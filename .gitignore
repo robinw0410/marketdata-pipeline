@@ -1,0 +1,9 @@
+data/
+logs/holdout_uses.jsonl
+__pycache__/
+.venv/
+.cache/
+.local/
+.config/
+.bash_history
+.lesshst
