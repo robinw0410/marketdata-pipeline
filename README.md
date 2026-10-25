@@ -134,6 +134,8 @@ period.
   regime.
 - **Holdout discipline.** After the first use, the holdout no longer counts as
   independent evidence. The use counter makes it visible if that has happened.
+  Holdout untouched so far: logs/holdout_uses.jsonl is created on first access
+  and will be committed once it exists.
 - **Null baseline instead of "beats buy-and-hold".** Beating buy-and-hold says
   little when exposure and timing differ. The random-entry baseline holds
   everything constant except *when* you enter. A strategy below the 95th
@@ -223,24 +225,32 @@ units only get write access to `/opt/marketdata/data`.
 | Unit | Status |
 |---|---|
 | `marketdata-collector.service` | **Running in production.** The file in `systemd/` is the deployed unit, unchanged. It reads optional settings such as `KUMA_PUSH_URL` from `/etc/marketdata.env`. |
-| `marketdata-compact.service` + `.timer` | **New, not deployed yet.** Compacts completed UTC days, daily at 00:30 UTC. `Persistent=true` catches up on runs missed while the container was down. |
+| `marketdata-compact.service` + `.timer` | **Deployed and running.** Compacts completed UTC days, daily at 00:30 UTC. `Persistent=true` catches up on runs missed while the container was down. |
 
 There is no timer for `fetch_klines.py`; historical data is fetched manually.
 
-Activating the compact timer:
+Installing the units on a new host:
 
 ```bash
-sudo cp systemd/marketdata-compact.service systemd/marketdata-compact.timer /etc/systemd/system/
+sudo cp systemd/*.service systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl start marketdata-compact.service      # one manual run first, check the log
 journalctl -u marketdata-compact.service -n 50
-sudo systemctl enable --now marketdata-compact.timer
+sudo systemctl enable --now marketdata-collector.service marketdata-compact.timer
 ```
+
+## Known issues / changelog
+
+- **2026-10, data repair: partial month 2026-08.** A bug in `fetch_klines.py`
+  stored the then-running month 2026-08 as a regular monthly file containing
+  only 1–19 August, and later runs never replaced it. Fixed: only completed
+  UTC months are written now. The affected files were deleted and reloaded
+  from the official monthly archives.
 
 ## Further documentation
 
 - [DATA.md](DATA.md): dataset inventory and live-collector verification
-- [GAPS.md](GAPS.md): gaps in the BTCUSDT history and how the backtester handles them
+- [GAPS.md](GAPS.md): gaps in the BTCUSDT and ETHUSDT history and how the backtester handles them
 - [SPLITS.md](SPLITS.md): frozen exploration / holdout / forward splits
 
 ## License
