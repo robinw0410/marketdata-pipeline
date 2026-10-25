@@ -25,7 +25,3 @@ Genau dann haettest du live nicht handeln koennen.
   Lookahead - du siehst den Ausfall nicht kommen.
 - Betroffene Trades sind im Trade-Log als spans_gap markiert;
   metrics.summarize meldet gap_pnl_share.
-
-## Vollstaendige Liste
-
-[Ausgabe von scripts/gaps.sql, Stand 2026-08-20]
