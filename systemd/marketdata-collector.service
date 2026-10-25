@@ -1,0 +1,21 @@
+# Example unit - adjust paths/user to your setup.
+[Unit]
+Description=Binance kline live collector (WebSocket + REST backfill)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=marketdata
+WorkingDirectory=/opt/marketdata
+Environment=TZ=UTC
+Environment=PYTHONUNBUFFERED=1
+# optional: KUMA_PUSH_URL=... (heartbeat for a push monitor)
+EnvironmentFile=-/etc/marketdata/collector.env
+ExecStart=/opt/marketdata/.venv/bin/python scripts/collect_klines.py --symbols BTCUSDT ETHUSDT --interval 1m
+# SIGTERM -> clean shutdown; a restart backfills the gap via REST
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

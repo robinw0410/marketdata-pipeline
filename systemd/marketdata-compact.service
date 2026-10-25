@@ -1,0 +1,12 @@
+# Example unit - adjust paths/user to your setup.
+[Unit]
+Description=Compact completed live-collector days to Parquet
+
+[Service]
+Type=oneshot
+User=marketdata
+WorkingDirectory=/opt/marketdata
+# compact_live.py uses date.today() for its cutoff -> must run in UTC
+Environment=TZ=UTC
+ExecStart=/opt/marketdata/.venv/bin/python scripts/compact_live.py --symbol BTCUSDT --interval 1m
+ExecStart=/opt/marketdata/.venv/bin/python scripts/compact_live.py --symbol ETHUSDT --interval 1m
