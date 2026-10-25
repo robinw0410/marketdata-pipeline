@@ -121,9 +121,11 @@ period.
 
 - **Overfitting.** Any rule you tune long enough on the same data will look
   good. The defence is structural, not willpower. The data is split into
-  **exploration** (2019–2023, where all research happens), **holdout** (from
-  2024, used *once*, for *one* final strategy), and **forward** (live collector
-  data from 2026-08-21, the only data that is out of sample by construction).
+  **exploration** (2019-01-01 to 2023-12-31, where all research happens),
+  **holdout** (2024-01-01 to 2026-08-20, used *once*, for *one* final
+  strategy), and **forward** (live collector data from 2026-08-21, the only
+  data that is out of sample by construction). Holdout and forward don't
+  overlap.
   The holdout sits at the *end* of the series on purpose: markets are not
   stationary, and the question is whether a rule holds in the most recent
   regime.

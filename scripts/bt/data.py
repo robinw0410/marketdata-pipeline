@@ -22,8 +22,10 @@ STORE = ROOT / "data" / "klines"
 LOGDIR = ROOT / "logs"
 
 # --- eingefroren am 2026-08-20 ------------------------------------------------
+# 2026-10-25: Holdout-Ende von 2026-12-31 auf 2026-08-20 gesetzt. Vorher lief
+# der Holdout in den Forward-Zeitraum (ab 2026-08-21) hinein.
 EXPLORE = ("2019-01-01", "2023-12-31")
-HOLDOUT = ("2024-01-01", "2026-12-31")
+HOLDOUT = ("2024-01-01", "2026-08-20")
 # ------------------------------------------------------------------------------
 
 log = logging.getLogger("bt.data")
