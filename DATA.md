@@ -5,7 +5,7 @@
 | Symbol  | Von        | Bis        | Bars      | Fehlend | Abdeckung | OHLC-Fehler |
 |---------|------------|------------|-----------|---------|-----------|-------------|
 | BTCUSDT | 2019-01-01 | 2026-08-19 | 4.010.631 | 4.089   | 99,898 %  | 0           |
-| ETHUSDT | 2019-01-01 | 2026-08-19 | ...       | ...     | ...       | 0           |
+| ETHUSDT | 2019-01-01 | 2026-08-19 | download in progress | download in progress | download in progress | 0 |
 
 Quelle:   data.binance.vision, monthly klines, jede Datei SHA256-verifiziert
 Erhoben:  2026-08-20
