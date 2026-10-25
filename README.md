@@ -147,10 +147,11 @@ period.
   chance. The current log has **4 runs**, and all of them are controls or
   reference runs (buy-and-hold, flat, oracle, buy-and-hold 2022). **No strategy
   hypothesis has been tested yet.**
-- **Gaps are not noise.** Binance outages cluster in high-volatility moments,
-  for example the COVID crash and the April 2021 flash crash. A backtest that
-  silently interpolates over them overstates what you could actually have
-  traded. See [GAPS.md](GAPS.md).
+- **Gaps are not noise.** BTCUSDT and ETHUSDT have the same 22 gaps, which
+  points to outages on the exchange side rather than download errors. Six of
+  them are unplanned outages of up to 354 minutes, and no one could trade
+  during them. A backtest that silently interpolates over them overstates what
+  you could actually have traded. See [GAPS.md](GAPS.md).
 
 ## Quick start
 
@@ -224,10 +225,15 @@ units only get write access to `/opt/marketdata/data`.
 
 | Unit | Status |
 |---|---|
-| `marketdata-collector.service` | **Running in production.** The file in `systemd/` is the deployed unit, unchanged. It reads optional settings such as `KUMA_PUSH_URL` from `/etc/marketdata.env`. |
+| `marketdata-collector.service` | **Running in production.** The file in `systemd/` is the deployed unit, unchanged. It reads `/etc/marketdata.env`; template: [`.env.example`](.env.example). |
 | `marketdata-compact.service` + `.timer` | **Deployed and running.** Compacts completed UTC days, daily at 00:30 UTC. `Persistent=true` catches up on runs missed while the container was down. |
 
 There is no timer for `fetch_klines.py`; historical data is fetched manually.
+
+The collector unit loads `/etc/marketdata.env` via `EnvironmentFile=` without
+a `-` prefix, so the file has to exist; it may be empty. Its only setting,
+`KUMA_PUSH_URL` (Uptime Kuma push heartbeat), is optional. Copy
+[`.env.example`](.env.example) there and fill it in, or leave it empty.
 
 Installing the units on a new host:
 

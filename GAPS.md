@@ -30,7 +30,7 @@ erster Bar DANACH. Die Luecke beginnt eine Minute nach der ersten Zeit.
 |  7 | 2019-11-25 01:59 | 2019-11-25 04:00 | 120 | 120 | Wartung 02:00 UTC |
 |  8 | 2020-02-09 01:59 | 2020-02-09 03:00 |  60 |  60 | Wartung 02:00 UTC |
 |  9 | 2020-02-19 11:35 | 2020-02-19 17:30 | 354 | 354 | ungeplanter Ausfall |
-| 10 | 2020-03-04 09:21 | 2020-03-04 11:30 | 128 | 128 | ungeplanter Ausfall, bisherige Notiz: COVID-Crash |
+| 10 | 2020-03-04 09:21 | 2020-03-04 11:30 | 128 | 128 | ungeplanter Ausfall, Ursache unbekannt |
 | 11 | 2020-04-25 01:59 | 2020-04-25 04:30 | 150 | 150 | Wartung 02:00 UTC |
 | 12 | 2020-06-28 01:59 | 2020-06-28 05:30 | 210 | 210 | Wartung 02:00 UTC |
 | 13 | 2020-11-30 05:59 | 2020-11-30 07:00 |  60 |  60 | UNERKLAERT (volle Stunde, aber nicht 02:00) |
