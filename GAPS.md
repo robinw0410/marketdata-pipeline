@@ -4,8 +4,16 @@
 
 ## Interpretation
 
-14 der 22 Luecken beginnen um 01:59 UTC -> planmaessige Binance-Wartung (02:00 UTC).
-Die uebrigen haben krumme Startzeiten und sind ungeplante Ausfaelle unter Last:
+22 Luecken insgesamt:
+
+  14  beginnen um 01:59 UTC -> planmaessige Binance-Wartung (02:00 UTC)
+   6  ungeplante Ausfaelle, unten einzeln aufgefuehrt
+   2  UNERKLAERT - Startzeit und Dauer nicht erfasst, noch nicht zugeordnet
+  --
+  22
+
+Die 6 ungeplanten haben krumme Startzeiten und sind Ausfaelle unter Last
+(zusammen 1.155 der 4.089 fehlenden Minuten):
 
   2020-02-19 11:35 (354 min)
   2020-03-04 09:21 (128 min)   <- COVID-Crash
