@@ -35,7 +35,9 @@ flowchart LR
   Each archive is checked against its published `.CHECKSUM` (SHA256). Parsing
   handles optional headers and ms/µs timestamps. Validation fails hard on
   duplicates, non-monotonic time, inconsistent OHLC, non-positive prices, NaNs,
-  or more than 2 % missing bars, before anything is written.
+  or more than 2 % missing bars, before anything is written. Only **completed
+  UTC months** are stored. The running month is skipped and gets fetched from
+  the monthly archive on the first run after the month has ended.
 - **`fetch_funding.py`**: funding rates and USDT-M perpetual klines, using the
   same verification path.
 - **`collect_klines.py`**: WebSocket collector. It writes **only closed

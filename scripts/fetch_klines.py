@@ -2,7 +2,8 @@
 """
 Bulk-Download historischer Binance-Klines von data.binance.vision.
 
-- laedt Monats-Archive, fuer den laufenden Monat Tages-Archive
+- laedt nur Monats-Archive abgeschlossener UTC-Monate; der laufende Monat
+  wird gar nicht geschrieben (siehe run)
 - verifiziert jede Datei gegen die mitgelieferte .CHECKSUM (SHA256)
 - parst robust (Header optional, Timestamps ms ODER us)
 - validiert hart, bevor irgendetwas geschrieben wird
@@ -15,13 +16,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import calendar
 import hashlib
 import io
 import logging
 import sys
 import zipfile
-from datetime import date, timedelta
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -184,42 +184,38 @@ def months(start: date, end: date):
         y, m = (y + 1, 1) if m == 12 else (y, m + 1)
 
 
-def run(symbol: str, interval: str, start: date, end: date) -> None:
+def utc_today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def run(symbol: str, interval: str, start: date, end: date,
+        today: date | None = None) -> None:
     STORE.mkdir(parents=True, exist_ok=True)
-    today = date.today()
+    today = today or utc_today()
     reports = []
 
     for y, m in months(start, end):
+        label = f"{symbol} {y}-{m:02d}"
+        # Laufender Monat wird NICHT geschrieben. Eine Teilmonatsdatei saehe
+        # aus wie eine fertige und wuerde wegen out.exists() nie ersetzt.
+        # Er kommt beim ersten Lauf nach Monatsende aus dem Monatsarchiv.
+        if (y, m) >= (today.year, today.month):
+            log.info("skip %s (Monat nicht abgeschlossen)", label)
+            continue
+
         out = STORE / f"symbol={symbol}" / f"year={y}" / f"{symbol}-{interval}-{y}-{m:02d}.parquet"
         if out.exists():
             continue
 
-        label = f"{symbol} {y}-{m:02d}"
-        is_current = (y, m) >= (today.year, today.month)
-
-        if not is_current:
-            fn = f"{symbol}-{interval}-{y}-{m:02d}.zip"
-            url = f"{BASE}/monthly/klines/{symbol}/{interval}/{fn}"
-            z = download_verified(url, RAW / symbol / fn)
-            if z is None:
-                log.warning("skip %s (kein Monatsarchiv)", label)
-                continue
-            df = parse_zip(z)
-        else:
-            # laufender Monat: nur Tagesarchive, heute selbst ist unvollstaendig
-            frames = []
-            last = min(date(y, m, calendar.monthrange(y, m)[1]), today - timedelta(days=1))
-            d = date(y, m, 1)
-            while d <= last:
-                fn = f"{symbol}-{interval}-{d.isoformat()}.zip"
-                url = f"{BASE}/daily/klines/{symbol}/{interval}/{fn}"
-                z = download_verified(url, RAW / symbol / fn)
-                if z is not None:
-                    frames.append(parse_zip(z))
-                d += timedelta(days=1)
-            if not frames:
-                continue
-            df = pd.concat(frames).sort_values("open_time").reset_index(drop=True)
+        fn = f"{symbol}-{interval}-{y}-{m:02d}.zip"
+        url = f"{BASE}/monthly/klines/{symbol}/{interval}/{fn}"
+        z = download_verified(url, RAW / symbol / fn)
+        if z is None:
+            # Monatsarchiv erscheint erst ein paar Tage nach Monatsende;
+            # nichts geschrieben -> naechster Lauf versucht es erneut
+            log.warning("skip %s (kein Monatsarchiv)", label)
+            continue
+        df = parse_zip(z)
 
         rep = validate(df, interval, label)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -255,7 +251,7 @@ def main() -> int:
     if a.end:
         ey, em = map(int, a.end.split("-"))
     else:
-        ey, em = date.today().year, date.today().month
+        ey, em = utc_today().year, utc_today().month
 
     try:
         run(a.symbol.upper(), a.interval, date(sy, sm, 1), date(ey, em, 1))
