@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -28,8 +28,23 @@ STORE = ROOT / "data" / "live_parquet"
 log = logging.getLogger("compact")
 
 
-def compact_day(symbol: str, interval: str, src: Path) -> dict | None:
-    day = src.stem.rsplit("-", 3)[-3:]
+def utc_today() -> date:
+    """Die Tagesdateien des Collectors sind UTC-Tage. date.today() waere Ortszeit."""
+    return datetime.now(timezone.utc).date()
+
+
+def day_of(src: Path) -> date:
+    """BTCUSDT-1m-2026-08-21.jsonl -> date(2026, 8, 21)"""
+    return date.fromisoformat("-".join(src.stem.rsplit("-", 3)[-3:]))
+
+
+def compact_day(symbol: str, interval: str, src: Path,
+                today: date | None = None) -> dict | None:
+    day = day_of(src)
+    # Schutz, unabhaengig vom Aufrufer: der laufende UTC-Tag wird nie verdichtet.
+    # Ein halber Tag als Parquet wuerde wegen out.exists() nie mehr ersetzt.
+    if day >= (today or utc_today()):
+        raise ValueError(f"{src.name}: UTC-Tag {day} ist nicht abgeschlossen")
     out = STORE / f"symbol={symbol}" / f"{src.stem}.parquet"
     if out.exists():
         return None
@@ -51,7 +66,7 @@ def compact_day(symbol: str, interval: str, src: Path) -> dict | None:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df = df.sort_values("open_time").reset_index(drop=True)
-    rep = validate(df, interval, f"{symbol} {'-'.join(day)}")
+    rep = validate(df, interval, f"{symbol} {day.isoformat()}")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out, index=False, compression="zstd")
@@ -66,19 +81,17 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s")
 
     sym = a.symbol.upper()
-    cutoff = date.today() - timedelta(days=1)      # laufenden Tag nicht anfassen
+    today = utc_today()                            # laufenden UTC-Tag nicht anfassen
     src_dir = LIVE / f"symbol={sym}"
     if not src_dir.exists():
         log.warning("keine Live-Daten fuer %s", sym)
         return
 
     for f in sorted(src_dir.glob(f"{sym}-{a.interval}-*.jsonl")):
-        d = date.fromisoformat(f.stem.rsplit("-", 3)[-3] + "-" +
-                               f.stem.rsplit("-", 3)[-2] + "-" + f.stem.rsplit("-", 3)[-1])
-        if d > cutoff:
+        if day_of(f) >= today:
             continue
         try:
-            rep = compact_day(sym, a.interval, f)
+            rep = compact_day(sym, a.interval, f, today=today)
         except ValidationError as e:
             log.error("ABGELEHNT %s: %s", f.name, e)
             continue

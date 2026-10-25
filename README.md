@@ -44,8 +44,9 @@ flowchart LR
   append-only NDJSON with `fsync`, and records each bar's origin (`ws` or
   `rest_backfill`). It can optionally send a heartbeat to a push monitor
   (`KUMA_PUSH_URL`).
-- **`compact_live.py`**: compacts completed days of NDJSON to Parquet. The
-  NDJSON stays the source of truth; Parquet is derived and can be rebuilt.
+- **`compact_live.py`**: compacts completed **UTC** days of NDJSON to Parquet.
+  The running UTC day is never compacted. The NDJSON stays the source of
+  truth; Parquet is derived and can be rebuilt.
 - **`verify_live.py`**: compares a collected day bar by bar against Binance's
   official daily archive (missing bars, phantom bars, OHLCV differences).
 - **`gaps.sql`**: DuckDB query that lists gaps in the historical store.
@@ -175,6 +176,15 @@ python scripts/verify_live.py  --symbol BTCUSDT --date 2026-08-21
 All data is written below `data/`, which is git-ignored. All timestamps are
 UTC.
 
+### Tests
+
+The tests use synthetic fixtures and need no downloaded data and no network.
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests
+```
+
 ## Directory layout
 
 ```
@@ -193,6 +203,7 @@ UTC.
 │       ├── metrics.py       metrics on daily returns
 │       ├── baseline.py      random-entry null distribution
 │       └── strategies.py    controls + example strategy
+├── tests/                   pytest, synthetic fixtures only
 ├── systemd/                 example units (see Deployment)
 ├── logs/experiments.jsonl   experiment log (committed)
 ├── data/                    not committed
