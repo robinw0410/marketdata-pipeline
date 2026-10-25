@@ -1,4 +1,4 @@
-# Example unit - adjust to your setup.
+# /etc/systemd/system/marketdata-compact.timer
 [Unit]
 Description=Daily compaction of live-collector data
 

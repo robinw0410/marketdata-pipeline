@@ -206,7 +206,7 @@ python -m pytest tests
 │       ├── baseline.py      random-entry null distribution
 │       └── strategies.py    controls + example strategy
 ├── tests/                   pytest, synthetic fixtures only
-├── systemd/                 example units (see Deployment)
+├── systemd/                 systemd units (see Deployment)
 ├── logs/experiments.jsonl   experiment log (committed)
 ├── data/                    not committed
 ├── DATA.md                  dataset inventory
@@ -216,16 +216,25 @@ python -m pytest tests
 
 ## Deployment
 
-In production the pipeline runs in an LXC container under systemd. The
-`systemd/` directory contains **example** units for the live collector and the
-daily compaction. They assume an install in `/opt/marketdata` with a venv in
-`.venv` and a dedicated `marketdata` user; adjust those to your setup. All
-units set `TZ=UTC`.
+The pipeline runs in an LXC container on UTC, under systemd. It is installed in
+`/opt/marketdata`, with a venv at `/opt/marketdata/.venv`, as user `mkt`. The
+units only get write access to `/opt/marketdata/data`.
+
+| Unit | Status |
+|---|---|
+| `marketdata-collector.service` | **Running in production.** The file in `systemd/` is the deployed unit, unchanged. It reads optional settings such as `KUMA_PUSH_URL` from `/etc/marketdata.env`. |
+| `marketdata-compact.service` + `.timer` | **New, not deployed yet.** Compacts completed UTC days, daily at 00:30 UTC. `Persistent=true` catches up on runs missed while the container was down. |
+
+There is no timer for `fetch_klines.py`; historical data is fetched manually.
+
+Activating the compact timer:
 
 ```bash
-sudo cp systemd/*.service systemd/*.timer /etc/systemd/system/
+sudo cp systemd/marketdata-compact.service systemd/marketdata-compact.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now marketdata-collector.service marketdata-compact.timer
+sudo systemctl start marketdata-compact.service      # one manual run first, check the log
+journalctl -u marketdata-compact.service -n 50
+sudo systemctl enable --now marketdata-compact.timer
 ```
 
 ## Further documentation

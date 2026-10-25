@@ -1,21 +1,23 @@
-# Example unit - adjust paths/user to your setup.
+# /etc/systemd/system/marketdata-collector.service
 [Unit]
-Description=Binance kline live collector (WebSocket + REST backfill)
-Wants=network-online.target
+Description=Binance kline collector
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=marketdata
-WorkingDirectory=/opt/marketdata
-Environment=TZ=UTC
-Environment=PYTHONUNBUFFERED=1
-# optional: KUMA_PUSH_URL=... (heartbeat for a push monitor)
-EnvironmentFile=-/etc/marketdata/collector.env
-ExecStart=/opt/marketdata/.venv/bin/python scripts/collect_klines.py --symbols BTCUSDT ETHUSDT --interval 1m
-# SIGTERM -> clean shutdown; a restart backfills the gap via REST
+User=mkt
+Group=mkt
+EnvironmentFile=/etc/marketdata.env
+ExecStart=/opt/marketdata/.venv/bin/python \
+    /opt/marketdata/scripts/collect_klines.py --symbols BTCUSDT ETHUSDT --interval 1m
 Restart=always
 RestartSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/marketdata/data
 
 [Install]
 WantedBy=multi-user.target
