@@ -52,6 +52,47 @@ flowchart LR
 - **`verify_live.py`**: compares a collected day bar by bar against Binance's
   official daily archive (missing bars, phantom bars, OHLCV differences).
 - **`gaps.sql`**: DuckDB query that lists gaps in the historical store.
+- **`fetch_dukascopy.py`**: historical tick data for XAUUSD, XAGUSD and EURUSD
+  from Dukascopy, aggregated to 1-minute bars with **bid and ask** OHLC. See
+  [Dukascopy (metals / FX)](#dukascopy-metals--fx) below.
+- **`export_fixture.py`**: exports a small slice of the kline store (default
+  BTCUSDT 1m, 2024-01-01 to 2024-01-07) as a gzip CSV test fixture under
+  `tests/fixtures/`. Meant to be run where the data lives; the output is then
+  committed.
+
+### Dukascopy (metals / FX)
+
+`fetch_dukascopy.py` downloads hourly `.bi5` tick files from
+`datafeed.dukascopy.com` (URL month is **0-based**, January = `00`; hours are
+UTC). Each file is LZMA-compressed; an empty file means no ticks, a 404 means
+missing. Records are 20 bytes big-endian (`>3I2f`): ms since the start of the
+hour, ask, bid (integers), ask volume, bid volume (float32).
+
+- **Assumption, to be verified:** price = integer / `POINT_DIVISOR`, with
+  1000 for XAUUSD/XAGUSD and 100000 for EURUSD. A wrong divisor shifts prices
+  by powers of ten, so every bar is checked against a coarse plausible range
+  (XAUUSD 200–20000, XAGUSD 3–500, EURUSD 0.5–2.0) and the run aborts hard
+  instead of writing wrong prices.
+- Raw files are cached (month 1-based in the cache path), so the store can be
+  rebuilt (`--rebuild`) without downloading again. 404s are cached as
+  `HHh_ticks.404` marker files; delete a marker to request that hour again.
+- Downloads are polite: generic User-Agent, retries with exponential backoff,
+  `--workers` (default 4) and a pause between requests.
+- Bars cover `[t, t+1min)`, labelled left, and exist only for minutes with
+  ticks (no filling). Only **completed UTC months** are written; existing
+  monthly files are not overwritten unless `--rebuild` is given.
+- Hard validation before writing: duplicates, monotonic time, bid and ask OHLC
+  consistency, prices > 0, NaNs, plausible range, crossed quotes
+  (`ask_close < bid_close`, abort above 0.1 % of bars). Soft checks are only
+  reported (log + JSON under `metals/reports/`): spread outliers (> 20x the
+  monthly median), 1m mid jumps > 2 %, and minutes without ticks Mon–Fri on a
+  coarse grid. There is deliberately **no hard gap limit** as for crypto:
+  metals and FX have daily breaks and weekends. Classifying gaps as planned or
+  unplanned is left to the consumer's trading calendar.
+- Data root: `MARKETDATA_DATA_ROOT`, default `data/` in the repo (only this
+  script reads the variable).
+- **License:** check Dukascopy's terms of use yourself. Do not redistribute
+  or commit the data, raw or derived (`data/` is git-ignored).
 
 ### Backtester (`scripts/bt`)
 
@@ -79,7 +120,10 @@ flowchart LR
   counted in `logs/holdout_uses.jsonl`. `--from` / `--to` can only *narrow* a
   split, never extend it into the holdout. See [SPLITS.md](SPLITS.md).
 - **Metrics.** Sharpe and Sortino are computed on *daily* returns, not minute
-  returns. The run also reports drawdown, Calmar, exposure, costs paid, win
+  returns. Sortino uses the downside deviation `sqrt(mean(min(r, 0)^2))` over
+  all days. Annualization defaults to 365 periods per year (crypto, 24/7);
+  `summarize(res, periods_per_year=252)` is meant for assets with weekends,
+  together with a daily series without weekend days. The run also reports drawdown, Calmar, exposure, costs paid, win
   rate, profit factor, and how much of the gross profit the top 5 trades
   contributed.
 
@@ -176,6 +220,12 @@ python scripts/run_backtest.py --strategy sma_cross --tf 15min \
 python scripts/collect_klines.py --symbols BTCUSDT ETHUSDT --interval 1m
 python scripts/compact_live.py --symbol BTCUSDT
 python scripts/verify_live.py  --symbol BTCUSDT --date 2026-08-21
+
+# metals / FX from Dukascopy (written to data/metals, raw cache in data/raw/dukascopy)
+python scripts/fetch_dukascopy.py --symbol XAUUSD --start 2024-01 --workers 4
+
+# test fixture from the local kline store
+python scripts/export_fixture.py      # -> tests/fixtures/BTCUSDT-1m-2024-01-01_07.csv.gz
 ```
 
 All data is written below `data/`, which is git-ignored. All timestamps are
@@ -197,6 +247,8 @@ python -m pytest tests
 ├── scripts/
 │   ├── fetch_klines.py      historical spot klines (checksum-verified)
 │   ├── fetch_funding.py     funding rates + perp klines
+│   ├── fetch_dukascopy.py   Dukascopy ticks -> 1m bid/ask bars (metals, FX)
+│   ├── export_fixture.py    kline slice -> tests/fixtures/*.csv.gz
 │   ├── collect_klines.py    WebSocket live collector
 │   ├── compact_live.py      NDJSON -> Parquet (completed days)
 │   ├── verify_live.py       live data vs. official archive
@@ -209,9 +261,15 @@ python -m pytest tests
 │       ├── baseline.py      random-entry null distribution
 │       └── strategies.py    controls + example strategy
 ├── tests/                   pytest, synthetic fixtures only
+│   └── fixtures/            small exported data slices (export_fixture.py)
 ├── systemd/                 systemd units (see Deployment)
 ├── logs/experiments.jsonl   experiment log (committed)
 ├── data/                    not committed
+│   ├── klines/              spot klines, symbol=/year=
+│   ├── raw/dukascopy/       raw .bi5 cache, SYM/YYYY/MM/DD (month 1-based)
+│   └── metals/
+│       ├── source=dukascopy/symbol=/year=/SYM-1m-YYYY-MM.parquet
+│       └── reports/         validation report per month (JSON)
 ├── DATA.md                  dataset inventory
 ├── GAPS.md                  gap analysis
 └── SPLITS.md                frozen data splits
@@ -246,6 +304,12 @@ sudo systemctl enable --now marketdata-collector.service marketdata-compact.time
 ```
 
 ## Known issues / changelog
+
+- **2026-11, metrics: Sortino formula.** Sortino used the standard deviation
+  of the negative daily returns only. It now uses the downside deviation over
+  all days. Sortino values logged in `logs/experiments.jsonl` before this
+  change were computed with the old formula; the log is append-only and was
+  not rewritten.
 
 - **2026-10, data repair: partial month 2026-08.** A bug in `fetch_klines.py`
   stored the then-running month 2026-08 as a regular monthly file containing

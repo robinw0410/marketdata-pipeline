@@ -5,6 +5,13 @@ Sharpe wird auf TAGESRENDITEN gerechnet, nicht auf Minutenrenditen.
 Minutenrenditen sind stark autokorreliert; sqrt(525600) darauf anzuwenden
 produziert Fantasiezahlen. Auch die Tagesvariante ist bei nicht-normalen
 Renditen nur eine grobe Orientierung.
+
+Sortino nutzt die Downside Deviation sqrt(mean(min(r, 0)^2)) ueber ALLE
+Tagesrenditen (positive zaehlen als 0), nicht die Standardabweichung nur der
+negativen Renditen. ACHTUNG: Sortino-Werte in logs/experiments.jsonl, die vor
+dem Commit "metrics: Sortino mit Downside Deviation ..." geloggt wurden, sind
+mit der alten Formel (r[r < 0].std()) berechnet und nicht direkt mit neueren
+Werten vergleichbar. Das Log wird bewusst nicht umgeschrieben (append-only).
 """
 from __future__ import annotations
 
@@ -14,7 +21,19 @@ import pandas as pd
 from .engine import Result
 
 
-def summarize(res: Result) -> dict:
+def summarize(res: Result, periods_per_year: int = 365) -> dict:
+    """
+    Kennzahlen eines Backtests.
+
+    periods_per_year: Annualisierungsfaktor fuer Sharpe/Sortino (sqrt davon).
+        Default 365 = unveraendertes Verhalten fuer Krypto (24/7, jeder
+        Kalendertag ist ein Handelstag). Fuer Assets mit Wochenenden/Pausen
+        (Metalle, FX) 252 verwenden, und zwar zusammen mit einer Tagesreihe
+        OHNE Wochenenden: Tage ohne Bars fallen beim resample("1D") +
+        dropna() ohnehin heraus, sofern die Equity-Kurve dort keine Punkte
+        hat. 252 auf eine 7-Tage-Reihe anzuwenden waere inkonsistent.
+    CAGR rechnet unabhaengig davon mit Kalenderjahren (365.25 Tage).
+    """
     eq = res.equity
     daily = eq.resample("1D").last().dropna()
     r = daily.pct_change().dropna()
@@ -23,9 +42,12 @@ def summarize(res: Result) -> dict:
     total = eq.iloc[-1] / eq.iloc[0] - 1.0
     cagr = (eq.iloc[-1] / eq.iloc[0]) ** (1 / years) - 1.0
 
-    sharpe = float(r.mean() / r.std() * np.sqrt(365)) if r.std() > 0 else 0.0
-    down = r[r < 0]
-    sortino = float(r.mean() / down.std() * np.sqrt(365)) if len(down) > 1 and down.std() > 0 else 0.0
+    ann = np.sqrt(periods_per_year)
+    sharpe = float(r.mean() / r.std() * ann) if r.std() > 0 else 0.0
+    # Downside Deviation ueber alle Beobachtungen (Ziel-Rendite 0).
+    # Bis zu diesem Fix: r[r < 0].std() -> siehe Modul-Docstring.
+    downside_dev = float(np.sqrt(np.mean(np.minimum(r.to_numpy(float), 0.0) ** 2))) if len(r) else 0.0
+    sortino = float(r.mean() / downside_dev * ann) if downside_dev > 0 else 0.0
 
     dd = eq / eq.cummax() - 1.0
     maxdd = float(dd.min())
