@@ -68,6 +68,24 @@ POINT_DIVISOR = {"XAUUSD": 1000, "XAGUSD": 1000, "EURUSD": 100000}
 # grob: faengt Divisor-Fehler (Faktor 10+), nicht echte Marktbewegungen.
 PLAUSIBLE = {"XAUUSD": (200.0, 20000.0), "XAGUSD": (3.0, 500.0), "EURUSD": (0.5, 2.0)}
 
+# Zweite, engere Absicherung gegen Zehnerpotenz-Fehler: grobe Jahres-
+# Durchschnittspreise aus allgemeinem Vorwissen (NICHT aus diesen Daten,
+# gerundet, 2025/2026 unsicher). Der Monatsmedian des Mid muss innerhalb
+# Faktor ANCHOR_BAND davon liegen. Ein Divisor-Fehler (Faktor 10) faellt
+# damit sicher auf, echte Jahresbewegungen (selbst +/-60 %) nicht.
+ANCHOR_BAND = 2.5
+ANCHORS = {
+    "XAUUSD": {2003: 360, 2004: 410, 2005: 445, 2006: 605, 2007: 695, 2008: 870,
+               2009: 970, 2010: 1225, 2011: 1570, 2012: 1670, 2013: 1410, 2014: 1265,
+               2015: 1160, 2016: 1250, 2017: 1255, 2018: 1270, 2019: 1390, 2020: 1770,
+               2021: 1800, 2022: 1800, 2023: 1940, 2024: 2390, 2025: 3400, 2026: 4200},
+    "XAGUSD": {2003: 4.9, 2004: 6.7, 2005: 7.3, 2006: 11.5, 2007: 13.4, 2008: 15.0,
+               2009: 14.7, 2010: 20.2, 2011: 35.1, 2012: 31.2, 2013: 23.8, 2014: 19.1,
+               2015: 15.7, 2016: 17.1, 2017: 17.0, 2018: 15.7, 2019: 16.2, 2020: 20.5,
+               2021: 25.1, 2022: 21.8, 2023: 23.4, 2024: 28.3, 2025: 40.0, 2026: 70.0},
+    "EURUSD": {},   # PLAUSIBLE (0.5..2.0) ist fuer EURUSD bereits eng genug
+}
+
 RECORD = np.dtype([("ms", ">u4"), ("ask", ">u4"), ("bid", ">u4"),
                    ("ask_volume", ">f4"), ("bid_volume", ">f4")])   # == '>3I2f'
 assert RECORD.itemsize == 20
@@ -289,6 +307,15 @@ def validate(df: pd.DataFrame, symbol: str, label: str,
         raise ValidationError(
             f"{label}: Preise {pmin:g}..{pmax:g} ausserhalb Plausibilitaetsbereich "
             f"{lo:g}..{hi:g} - POINT_DIVISOR[{symbol}]={POINT_DIVISOR[symbol]} pruefen")
+
+    anchor = ANCHORS.get(symbol, {}).get(month_start.year)
+    if anchor:
+        med = float(((df["bid_close"] + df["ask_close"]) / 2).median())
+        if not (anchor / ANCHOR_BAND <= med <= anchor * ANCHOR_BAND):
+            raise ValidationError(
+                f"{label}: Monatsmedian {med:g} weicht mehr als Faktor {ANCHOR_BAND:g} vom "
+                f"Jahresanker {anchor:g} ab - POINT_DIVISOR[{symbol}]={POINT_DIVISOR[symbol]} pruefen")
+        rep["anchor_ratio"] = med / anchor
 
     crossed = int((df["ask_close"] < df["bid_close"]).sum())
     rep["crossed"] = crossed

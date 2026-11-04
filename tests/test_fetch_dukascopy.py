@@ -338,3 +338,12 @@ def test_get_hour_caches_blob_and_404(tmp_path, fake_get):
     assert fd.get_hour(tmp_path, SYM, h_ok, pause=0) == ("cached", blob)
     assert fd.get_hour(tmp_path, SYM, h_404, pause=0) == ("cached_404", None)
     assert len(calls) == 2
+
+
+def test_divisor_factor_ten_too_large_is_caught_by_anchor():
+    """Gold mit Divisor 10000 statt 1000 laege bei ~200 und damit noch im groben
+    Plausibilitaetsbereich; der Jahresanker (2024 ~2390) muss abbrechen."""
+    with pytest.raises(fd.ValidationError, match="Jahresanker"):
+        fd.validate(make_bars(bid=205.0, ask=205.05), SYM, "t", MS, ME)
+    rep = fd.validate(make_bars(), SYM, "t", MS, ME)
+    assert 0.4 < rep["anchor_ratio"] < 2.5
