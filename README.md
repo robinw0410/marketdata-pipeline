@@ -55,6 +55,9 @@ flowchart LR
 - **`fetch_dukascopy.py`**: historical tick data for XAUUSD, XAGUSD and EURUSD
   from Dukascopy, aggregated to 1-minute bars with **bid and ask** OHLC. See
   [Dukascopy (metals / FX)](#dukascopy-metals--fx) below.
+- **`fetch_calendar.py`**: economic calendar (US / euro area) for the news
+  blackout of a gold/silver bot. See
+  [Economic calendar](#economic-calendar) below.
 - **`export_fixture.py`**: exports a small slice of the kline store (default
   BTCUSDT 1m, 2024-01-01 to 2024-01-07) as a gzip CSV test fixture under
   `tests/fixtures/`. Meant to be run where the data lives; the output is then
@@ -89,10 +92,43 @@ hour, ask, bid (integers), ask volume, bid volume (float32).
   coarse grid. There is deliberately **no hard gap limit** as for crypto:
   metals and FX have daily breaks and weekends. Classifying gaps as planned or
   unplanned is left to the consumer's trading calendar.
-- Data root: `MARKETDATA_DATA_ROOT`, default `data/` in the repo (only this
-  script reads the variable).
+- Data root: `MARKETDATA_DATA_ROOT`, default `data/` in the repo (read only
+  by this script and `fetch_calendar.py`).
 - **License:** check Dukascopy's terms of use yourself. Do not redistribute
   or commit the data, raw or derived (`data/` is git-ignored).
+
+### Economic calendar
+
+`fetch_calendar.py` builds `calendar/events.parquet` (current state) plus a
+snapshot per run under `calendar/snapshots/`, so moved dates stay traceable.
+Schema and sources are in [DATA.md](DATA.md#wirtschaftskalender); settings in
+`config/calendar.yaml` and `config/calendar_adhoc.csv`.
+
+- **Sources**, each with its own parser: FRED `release/dates` (date only,
+  time by rule, 08:30 ET; needs `FRED_API_KEY`), the Fed's FOMC calendar
+  pages, the ECB Governing Council calendar, and a hand-kept ad-hoc CSV.
+  Local times are converted with `zoneinfo`, never with a fixed offset.
+- **Assumptions are guarded at run time.** The FRED release IDs come from
+  memory: before use, the script fetches each release's name and aborts if it
+  doesn't match. The FOMC and ECB parsers check meetings per year (FOMC 7–10,
+  ECB 6–12) and fail instead of guessing.
+- **Merge with the last state.** Same `event_id` → newest source wins; changed
+  `ts_utc` → `rescheduled`; an event that disappears inside a source's newly
+  fetched date range → `cancelled` (the row is kept).
+- **Hard validation** (schema, UTC, no NaT, event_id vs. local date, impact
+  vs. config, plausible local hour, at least 30 high-impact events per
+  complete year from 2010, at most 10 newly cancelled high-impact events per
+  run). If any source fails or validation fails, **nothing** is written, the
+  old state stays, and the exit code is non-zero (2 validation, 3 source,
+  4 config). A JSON report is written to `calendar/reports/` either way.
+- **Cross-check** against the faireconomy weekly JSON is report-only: time
+  differences over 5 minutes are listed, nothing is taken over, and failures
+  of that source are not fatal.
+- Not verified without network access when this was written: page structures
+  of federalreserve.gov and ecb.europa.eu (the parsers were built against
+  self-written fixtures), FRED release IDs (hence the name check), the FOMC
+  press-conference rule before 2019, ff titles. The ECB page covers only the
+  current calendar, so ECB history builds up from the first run on.
 
 ### Backtester (`scripts/bt`)
 
@@ -221,6 +257,10 @@ python scripts/collect_klines.py --symbols BTCUSDT ETHUSDT --interval 1m
 python scripts/compact_live.py --symbol BTCUSDT
 python scripts/verify_live.py  --symbol BTCUSDT --date 2026-08-21
 
+# economic calendar (FRED_API_KEY from /etc/marketdata.env or the shell)
+python scripts/fetch_calendar.py --start-year 2003 --dry-run -v
+python scripts/fetch_calendar.py --sources fomc,ecb,adhoc,ff   # without FRED (fails validation on an empty store)
+
 # metals / FX from Dukascopy (written to data/metals, raw cache in data/raw/dukascopy)
 python scripts/fetch_dukascopy.py --symbol XAUUSD --start 2024-01 --workers 4
 
@@ -248,6 +288,7 @@ python -m pytest tests
 │   ├── fetch_klines.py      historical spot klines (checksum-verified)
 │   ├── fetch_funding.py     funding rates + perp klines
 │   ├── fetch_dukascopy.py   Dukascopy ticks -> 1m bid/ask bars (metals, FX)
+│   ├── fetch_calendar.py    economic calendar (FRED, FOMC, ECB, ad hoc)
 │   ├── export_fixture.py    kline slice -> tests/fixtures/*.csv.gz
 │   ├── collect_klines.py    WebSocket live collector
 │   ├── compact_live.py      NDJSON -> Parquet (completed days)
@@ -262,11 +303,14 @@ python -m pytest tests
 │       └── strategies.py    controls + example strategy
 ├── tests/                   pytest, synthetic fixtures only
 │   └── fixtures/            small exported data slices (export_fixture.py)
+├── config/                  calendar.yaml, calendar_adhoc.csv
 ├── systemd/                 systemd units (see Deployment)
 ├── logs/experiments.jsonl   experiment log (committed)
 ├── data/                    not committed
 │   ├── klines/              spot klines, symbol=/year=
 │   ├── raw/dukascopy/       raw .bi5 cache, SYM/YYYY/MM/DD (month 1-based)
+│   ├── raw/fomc/            cached FOMC historical pages
+│   ├── calendar/            events.parquet, snapshots/, reports/
 │   └── metals/
 │       ├── source=dukascopy/symbol=/year=/SYM-1m-YYYY-MM.parquet
 │       └── reports/         validation report per month (JSON)
@@ -285,13 +329,16 @@ units only get write access to `/opt/marketdata/data`.
 |---|---|
 | `marketdata-collector.service` | **Running in production.** The file in `systemd/` is the deployed unit, unchanged. It reads `/etc/marketdata.env`; template: [`.env.example`](.env.example). |
 | `marketdata-compact.service` + `.timer` | **Deployed and running.** Compacts completed UTC days, daily at 00:30 UTC. `Persistent=true` catches up on runs missed while the container was down. |
+| `marketdata-calendar.service` + `.timer` | **New, not deployed yet.** Economic calendar, daily at 05:10 UTC, `Persistent=true`. Reads `FRED_API_KEY` from `/etc/marketdata.env` (`EnvironmentFile=-`, optional). Exits non-zero if a source or the validation fails. Needs `pyyaml` (`pip install -r requirements.txt`). |
 
 There is no timer for `fetch_klines.py`; historical data is fetched manually.
 
 The collector unit loads `/etc/marketdata.env` via `EnvironmentFile=` without
-a `-` prefix, so the file has to exist; it may be empty. Its only setting,
-`KUMA_PUSH_URL` (Uptime Kuma push heartbeat), is optional. Copy
-[`.env.example`](.env.example) there and fill it in, or leave it empty.
+a `-` prefix, so the file has to exist; it may be empty. The collector's
+setting `KUMA_PUSH_URL` (Uptime Kuma push heartbeat) is optional. The calendar
+unit reads `FRED_API_KEY` from the same file; without it the FRED source fails
+and the run exits non-zero. Copy [`.env.example`](.env.example) there and fill
+it in.
 
 Installing the units on a new host:
 
@@ -301,6 +348,9 @@ sudo systemctl daemon-reload
 sudo systemctl start marketdata-compact.service      # one manual run first, check the log
 journalctl -u marketdata-compact.service -n 50
 sudo systemctl enable --now marketdata-collector.service marketdata-compact.timer
+# calendar: one manual run first, then the timer
+sudo systemctl start marketdata-calendar.service && journalctl -u marketdata-calendar.service -n 50
+sudo systemctl enable --now marketdata-calendar.timer
 ```
 
 ## Known issues / changelog

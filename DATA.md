@@ -64,3 +64,62 @@ Handelskalender des Bots.
 
 Lizenz: Dukascopy-Nutzungsbedingungen selbst pruefen. Daten (roh und
 abgeleitet) nicht weitergeben und nicht committen.
+
+## Wirtschaftskalender
+
+Zweck:    News-Sperre des Gold/Silber-Bots (scripts/fetch_calendar.py)
+Stand:    noch nicht geladen
+Zeitzone: ts_utc UTC; Regeluhrzeiten lokal (America/New_York bzw.
+          Europe/Berlin) per zoneinfo umgerechnet, nie fester Offset
+
+Store:
+    data/calendar/events.parquet                             aktueller Stand
+    data/calendar/snapshots/events-YYYYMMDDTHHMMSSZ.parquet  Stand je Abruf
+    data/calendar/reports/calendar-YYYYMMDDTHHMMSSZ.json     Report je Lauf
+    data/raw/fomc/fomchistorical{YYYY}.htm                   Roh-Cache
+    Wurzel per MARKETDATA_DATA_ROOT ueberschreibbar.
+
+Schema (verbindlich, wird vom Bot gelesen):
+    event_id    str   f"{event_type}:{Datum lokal YYYY-MM-DD}", stabil
+    ts_utc      datetime64[ns, UTC]
+    event_type  str   NFP, CPI, PCE, GDP, PPI, RETAIL_SALES, JOBLESS_CLAIMS,
+                      FOMC_STATEMENT, FOMC_PRESS_CONF, FOMC_MINUTES,
+                      ECB_RATE_DECISION, ECB_PRESS_CONF
+    country     str   "US" | "EA"
+    impact      str   "high" | "medium" | "low" (config/calendar.yaml)
+    source      str   "fred" | "fomc" | "ecb" | "adhoc"
+    status      str   "scheduled" | "rescheduled" | "cancelled" | "adhoc"
+    fetched_at  datetime64[ns, UTC]  Lauf, der die Zeile zuletzt geliefert
+                                     oder geaendert hat
+
+Status-Regeln: gleiche event_id mit anderem ts_utc als im letzten Stand ->
+rescheduled (bleibt es, solange ts_utc gleich bleibt). Verschwindet ein
+Event einer Quelle innerhalb des neu abgerufenen Datumsbereichs (je source +
+event_type), wird es cancelled, die Zeile bleibt. Eine Terminverschiebung auf
+einen anderen Tag erscheint daher als cancelled (alter Tag) + neues Event
+(neuer Tag). adhoc bleibt adhoc. Zeilen ausserhalb des abgerufenen Bereichs
+bleiben unveraendert (die EZB-Seite zeigt nur den aktuellen Kalender; die
+EZB-Historie waechst ab dem ersten Lauf).
+
+Regeln / Uhrzeiten:
+- FRED-Releases 08:30 ET (Employment Situation=NFP, CPI, Personal Income
+  and Outlays=PCE, GDP, PPI, Retail Sales, Jobless Claims)
+- FOMC: Statement 14:00 ET am letzten Sitzungstag; Pressekonferenz 14:30 ET
+  ab 2019 bei jeder Sitzung, davor nur bei SEP-Sitzungen ab April 2011;
+  Minutes 14:00 ET nur, wenn das Datum auf der Seite steht. unscheduled /
+  notation vote / Conference Call werden uebersprungen (Report).
+- EZB: Entscheidung 13:45, PK 14:30 Europe/Berlin bis 2022-07-20; ab
+  2022-07-21 14:15 bzw. 14:45.
+- Ad hoc (config/calendar_adhoc.csv): 2020-03-03 10:00 ET und 2020-03-15
+  17:00 ET (FOMC-Notfallsitzungen), impact high.
+
+Annahmen (ohne Netz erstellt, nicht verifiziert):
+- FRED release_id 50/10/54/53/46/9/180 aus dem Gedaechtnis; abgesichert
+  durch Namens-Check zur Laufzeit (falscher Name -> Abbruch, Exit 4).
+- Seitenstruktur federalreserve.gov / ecb.europa.eu: Parser gegen selbst
+  geschriebene Fixtures gebaut; abgesichert durch Plausibilitaet je Jahr
+  (FOMC 7-10 regulaere Sitzungen, EZB 6-12 Entscheidungen).
+- 08:30 ET fuer alle FRED-Releases ueber die ganze Historie; FOMC-Uhrzeiten
+  vor 2013 lagen vermutlich teils anders (nicht umgesetzt).
+- Nach jeder geldpolitischen EZB-Sitzung eine Pressekonferenz.
+- ff-Titel (Kreuzcheck, nur Report).
