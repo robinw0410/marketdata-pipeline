@@ -216,6 +216,64 @@ def test_fomc_press_conf_rule_before_2019(cfg):
     assert fc.has_press_conf(m2019, cfg)
 
 
+def _m(end, sep=False):
+    return fc.Meeting(end.year, end - timedelta(days=1), end, sep=sep, kind="regular")
+
+
+@pytest.mark.parametrize("end, sep, st_utc, pc_utc", [
+    # bis 2012-12-31 ohne PK: 14:15 ET
+    (date(2010, 1, 27), True, "2010-01-27 19:15", None),        # EST, SEP aber vor 2011-04
+    (date(2010, 6, 23), True, "2010-06-23 18:15", None),        # EDT
+    (date(2011, 1, 26), True, "2011-01-26 19:15", None),        # SEP, PK erst ab 2011-04-27
+    (date(2012, 3, 13), False, "2012-03-13 18:15", None),       # EDT seit 11.03.2012
+    (date(2012, 12, 31), False, "2012-12-31 19:15", None),      # letzter Tag, valid_to inklusive
+    # 2011-04-27 .. 2012-12-31 mit PK: Statement 12:30, PK 14:15 ET
+    (date(2011, 4, 27), True, "2011-04-27 16:30", "2011-04-27 18:15"),   # EDT, erste PK
+    (date(2011, 11, 2), True, "2011-11-02 16:30", "2011-11-02 18:15"),   # EDT (bis 06.11.)
+    (date(2012, 1, 25), True, "2012-01-25 17:30", "2012-01-25 19:15"),   # EST
+    (date(2012, 12, 12), True, "2012-12-12 17:30", "2012-12-12 19:15"),
+    # ab 2013-01-01: 14:00 / 14:30 ET
+    (date(2013, 1, 30), False, "2013-01-30 19:00", None),
+    (date(2013, 3, 20), True, "2013-03-20 18:00", "2013-03-20 18:30"),   # EDT seit 10.03.2013
+    (date(2018, 12, 19), True, "2018-12-19 19:00", "2018-12-19 19:30"),
+    (date(2019, 1, 30), False, "2019-01-30 19:00", "2019-01-30 19:30"),  # ab 2019 jede Sitzung
+    (date(2024, 7, 31), False, "2024-07-31 18:00", "2024-07-31 18:30"),
+])
+def test_fomc_time_periods(cfg, end, sep, st_utc, pc_utc):
+    ev = fc.fomc_events([_m(end, sep)], cfg, FA).set_index("event_type")
+    assert ev.loc["FOMC_STATEMENT"].ts_utc == pd.Timestamp(st_utc, tz="UTC")
+    assert ev.loc["FOMC_STATEMENT"].event_id == f"FOMC_STATEMENT:{end.isoformat()}"
+    if pc_utc is None:
+        assert "FOMC_PRESS_CONF" not in ev.index
+    else:
+        assert ev.loc["FOMC_PRESS_CONF"].ts_utc == pd.Timestamp(pc_utc, tz="UTC")
+
+
+def test_fomc_time_rules_config_errors(cfg):
+    c = copy.deepcopy(cfg)
+    c["fomc"]["time_rules"][2]["valid_from"] = "2012-12-01"     # Ueberlappung
+    with pytest.raises(fc.ConfigError, match="2 passende"):
+        fc.fomc_times(date(2012, 12, 12), False, c)
+    c = copy.deepcopy(cfg)
+    c["fomc"]["time_rules"] = c["fomc"]["time_rules"][2:]        # Luecke vor 2013
+    with pytest.raises(fc.ConfigError, match="0 passende"):
+        fc.fomc_events([_m(date(2012, 1, 25), True)], c, FA)
+    with pytest.raises(fc.ConfigError):                         # PK vor 2011-04-27 ohne Regel
+        fc.fomc_times(date(2011, 1, 26), True, cfg)
+
+
+def test_fomc_historical_pages_use_period_times(cfg):
+    y2012 = _historical(2012, ["January 24-25 Meeting SEP", "March 13 Meeting",
+                               "April 24-25 Meeting SEP", "June 19-20 Meeting SEP",
+                               "July 31-August 1 Meeting", "September 12-13 Meeting SEP",
+                               "October 23-24 Meeting", "December 11-12 Meeting SEP"])
+    ev = fc.fomc_events(fc.parse_fomc_page(y2012, 2012), cfg, FA).set_index("event_id")
+    assert ev.loc["FOMC_STATEMENT:2012-08-01"].ts_utc == pd.Timestamp("2012-08-01 18:15", tz="UTC")
+    assert ev.loc["FOMC_STATEMENT:2012-09-13"].ts_utc == pd.Timestamp("2012-09-13 16:30", tz="UTC")
+    assert ev.loc["FOMC_PRESS_CONF:2012-09-13"].ts_utc == pd.Timestamp("2012-09-13 18:15", tz="UTC")
+    fc.validate(ev.reset_index()[fc.COLUMNS], cfg, 2030, date(2026, 1, 1))   # Lokalzeiten plausibel
+
+
 def test_fomc_plausibility_too_few_meetings(cfg):
     html = FOMC_CURRENT
     for days in ("27-28", "28-29"):            # zwei 2026er-Zeilen entfernen
@@ -629,32 +687,104 @@ def test_second_run_rescheduled_cancelled_and_new_snapshot(cfg, net, tmp_path):
     assert {c["event_id"] for c in rep["changes"]["cancelled"]} == {"CPI:2026-05-12"}
 
 
-def test_source_failure_writes_nothing(cfg, net, tmp_path):
-    assert fc.run(["fred", "fomc", "ecb", "adhoc"], 2024, tmp_path, now=NOW, cfg=cfg)[0] == 0
-    before = fc.events_path(tmp_path).read_bytes()
-    net.fail["ecb.europa.eu"] = 503
-    code, rep = fc.run(["fred", "fomc", "ecb", "adhoc"], 2024, tmp_path,
-                       now=NOW + timedelta(days=1), cfg=cfg)
+ALL = ["fred", "fomc", "ecb", "adhoc"]
+
+
+def _rows(root, source):
+    df = pd.read_parquet(fc.events_path(root))
+    return df[df["source"] == source].sort_values("event_id").reset_index(drop=True)
+
+
+@pytest.mark.parametrize("breakage", ["http", "plausibility"])
+def test_source_failure_keeps_its_events_and_updates_others(cfg, net, tmp_path, breakage):
+    assert fc.run(ALL, 2024, tmp_path, now=NOW, cfg=cfg)[0] == 0
+    ecb_before = _rows(tmp_path, "ecb")
+    assert len(ecb_before) == 20
+    if breakage == "http":
+        net.fail["ecb.europa.eu"] = 503
+    else:                                      # Seite umgebaut: 2025 nur noch 2 Termine erkannt
+        net.ecb = ECB_HTML.replace("monetary policy meeting, Day 2", "Sitzung, Tag 2", 6)
+    # gleichzeitig neuer CPI-Termin bei FRED
+    net.dates[10] = net.dates[10] + [date(2027, 1, 13)]
+    later = NOW + timedelta(days=1)
+    code, rep = fc.run(ALL, 2024, tmp_path, now=later, cfg=cfg)
     assert code == 3
-    assert rep["sources"]["ecb"]["status"] == "error" and rep["written"] is None
-    assert fc.events_path(tmp_path).read_bytes() == before
-    assert len(list((tmp_path / "calendar" / "snapshots").glob("*.parquet"))) == 1
-    assert len(list((tmp_path / "calendar" / "reports").glob("*.json"))) == 2
+    assert rep["sources_failed"] == ["ecb"]
+    assert rep["sources"]["ecb"]["status"] == "error"
+    assert rep["sources"]["ecb"]["kept_from_previous"] == 20
+    assert rep["written"] is not None
+    # EZB-Zeilen exakt unveraendert (auch status und fetched_at), nicht cancelled
+    pd.testing.assert_frame_equal(_rows(tmp_path, "ecb"), ecb_before)
+    assert not any(c["source"] == "ecb" for c in rep["changes"]["cancelled"])
+    # uebrige Quellen aktualisiert
+    e = pd.read_parquet(fc.events_path(tmp_path)).set_index("event_id")
+    assert e.loc["CPI:2027-01-13"].fetched_at == pd.Timestamp(later)
+    assert e.loc["CPI:2027-01-13"].status == "scheduled"
+    assert len(list((tmp_path / "calendar" / "snapshots").glob("*.parquet"))) == 2
+    saved = json.loads((tmp_path / "calendar" / "reports" /
+                        f"calendar-{fc.stamp(later)}.json").read_text())
+    assert saved["exit_code"] == 3 and saved["sources_failed"] == ["ecb"]
 
 
-def test_parse_failure_on_first_run_writes_no_table(cfg, net, tmp_path):
+def test_failed_source_then_recovers(cfg, net, tmp_path):
+    assert fc.run(ALL, 2024, tmp_path, now=NOW, cfg=cfg)[0] == 0
+    net.fail["ecb.europa.eu"] = 503
+    assert fc.run(ALL, 2024, tmp_path, now=NOW + timedelta(days=1), cfg=cfg)[0] == 3
+    del net.fail["ecb.europa.eu"]
+    code, rep = fc.run(ALL, 2024, tmp_path, now=NOW + timedelta(days=2), cfg=cfg)
+    assert code == 0 and rep["sources_failed"] == []
+    assert rep["changes"]["cancelled"] == [] and rep["changes"]["rescheduled"] == []
+
+
+def test_first_run_missing_source_writes_if_valid(cfg, net, tmp_path):
+    # ohne FOMC reichen NFP+CPI+PCE (36) fuer 2024 -> wird geschrieben, Exit 3
     net.fomc = "<html><body>Seite in Wartung</body></html>"
-    code, rep = fc.run(["fred", "fomc", "ecb", "adhoc"], 2024, tmp_path, now=NOW, cfg=cfg)
+    code, rep = fc.run(ALL, 2024, tmp_path, now=NOW, cfg=cfg)
     assert code == 3 and "ParseError" in rep["sources"]["fomc"]["error"]
+    assert rep["sources"]["fomc"]["kept_from_previous"] == 0
+    ev = pd.read_parquet(fc.events_path(tmp_path))
+    assert "fomc" not in set(ev["source"]) and {"fred", "ecb"} <= set(ev["source"])
+    assert len(list((tmp_path / "calendar" / "snapshots").glob("*.parquet"))) == 1
+
+
+def test_first_run_missing_source_invalid_writes_nothing(cfg, net, tmp_path):
+    # ohne FRED nur FOMC (16 High-Impact 2024) -> Validierung schlaegt fehl, Exit 2
+    net.fail["stlouisfed"] = 500
+    code, rep = fc.run(ALL, 2024, tmp_path, now=NOW, cfg=cfg)
+    assert code == 2 and "zu wenige High-Impact" in rep["validation_error"]
+    assert rep["sources_failed"] == ["fred"]
     assert not fc.events_path(tmp_path).exists()
     assert not (tmp_path / "calendar" / "snapshots").exists()
 
 
-def test_fred_wrong_id_aborts_run(cfg, net, tmp_path):
+def test_fred_wrong_id_aborts_fred_only(cfg, net, tmp_path):
+    assert fc.run(ALL, 2024, tmp_path, now=NOW, cfg=cfg)[0] == 0
+    fred_before = _rows(tmp_path, "fred")
     net.names[10] = "Industrial Production and Capacity Utilization"
-    code, rep = fc.run(["fred", "fomc", "ecb", "adhoc"], 2024, tmp_path, now=NOW, cfg=cfg)
+    net.calls.clear()
+    code, rep = fc.run(ALL, 2024, tmp_path, now=NOW + timedelta(days=1), cfg=cfg)
     assert code == 4 and "release_id=10" in rep["sources"]["fred"]["error"]
+    # harter Abbruch der Quelle: keine FRED-Termine mehr abgefragt, alter Stand bleibt
+    assert not any(u.endswith("/release/dates") and p["release_id"] in (10, 54, 53, 46, 9, 180)
+                   for u, p in net.calls)
+    pd.testing.assert_frame_equal(_rows(tmp_path, "fred"), fred_before)
+
+
+def test_fred_wrong_id_first_run_writes_nothing(cfg, net, tmp_path):
+    net.names[10] = "Industrial Production and Capacity Utilization"
+    code, rep = fc.run(ALL, 2024, tmp_path, now=NOW, cfg=cfg)
+    assert code == 2 and rep["sources_failed"] == ["fred"]
     assert not fc.events_path(tmp_path).exists()
+
+
+def test_failed_source_plus_mass_cancellation_writes_nothing(cfg, net, tmp_path):
+    assert fc.run(ALL, 2024, tmp_path, now=NOW, cfg=cfg)[0] == 0
+    before = fc.events_path(tmp_path).read_bytes()
+    net.fail["ecb.europa.eu"] = 503
+    net.dates[50] = net.dates[50][::2]
+    code, rep = fc.run(ALL, 2024, tmp_path, now=NOW + timedelta(days=1), cfg=cfg)
+    assert code == 2 and "gestrichen" in rep["validation_error"]
+    assert fc.events_path(tmp_path).read_bytes() == before
 
 
 def test_validation_abort_writes_nothing(cfg, net, tmp_path):

@@ -101,12 +101,20 @@ einen anderen Tag erscheint daher als cancelled (alter Tag) + neues Event
 bleiben unveraendert (die EZB-Seite zeigt nur den aktuellen Kalender; die
 EZB-Historie waechst ab dem ersten Lauf).
 
+Fehler je Quelle: Schlaegt eine Quelle fehl (Abruf/Parser/Plausibilitaet),
+bleiben ihre Zeilen aus dem letzten Stand unveraendert (nicht cancelled),
+die uebrigen Quellen werden aktualisiert und geschrieben; Report nennt die
+Quelle (sources_failed), Exit 3 (4 bei Konfigfehler). Harte Validierung der
+zusammengefuehrten Tabelle verletzt -> nichts geschrieben, Exit 2.
+
 Regeln / Uhrzeiten:
 - FRED-Releases 08:30 ET (Employment Situation=NFP, CPI, Personal Income
   and Outlays=PCE, GDP, PPI, Retail Sales, Jobless Claims)
-- FOMC: Statement 14:00 ET am letzten Sitzungstag; Pressekonferenz 14:30 ET
-  ab 2019 bei jeder Sitzung, davor nur bei SEP-Sitzungen ab April 2011;
-  Minutes 14:00 ET nur, wenn das Datum auf der Seite steht. unscheduled /
+- FOMC: Statement am letzten Sitzungstag. Uhrzeiten ET je Zeitraum
+  (fomc.time_rules): bis 2012-12-31 Statement 14:15; Sitzungen MIT PK
+  2011-04-27..2012-12-31 Statement 12:30, PK 14:15; ab 2013-01-01 Statement
+  14:00, PK 14:30. PK ab 2019 bei jeder Sitzung, davor nur bei SEP-Sitzungen
+  ab April 2011. Minutes 14:00 ET nur, wenn das Datum auf der Seite steht. unscheduled /
   notation vote / Conference Call werden uebersprungen (Report).
 - EZB: Entscheidung 13:45, PK 14:30 Europe/Berlin bis 2022-07-20; ab
   2022-07-21 14:15 bzw. 14:45.
@@ -120,6 +128,6 @@ Annahmen (ohne Netz erstellt, nicht verifiziert):
   geschriebene Fixtures gebaut; abgesichert durch Plausibilitaet je Jahr
   (FOMC 7-10 regulaere Sitzungen, EZB 6-12 Entscheidungen).
 - 08:30 ET fuer alle FRED-Releases ueber die ganze Historie; FOMC-Uhrzeiten
-  vor 2013 lagen vermutlich teils anders (nicht umgesetzt).
+  vor 2013 (14:15 bzw. 12:30/14:15) aus Vorwissen.
 - Nach jeder geldpolitischen EZB-Sitzung eine Pressekonferenz.
 - ff-Titel (Kreuzcheck, nur Report).

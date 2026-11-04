@@ -118,16 +118,25 @@ Schema and sources are in [DATA.md](DATA.md#wirtschaftskalender); settings in
 - **Hard validation** (schema, UTC, no NaT, event_id vs. local date, impact
   vs. config, plausible local hour, at least 30 high-impact events per
   complete year from 2010, at most 10 newly cancelled high-impact events per
-  run). If any source fails or validation fails, **nothing** is written, the
-  old state stays, and the exit code is non-zero (2 validation, 3 source,
-  4 config). A JSON report is written to `calendar/reports/` either way.
+  run) on the merged table. If it fails, **nothing** is written, the old
+  state stays, exit code 2.
+- **Fault tolerance per source.** If one source fails (download, parser or
+  plausibility check), its events from the last state stay **unchanged** (not
+  cancelled), the other sources are updated and written as usual, and the run
+  still exits non-zero (3; 4 for a config error such as the FRED name check),
+  so systemd/alerting fires. A changed ECB page therefore can't block new
+  CPI/NFP dates. On the very first run, a missing source is fine as long as
+  the validation still passes. A JSON report (incl. failed sources) is
+  written to `calendar/reports/` either way.
 - **Cross-check** against the faireconomy weekly JSON is report-only: time
   differences over 5 minutes are listed, nothing is taken over, and failures
   of that source are not fatal.
 - Not verified without network access when this was written: page structures
   of federalreserve.gov and ecb.europa.eu (the parsers were built against
   self-written fixtures), FRED release IDs (hence the name check), the FOMC
-  press-conference rule before 2019, ff titles. The ECB page covers only the
+  press-conference rule before 2019, the FOMC times before 2013 (14:15, and
+  12:30 statement / 14:15 press conference at press-conference meetings from
+  2011-04-27; configurable periods in `fomc.time_rules`), ff titles. The ECB page covers only the
   current calendar, so ECB history builds up from the first run on.
 
 ### Backtester (`scripts/bt`)
@@ -329,7 +338,7 @@ units only get write access to `/opt/marketdata/data`.
 |---|---|
 | `marketdata-collector.service` | **Running in production.** The file in `systemd/` is the deployed unit, unchanged. It reads `/etc/marketdata.env`; template: [`.env.example`](.env.example). |
 | `marketdata-compact.service` + `.timer` | **Deployed and running.** Compacts completed UTC days, daily at 00:30 UTC. `Persistent=true` catches up on runs missed while the container was down. |
-| `marketdata-calendar.service` + `.timer` | **New, not deployed yet.** Economic calendar, daily at 05:10 UTC, `Persistent=true`. Reads `FRED_API_KEY` from `/etc/marketdata.env` (`EnvironmentFile=-`, optional). Exits non-zero if a source or the validation fails. Needs `pyyaml` (`pip install -r requirements.txt`). |
+| `marketdata-calendar.service` + `.timer` | **New, not deployed yet.** Economic calendar, daily at 05:10 UTC, `Persistent=true`. Reads `FRED_API_KEY` from `/etc/marketdata.env` (`EnvironmentFile=-`, optional). Exits non-zero if a source or the validation fails (a failed source keeps its old events, the rest is still written). Needs `pyyaml` (`pip install -r requirements.txt`). |
 
 There is no timer for `fetch_klines.py`; historical data is fetched manually.
 

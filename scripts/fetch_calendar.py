@@ -17,8 +17,12 @@ laden, historisch und laufend.
 - Merge mit dem letzten Stand: gleiche event_id -> neueste Quelle gewinnt;
   ts_utc geaendert -> status rescheduled; Event einer Quelle verschwindet
   innerhalb des neu abgerufenen Zeitraums -> status cancelled (Zeile bleibt)
-- harte Validierung vor dem Schreiben; schlaegt eine Quelle fehl, wird NICHTS
-  geschrieben (alter Stand bleibt), Report + Exit-Code != 0
+- Fehlertoleranz je Quelle: schlaegt eine Quelle fehl (Abruf, Parser,
+  Plausibilitaet), bleiben IHRE Events aus dem letzten Stand unveraendert
+  (nicht cancelled), die uebrigen Quellen werden normal aktualisiert und
+  geschrieben; Report nennt die Quelle, Exit-Code 3 (4 bei Konfigfehler)
+- harte Validierung der zusammengefuehrten Tabelle vor dem Schreiben;
+  verletzt -> NICHTS geschrieben (alter Stand bleibt), Exit-Code 2
 
 Ablage (DATA_ROOT = $MARKETDATA_DATA_ROOT, sonst <repo>/data):
     calendar/events.parquet                               aktueller Stand
@@ -38,8 +42,10 @@ Schema events.parquet (verbindlich, wird von anderen Komponenten gelesen):
     fetched_at  datetime64[ns, UTC]  Abrufzeit des Laufs, der die Zeile
                                      zuletzt geliefert/geaendert hat
 
-Exit-Codes: 0 ok, 2 Validierung, 3 Quelle fehlgeschlagen, 4 Konfiguration
-(z.B. FRED-Namens-Check).
+Exit-Codes: 0 ok, 2 Validierung (nichts geschrieben), 3 mindestens eine
+Quelle fehlgeschlagen (Rest geschrieben), 4 Konfiguration einer Quelle (z.B.
+FRED-Namens-Check; diese Quelle bleibt auf dem alten Stand, Rest geschrieben).
+Vorrang: 2 vor 4 vor 3.
 
 Usage:
     FRED_API_KEY=... python fetch_calendar.py
@@ -536,6 +542,32 @@ def has_press_conf(m: Meeting, cfg: dict) -> bool:
     return m.end >= every or (m.sep and m.end >= sep_from)
 
 
+def _opt_date(v) -> date | None:
+    return None if v in (None, "") else date.fromisoformat(str(v))
+
+
+def fomc_times(d: date, with_press_conf: bool, cfg: dict) -> tuple[str, str | None]:
+    """
+    (Statement, Pressekonferenz|None) America/New_York fuer Sitzungsende d aus
+    fomc.time_rules. Genau eine Regel muss passen (Datum inklusive valid_from/
+    valid_to und with_press_conf true/false/null), sonst ConfigError.
+    """
+    hits = []
+    for r in cfg["fomc"]["time_rules"]:
+        lo, hi = _opt_date(r.get("valid_from")), _opt_date(r.get("valid_to"))
+        wpc = r.get("with_press_conf")
+        if (lo is None or d >= lo) and (hi is None or d <= hi) and \
+                (wpc is None or bool(wpc) == with_press_conf):
+            hits.append(r)
+    if len(hits) != 1:
+        raise ConfigError(f"FOMC {d} (PK={with_press_conf}): {len(hits)} passende "
+                          f"time_rules, erwartet genau 1")
+    r = hits[0]
+    if with_press_conf and not r.get("press_conf"):
+        raise ConfigError(f"FOMC {d}: Regel ab {r.get('valid_from')} ohne press_conf-Uhrzeit")
+    return r["statement"], (r.get("press_conf") if with_press_conf else None)
+
+
 def fomc_events(meetings: list[Meeting], cfg: dict, fetched_at: pd.Timestamp) -> pd.DataFrame:
     fc, rows = cfg["fomc"], []
     for m in meetings:
@@ -543,10 +575,11 @@ def fomc_events(meetings: list[Meeting], cfg: dict, fetched_at: pd.Timestamp) ->
         # bekannte Faelle stehen in calendar_adhoc.csv
         if m.kind != "regular":
             continue
-        rows.append(make_event(cfg, "FOMC_STATEMENT", m.end, fc["statement_time"], "US",
-                               "fomc", fetched_at))
-        if has_press_conf(m, cfg):
-            rows.append(make_event(cfg, "FOMC_PRESS_CONF", m.end, fc["press_conf_time"], "US",
+        pc = has_press_conf(m, cfg)
+        st_time, pc_time = fomc_times(m.end, pc, cfg)
+        rows.append(make_event(cfg, "FOMC_STATEMENT", m.end, st_time, "US", "fomc", fetched_at))
+        if pc:
+            rows.append(make_event(cfg, "FOMC_PRESS_CONF", m.end, pc_time, "US",
                                    "fomc", fetched_at))
         if m.minutes_released:
             rows.append(make_event(cfg, "FOMC_MINUTES", m.minutes_released, fc["minutes_time"],
@@ -959,7 +992,12 @@ FETCHERS = {"fred": fetch_fred, "fomc": fetch_fomc, "ecb": fetch_ecb, "adhoc": f
 def run(sources: list[str], start_year: int = 2003, data_root: Path | None = None,
         dry_run: bool = False, now: datetime | None = None,
         cfg: dict | None = None) -> tuple[int, dict]:
-    """Rueckgabe (exit_code, report). Schreibt nur, wenn alles gruen ist."""
+    """
+    Rueckgabe (exit_code, report). Fehlgeschlagene Quellen behalten ihren
+    alten Stand, der Rest wird geschrieben (Exit 3/4). Verletzt die
+    zusammengefuehrte Tabelle eine harte Validierung, wird nichts geschrieben
+    (Exit 2). Der Report wird ausser bei --dry-run immer geschrieben.
+    """
     data_root = data_root or default_data_root()
     cfg = cfg or load_config()
     now_ts = pd.Timestamp(now or datetime.now(timezone.utc)).tz_convert("UTC").as_unit("ns")
@@ -997,9 +1035,16 @@ def run(sources: list[str], start_year: int = 2003, data_root: Path | None = Non
         report["sources"][name] = {"status": "ok", "events": len(df), **ctx}
 
     prev = read_events(events_path(data_root))
-    if failed:
-        log.error("Quellen fehlgeschlagen: %s - nichts geschrieben, alter Stand bleibt", failed)
-        return finish(4 if config_failed else 3)
+    report["sources_failed"] = failed
+    for name in failed:
+        # Events einer fehlgeschlagenen Quelle bleiben unveraendert: sie liefert
+        # nichts Neues, also gibt es fuer sie keinen Abdeckungsbereich und
+        # merge_with_previous streicht/aendert keine ihrer Zeilen.
+        kept = 0 if prev is None else int((prev["source"] == name).sum())
+        report["sources"][name]["kept_from_previous"] = kept
+        log.error("Quelle %s fehlgeschlagen: %d Events aus dem letzten Stand bleiben "
+                  "unveraendert, uebrige Quellen werden aktualisiert", name, kept)
+    fail_code = (4 if config_failed else 3) if failed else 0
 
     new = combine_new(frames)
     table, changes = merge_with_previous(prev, new, now_ts)
@@ -1029,7 +1074,9 @@ def run(sources: list[str], start_year: int = 2003, data_root: Path | None = Non
     log.info("FERTIG: %d Events (neu %d, verschoben %d, gestrichen %d)%s", len(table),
              len(changes["added"]), len(changes["rescheduled"]), len(changes["cancelled"]),
              " [dry-run, nichts geschrieben]" if dry_run else "")
-    return finish(0)
+    if failed:
+        log.error("Lauf unvollstaendig, fehlgeschlagene Quellen: %s (Exit %d)", failed, fail_code)
+    return finish(fail_code)
 
 
 def main() -> int:
