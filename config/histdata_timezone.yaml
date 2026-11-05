@@ -1,0 +1,37 @@
+# Stempelungsregeln der HistData-Rohzeitstempel (scripts/fetch_histdata.py).
+#
+# Regel: Rohzeit (Wanduhr-Ziffern der Datei) = Ortszeit in `zone` + shift_h Stunden.
+# Eingebaut (nicht neu definieren):
+#   berlin_minus_6  Europe/Berlin - 6 h: UTC-5 im EU-Winter, UTC-4 in der EU-
+#                   Sommerzeit; Wechsel letzter So Maerz/Oktober 01:00 UTC.
+#                   Im Homelab an echten Ticks gemessen (XAUUSD, XAGUSD, EURUSD):
+#                   2024-03 bleibt nach der US-Umstellung (10.03.) bis 31.03. bei
+#                   -5 h (Tagespause roh 15:59:59 -> 17:00:00), 2024-10 schon ab
+#                   27.10. (EU) wieder -5 h; Januar und Juli passen.
+#   ny_local        America/New_York (Pruefversion 4, fuer Ticks widerlegt)
+#   fixed_est       Etc/GMT+5 = fest UTC-5 (HistData-Angabe; fuer M1 NICHT verifiziert)
+#
+# Eigene Regeln (optional), Namen eindeutig, nur a-z 0-9 _:
+#   rules:
+#     - {name: my_rule, zone: Europe/London, shift_h: -5}
+#
+# schedule: je Modus (tick, m1) die Regel ab einem ROH-Monat ("YYYY-MM",
+# aufsteigend, keine doppelten Monate). Ein Wechsel gilt nur an
+# Rohmonatsgrenzen. Beispiel - ab 2012-01 eine andere Regel:
+#   tick:
+#     - {from: "2000-01", rule: fixed_est}
+#     - {from: "2012-01", rule: berlin_minus_6}
+# Nach einer Aenderung: betroffene Store-Dateien werden beim naechsten Lauf
+# erkannt (source_timezone passt nicht), verschobene sofort nach metals/stale/
+# gelegt und aus dem Roh-Cache neu gebaut. Pruefen vorher offline:
+#   python scripts/histdata_tz_survey.py ...   (nutzt evaluate_raw_month)
+# Ungueltige Datei (unbekannte Regel/Zone, unsortiert) -> Abbruch, nie still ein Default.
+# Andere Datei: Umgebungsvariable HISTDATA_TZ_CONFIG.
+
+rules: []
+
+schedule:
+  tick:
+    - {from: "2000-01", rule: berlin_minus_6}
+  m1:
+    - {from: "2000-01", rule: fixed_est}     # M1 unverifiziert: --mode m1 --verify-month 2024-07

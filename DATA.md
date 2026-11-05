@@ -198,19 +198,24 @@ Handelskalender des Bots.
 Lizenz: Dukascopy-Nutzungsbedingungen selbst pruefen. Daten (roh und
 abgeleitet) nicht weitergeben und nicht committen.
 
-## Metalle / FX (HistData, Default-Quelle)
+## Metalle (HistData, Default-Quelle)
 
-Symbole:  XAUUSD, XAGUSD, EURUSD (1m, Bid- und Ask-OHLC)
+Symbole:  XAUUSD, XAGUSD (1m, Bid- und Ask-OHLC). EURUSD NICHT mehr ueber
+          HistData (keine Tagespause, zu wenige Zeitanker, --verify-month
+          2024-11 bestand faelschlich); der Bot nutzt einen Tages-
+          Referenzkurs (EZB/FRED). --symbol EURUSD wird mit diesem Hinweis
+          abgelehnt; fetch_dukascopy.py unveraendert.
 Stand:    noch nicht geladen (scripts/fetch_histdata.py)
 Quelle:   histdata.com, Generic ASCII; Default Ticks je Monat (--mode tick),
           optional M1 nur Bid (--mode m1, EIGENE Partition). Dukascopy
           liefert im Homelab HTTP 429 je IP.
 Format:   wie Dukascopy (Parquet/zstd, gleiche Spalten und dtypes), nur
           Partition source=histdata (Ticks) bzw. source=histdata_m1 (M1)
-Zeitzone: UTC; Rohzeit Ticks = New-York-Ortszeit MIT Sommerzeit (gemessen,
-          entgegen der HistData-Angabe "EST ohne Sommerzeit"); M1 fest
-          UTC-5 laut HistData (NICHT verifiziert). JE ROHMONAT im Code
-          geprueft (s. u.)
+Zeitzone: UTC; Rohzeit Ticks = Europe/Berlin - 6 h (Regel berlin_minus_6,
+          im Homelab gemessen; entgegen der HistData-Angabe "EST ohne
+          Sommerzeit" und der Vorversion America/New_York); M1 fest UTC-5
+          laut HistData (NICHT verifiziert). Regeln/Fahrplan:
+          config/histdata_timezone.yaml. JE ROHMONAT im Code geprueft (s. u.)
 Recherche, Quellen, Offenes: docs/histdata_research.md
 
 Store (SRC = histdata im Tickmodus, histdata_m1 im M1-Modus):
@@ -225,16 +230,17 @@ Store (SRC = histdata im Tickmodus, histdata_m1 im M1-Modus):
                                    confirmed, confirmed_at, checks; "accepted": true
                                    = Luecke in der Historie manuell akzeptiert)
         <zip>[.YYYY-MM].quarantine Zeitzone/Format (JSON mit Pruefbericht,
-                                   raw_tz, tz_check_version):
+                                   tz_rule, raw_tz, tz_shift_h, tz_check_version):
                                    loeschen = erneut pruefen (ohne Download);
                                    "accepted": true = nach manueller Pruefung frei;
                                    ZIP loeschen = neu laden, der Download entfernt
                                    den Marker und es wird neu geprueft; nicht
                                    freigegebene Marker aelterer tz_check_version
-                                   oder anderer Zone: neu geprueft (ohne Download);
-                                   "accepted": true gilt nur bei gleichem raw_tz -
-                                   eine Freigabe der Vorversion (fest UTC-5, ohne
-                                   raw_tz) wird neu geprueft: besteht -> Marker
+                                   oder anderer Regel (z.B. v4 ny_local): neu
+                                   geprueft (ohne Download); "accepted": true gilt
+                                   nur bei gleicher Regel (Zone + Verschiebung) -
+                                   eine Freigabe unter anderer Regel wird neu
+                                   geprueft: besteht -> Marker
                                    weg, sonst accepted false mit "note"; Tick in
                                    nicht eindeutiger Ortszeit sperrt immer;
                                    unlesbarer Marker (JSON-Fehler): ERROR, bleibt,
@@ -248,23 +254,24 @@ Store (SRC = histdata im Tickmodus, histdata_m1 im M1-Modus):
 Spalten: wie Dukascopy (ts UTC ms, Label links; bid_/ask_open/high/low/close
 float64; tick_count int64; bid_volume, ask_volume float64; source = SRC).
 Parquet-Metadaten: histdata_mode = histdata_tick|histdata_m1,
-spread_available = true|false, source_timezone = aus RAW_TZ und
-TZ_CHECK_VERSION abgeleitet, z.B. "America/New_York -> UTC, je Rohmonat
-geprueft (tz_check v4)" (tick) bzw. "Etc/GMT+5 -> UTC, ..." (m1). Zu Beginn
-JEDES Laufs werden alle Monatsdateien des Symbols/Modus geprueft (nicht nur
+spread_available = true|false, tz_right_padding = true|false, source_timezone
+= Regel(n) der Rohmonate mit Zone/Verschiebung und TZ_CHECK_VERSION, z.B.
+"berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v5)"
+(tick) bzw. "fixed_est (Etc/GMT+5 +0 h) -> ..." (m1). Zu Beginn JEDES Laufs
+werden alle Monatsdateien des Symbols/Modus geprueft (nicht nur
 --start/--end):
-  gleiche Umrechnungszone, aeltere Pruefversion (z.B. m1 der Vorversionen,
-    Tick-Dateien der Pruefung v2/v3): Rohmonate aus dem Cache neu pruefen
-    (kein Download); besteht -> nur Metadaten erneuert (relabelled_timezone),
-    faellt durch -> nach metals/stale/ + Quarantaene (retired_after_recheck),
-    Roh-Cache fehlt -> Datei bleibt (unverified_after_version_bump)
-  andere Umrechnung, die im Monat UTC-Zeiten verschiebt (Tick-Monate mit
-    EDT aus der Fest-UTC-5-Version, 1 h verschoben): SOFORT nach
-    metals/stale/... verschoben (nichts geloescht; der Bot sieht eher eine
-    Luecke als einen verschobenen Monat), auch ausserhalb des Bereichs
-    (stale_retired_out_of_range)
-  andere Umrechnung, im Monat aber gleiche UTC-Zeiten (Dez-Feb, nur EST):
-    bleibt liegen, bis der Neubau sie atomar ersetzt (stale_out_of_range)
+  andere/aeltere Kennzeichnung, im UTC-Monat aber dieselben UTC-Zeiten
+    (aeltere Pruefversion; ny_local-Dateien von Jan/Feb/Apr-Sep/Dez, wo
+    beide Regeln gleich sind; m1 der Vorversionen): Rohmonate aus dem Cache
+    unter der aktuellen Regel neu pruefen (kein Download); besteht -> nur
+    Metadaten erneuert (relabelled_timezone), faellt durch -> nach
+    metals/stale/ + Quarantaene (retired_after_recheck), Roh-Cache fehlt ->
+    Datei bleibt (unverified_after_version_bump)
+  andere Umrechnung, die im Monat UTC-Zeiten verschiebt (ny_local: Maerz,
+    Oktober, November = EU/US-Lueckenwochen; fest UTC-5: Monate mit
+    EU-Sommerzeit): SOFORT nach metals/stale/... verschoben (nichts
+    geloescht; der Bot sieht eher eine Luecke als einen verschobenen Monat),
+    auch ausserhalb des Bereichs (stale_retired_out_of_range)
 Monate im Bereich werden aus dem Roh-Cache neu gebaut (WARNING, Laufreport
 rebuilt_timezone; Ergebnis summary.months_rebuilt_timezone bzw.
 summary.months_stale_timezone_not_rebuilt, der naechste Lauf versucht es
@@ -288,32 +295,52 @@ keine Quarantaene-Marker.
         als Jahres-ZIP, laufendes Jahr monatlich.
 
 Zeitzone und Monatsgrenze:
-- Rohzeit-Zone je Modus (RAW_TZ): tick America/New_York (EST -5 h / EDT
-  -4 h; gemessen im Homelab an echten XAUUSD-Ticks: 2024-07 Tagespause
-  16:59:58 -> 18:00:01, Wochenschluss Fr 16:59:58, Wochenstart So 18:00:01,
-  alle 38 Anker bei -4 h; 2024-01 bei -5 h), m1 Etc/GMT+5 = fest UTC-5
-  (HistData-Angabe, fuer M1 NICHT verifiziert; pruefen mit
-  --mode m1 --verify-month 2024-07).
-- Umrechnung raw_to_utc_ms: Rohziffern als Ortszeit gelesen, exakt nach UTC.
-  Ortszeit in der Sommerzeit-Luecke (z.B. 2024-03-10 02:00-02:59:59.999,
-  existiert nicht) oder in der doppelten Stunde (z.B. 2024-11-03
-  01:00-01:59:59.999, mehrdeutig) wird NIE geraten: TimezoneError ->
-  Quarantaene (Exit 4); der Markt ist dann geschlossen.
-- UTC-Monat M = letzte 4 h (EDT) bzw. 5 h (EST) des Rohmonats M-1 +
-  Rohmonat M ohne diese Stunden an seinem Ende (aus RAW_TZ berechnet).
-  Geschrieben wird M nur, wenn beide Rohmonate erledigt sind (Daten,
-  bestaetigt leer oder vor Historienbeginn).
-- Pruefung je Rohmonat (check_timezone, Pruefversion 4): je Marktluecke ein
+- Stempelungsregel (TzRule: Rohzeit = Ortszeit in zone + shift_h) je
+  ROHmonat nach Fahrplan in config/histdata_timezone.yaml (andere Datei:
+  $HISTDATA_TZ_CONFIG). Eingebaut: berlin_minus_6 (Europe/Berlin, -6),
+  ny_local (America/New_York, 0), fixed_est (Etc/GMT+5, 0); weitere Regeln
+  in der Datei (Name eindeutig, Zone geprueft). schedule je Modus:
+  [{from: "YYYY-MM", rule: name}] aufsteigend, Wechsel nur an
+  Rohmonatsgrenzen. Unbekannte Regel/Zone, unsortiert/doppelt, fehlender
+  Modus -> Abbruch (nie still ein Default). Default: tick berlin_minus_6 ab
+  2000-01, m1 fixed_est ab 2000-01.
+- tick berlin_minus_6 = UTC-5 im EU-Winter, UTC-4 in der EU-Sommerzeit
+  (Wechsel letzter So Maerz/Oktober 01:00 UTC). Gemessen im Homelab an
+  echten Ticks aller drei Symbole: 2024-03 bleibt von der US-Umstellung
+  (10.03.) bis Monatsende bei -5 h (Tagespause roh 15:59:59 -> 17:00:00 statt
+  16:59 -> 18:00), Wechsel auf -4 h erst zur EU-Umstellung (31.03.); 2024-10
+  ab 27.10. (EU) schon -5 h, nicht erst ab 03.11.; Januar und Juli passen
+  (2024-07 Tagespause 16:59:58 -> 18:00:01, 2024-01 -5 h). Die Marktzeiten
+  bleiben New York (Anker 17:00/18:00 America/New_York), nur die Stempelung
+  folgt Berlin. m1 fixed_est = fest UTC-5 (HistData-Angabe, fuer M1 NICHT
+  verifiziert; pruefen mit --mode m1 --verify-month 2024-07).
+- Regel fuer einen Zeitraum aendern: Eintrag in schedule (z.B.
+  {from: "2012-01", rule: berlin_minus_6} nach {from: "2000-01", rule:
+  fixed_est}); vorher Kandidaten offline gegen den Roh-Cache abgleichen
+  (scripts/histdata_tz_survey.py, nutzt evaluate_raw_month: nur Cache, kein
+  Download, keine Marker). Der naechste Lauf erkennt betroffene
+  Monatsdateien an source_timezone (s. o.).
+- Umrechnung raw_to_utc_ms(raw, rule): Rohziffern - shift_h als Ortszeit der
+  Regel-Zone, exakt nach UTC. Ortszeit in der Sommerzeit-Luecke oder der
+  doppelten Stunde (berlin_minus_6: roh Samstag 20:00-20:59:59.999 in den
+  Umstellungsnaechten) wird NIE geraten: TimezoneError -> Quarantaene (Exit
+  4); der Markt ist dann geschlossen.
+- UTC-Monat M = letzte 4 h (EU-Sommer) bzw. 5 h (EU-Winter/M1) des
+  Rohmonats M-1 + Rohmonat M ohne diese Stunden an seinem Ende (aus dem
+  Fahrplan berechnet). Geschrieben wird M nur, wenn beide Rohmonate erledigt
+  sind (Daten, bestaetigt leer oder vor Historienbeginn).
+- Pruefung je Rohmonat (check_timezone, Pruefversion 5): je Marktluecke ein
   Schluss- und ein Oeffnungsanker: Wochenende (>= 24 h, Schluss Do/Fr,
-  Oeffnung So/Mo; Fr 17:00 -> So 18:00 Metalle / 17:00 EURUSD New York;
+  Oeffnung So/Mo; Fr 17:00 -> So 18:00 New York;
   andere Luecken >= 24 h sind Ausfaelle: nur Bericht "outages"),
   Tagespause der Metalle Mo-Do (17:00-18:00 New York; nur wenn ALLE
   pausenartigen Luecken des Tages dieselbe eindeutige Abweichung <= 1 h
   ergeben - so ersetzt kein Ausfall die echte Pause). Kontext: die Ticks der
   ersten/letzten 8 Tage der gecachten Nachbar-Rohmonate (Luecken ueber den
   Monatsrand). Erwartete Marktzeiten per zoneinfo America/New_York,
-  erwarteter Offset je Anker aus RAW_TZ[mode] im Ereigniszeitpunkt (tick -4 h
-  in EDT, -5 h in EST; m1 immer -5 h); entschieden wird ueber Abweichung =
+  erwarteter Offset je Anker aus der Regel des Rohmonats im Ereigniszeitpunkt
+  (berlin_minus_6 -5 h im EU-Winter, -4 h im EU-Sommer; fixed_est immer
+  -5 h); entschieden wird ueber Abweichung =
   implizit - erwartet, je Luecke aus beiden Seiten gemeinsam (Schluss nicht
   vor dem letzten Tick, Toleranz 15 min; Oeffnung nicht nach dem ersten,
   5 min) - auch bei duennen Daten richtig.
@@ -348,14 +375,15 @@ Zeitzone und Monatsgrenze:
 - Unverifiziert: Zeitzone der M1-Dateien. Drittquellen sehen je Oktober
   60 doppelte M1-Minuten (Hinweis auf eine Uhr mit Umstellung). Vor dem
   ersten M1-Volllauf: --mode m1 --verify-month 2024-07; liegt die
-  Median-Abweichung bei +1, RAW_TZ["m1"] bewusst umstellen.
+  Median-Abweichung bei +1, den m1-Fahrplan in config/histdata_timezone.yaml
+  bewusst umstellen.
 
 Verfuegbarkeit / "keine Daten":
-- Historienbeginn (ASCII M1, Auswahlliste): XAUUSD 2009-03, XAGUSD 2009-05,
-  EURUSD 2000-05. Tick-Beginn NICHT verifiziert. Monate davor ohne Request
+- Historienbeginn (ASCII M1, Auswahlliste): XAUUSD 2009-03, XAGUSD 2009-05.
+  Tick-Beginn NICHT verifiziert. Monate davor ohne Request
   als nicht verfuegbar gelistet.
 - Angefragt wird ein Monat erst nach Rohmonatsende (UTC-Monatsende + 4 h
-  in EDT bzw. + 5 h in EST/M1) + 6 h. Leerer Body (keine Daten):
+  im EU-Sommer bzw. + 5 h im EU-Winter/M1) + 6 h. Leerer Body (keine Daten):
     bis 45 Tage nach Monatsende -> pending (Exit 3), erneute Pruefung
                                    fruehestens nach 24 h, nie bestaetigt
     danach                      -> unbestaetigt (Exit 3), bestaetigt, wenn
@@ -478,3 +506,56 @@ Annahmen (ohne Netz erstellt, nicht verifiziert):
   vor 2013 (14:15 bzw. 12:30/14:15) aus Vorwissen.
 - Nach jeder geldpolitischen EZB-Sitzung eine Pressekonferenz.
 - ff-Titel (Kreuzcheck, nur Report).
+
+## Zeitzonen-Survey (HistData-Ticks)
+
+Prueft, ob die Stempelregel der HistData-Ticks (`berlin_minus_6` =
+Europe/Berlin minus 6 h, gemessen fuer 2024) auch in frueheren Jahren gilt
+oder HistData anders gestempelt hat (`ny_local`, `fixed_est`, eigene Regeln
+aus config/histdata_timezone.yaml). Nur Tick-Modus, XAUUSD und XAGUSD.
+Homelab:
+
+    runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/histdata_tz_survey.py
+
+Default: Jahre 2010 2012 2015 2018 2021 2024, Umstellungsmonate 3 4 10 11,
+Kontrollmonate 1 7. Optionen: --symbols, --years, --months, --controls,
+--rules, --offline (nur Cache, kein Request), --max-downloads N (Rohmonate je
+Aufruf, default 60), --pause (default 5 s), --json PATH, -v.
+
+Ablauf: Fehlende Rohmonate werden in den normalen Roh-Cache geladen (je
+Rohmonat 2 Requests; die geplante Zahl steht vor dem ersten Download auf der
+Konsole), ueber den Client von fetch_histdata.py mit Symbol-Lock und der
+gemeinsamen 429-Sperre (data/metals/state/histdata-ratelimit.json). Bei 429
+oder aktiver Sperre bricht der Survey die Downloads sofort ab, wertet das
+Vorhandene aus und endet mit Exit 3; ein spaeterer Aufruf setzt fort. Danach
+wird jeder gecachte Rohmonat mit jeder Regel geprueft
+(fetch_histdata.evaluate_raw_month, nur Cache, schreibt nichts).
+
+Ergebnis lesen:
+- Tabelle je Symbol: je Rohmonat und Regel ok / failed / not_checkable und
+  die Median-Abweichung in h; Art T = Umstellungsmonat, K = Kontrollmonat;
+  Spalte "konfiguriert" = Regel laut aktuellem Fahrplan.
+- Entscheidend ist nur ein Rohmonat, in dem GENAU EINE Regel besteht und alle
+  anderen durchfallen. Januar/Juli unterscheiden berlin_minus_6 und ny_local
+  nicht; dort muessen alle Regeln mit Sommerzeit bestehen ("Kontrolle ok"),
+  sonst "Kontrolle gescheitert" (Grund-Offset pruefen). Besteht im Juli nur
+  fixed_est, ist das entscheidend (keine Sommerzeit).
+- Urteil je Jahr: "berlin_minus_6 passt" (passt zum Fahrplan), "nur X passt"
+  (anders als konfiguriert), "Wechsel im Jahr: ...", "keine Regel passt",
+  "nicht entscheidbar" (keine entscheidenden Monate).
+- Vorschlag fuer den Abschnitt `schedule` (YAML zum Kopieren). Die Datei wird
+  nicht geschrieben. Ein Wechsel liegt irgendwo zwischen den beiden
+  genannten Belegmonaten: vor dem Uebernehmen mit --years/--months (z.B. alle
+  Monate der Jahre dazwischen) genauer eingrenzen.
+- Exit 0: alle entscheidenden Monate passen zum Fahrplan. Exit 4: mindestens
+  ein entscheidender Monat widerspricht (Liste "WIDERSPRUCH"). Exit 3:
+  unvollstaendig (Download gescheitert, 429, --max-downloads erreicht,
+  Symbol-Lock belegt, bei --offline nicht im Cache). 4 geht vor 3.
+
+Fahrplan aendern: in config/histdata_timezone.yaml unter `schedule.tick`
+Eintraege `{from: "YYYY-MM", rule: name}` aufsteigend eintragen (ROH-Monat,
+Wechsel nur an Rohmonatsgrenzen; der erste Eintrag deckt alles davor ab),
+`schedule.m1` unveraendert lassen. Danach den Survey mit --offline erneut
+starten (soll Exit 0 liefern). Der naechste Lauf von fetch_histdata.py
+erkennt betroffene Monatsdateien an source_timezone und baut sie aus dem
+Roh-Cache neu.

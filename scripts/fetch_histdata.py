@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Historische HistData.com-Daten (XAUUSD, XAGUSD, EURUSD) als 1-Minuten-Bars
-mit Bid- UND Ask-OHLC laden. Default-Quelle fuer den Gold/Silber-Bot
-(Dukascopy drosselt per IP mit HTTP 429, s. fetch_dukascopy.py).
+Historische HistData.com-Daten (XAUUSD, XAGUSD) als 1-Minuten-Bars mit Bid-
+UND Ask-OHLC laden. Default-Quelle fuer den Gold/Silber-Bot (Dukascopy
+drosselt per IP mit HTTP 429, s. fetch_dukascopy.py). EURUSD kommt nicht
+mehr von hier (keine Tagespause, zu wenige Zeitanker, --verify-month 2024-11
+bestand faelschlich): der Bot nutzt einen Tages-Referenzkurs (EZB/FRED);
+--symbol EURUSD wird mit diesem Hinweis abgelehnt.
 
 Gleiches Ausgabeformat wie fetch_dukascopy.py (Spalten, dtypes, atomares
 Schreiben, Exit-Codes); der Bot unterscheidet die Quellen nur an der
@@ -30,32 +33,41 @@ Periodenseite -> ZIP (CSV + Status-.txt mit Lueckenliste). Leerer Body =
 keine Daten. Je Datei 2 Requests, immer nur einer gleichzeitig. 429 auf den
 POST -> nach der Pause wieder ab dem Seiten-GET (frisches Token).
 
-Zeitzone (RAW_TZ, je Modus; Rohzeit = Wanduhr-Ziffern der Datei):
-- tick: America/New_York MIT Sommerzeit (EST -5 h / EDT -4 h) - entgegen der
-  HistData-Angabe "EST WITHOUT Day Light Savings". Gemessen an echten
-  XAUUSD-Ticks (2024-07: Tagespause 16:59:58 -> 18:00:01, Wochenschluss Fr
-  16:59:58, Wochenstart So 18:00:01 = New-York-Sessionzeiten, alle 38 Anker
-  bei -4 h; 2024-01 bei -5 h), s. docs/histdata_research.md.
-- m1: Etc/GMT+5 = fest UTC-5 laut HistData-Angabe, fuer M1 NICHT verifiziert:
-  mit --mode m1 --verify-month 2024-07 (Sommermonat) pruefen.
-Umrechnung raw_to_utc_ms (vektorisiert, exakt auf die Millisekunde). Ortszeiten
-in der Sommerzeit-Luecke (z.B. 2024-03-10 02:00-02:59:59.999) oder der
-doppelten Stunde (z.B. 2024-11-03 01:00-01:59:59.999) werden NIE geraten:
-TimezoneError -> Quarantaene (Exit 4); der Markt ist dann ohnehin zu. Folge:
-UTC-Monat M braucht die Rohmonate M-1 (dessen letzte 4 h in EDT bzw. 5 h in
-EST; aus RAW_TZ berechnet) und M; er gilt nur als vollstaendig, wenn beide da
-sind (oder M-1 vor Historienbeginn bzw. bestaetigt leer ist).
-Die Zeitzone wird JE ROHMONAT aus den Daten geprueft (check_timezone, v4):
+Zeitzone = Stempelungsregel (TzRule: Rohzeit = Ortszeit in `zone` + shift_h)
+je ROHmonat nach Fahrplan in config/histdata_timezone.yaml (load_tz_config,
+rule_for; andere Datei per $HISTDATA_TZ_CONFIG; Fehler -> Abbruch, nie still
+ein Default). Wechsel nur an Rohmonatsgrenzen.
+- tick: berlin_minus_6 = Europe/Berlin - 6 h: UTC-5 im EU-Winter, UTC-4 in
+  der EU-Sommerzeit (Wechsel letzter So Maerz/Oktober 01:00 UTC). Im Homelab
+  an echten Ticks aller drei Symbole gemessen: 2024-03 bleibt nach der
+  US-Umstellung (10.03.) bis 31.03. bei -5 h (Tagespause roh 15:59:59 ->
+  17:00:00 statt 16:59 -> 18:00), 2024-10 ab der EU-Umstellung (27.10.) schon
+  -5 h; Januar/Juli passen. Widerlegt: ny_local (America/New_York, Pruef-
+  version 4) und die HistData-Angabe "EST ohne Sommerzeit". Die Marktzeiten
+  (Anker) bleiben New York/CME: 17:00/18:00 America/New_York.
+- m1: fixed_est = Etc/GMT+5 (fest UTC-5) laut HistData-Angabe, fuer M1 NICHT
+  verifiziert: mit --mode m1 --verify-month 2024-07 (Sommermonat) pruefen.
+Andere Regeln offline gegen den Roh-Cache abgleichen: evaluate_raw_month
+(scripts/histdata_tz_survey.py).
+Umrechnung raw_to_utc_ms(raw, rule) (vektorisiert, exakt auf die
+Millisekunde). Ortszeiten in der Sommerzeit-Luecke oder der doppelten Stunde
+der Regel-Zone (berlin_minus_6: roh Samstag 20:00-20:59:59.999 in den
+Umstellungsnaechten) werden NIE geraten: TimezoneError -> Quarantaene (Exit
+4); der Markt ist dann ohnehin zu. Folge: UTC-Monat M braucht die Rohmonate
+M-1 (dessen letzte 4 bzw. 5 h, aus dem Fahrplan berechnet) und M; er gilt nur
+als vollstaendig, wenn beide da sind (oder M-1 vor Historienbeginn bzw.
+bestaetigt leer ist).
+Die Zeitzone wird JE ROHMONAT aus den Daten geprueft (check_timezone, v5):
 je Marktluecke ein Schluss- und ein Oeffnungsanker - Wochenende (>= 24 h,
-Schluss Do/Fr, Oeffnung So/Mo: Fr 17:00 -> So 18:00 Metalle / 17:00 EURUSD
-New York; andere Luecken >= 24 h sind Ausfaelle, nur Bericht), bei Metallen
+Schluss Do/Fr, Oeffnung So/Mo: Fr 17:00 -> So 18:00 New York; andere Luecken >= 24 h sind Ausfaelle, nur Bericht), bei Metallen
 die Tagespause Mo-Do (17:00-18:00 New York; nur wenn alle pausenartigen
 Luecken des Tages dieselbe eindeutige Abweichung <= 1 h ergeben). Die
 Abweichung einer Luecke wird aus beiden Seiten gemeinsam bestimmt (Schluss
 nicht vor dem letzten Tick, Toleranz 15 min; Oeffnung nicht nach dem ersten,
 5 min) - auch bei duennen Daten richtig. Erwartet je Anker: Offset von
-RAW_TZ[mode] im Ereigniszeitpunkt (tick: -4 h in EDT, -5 h in EST; m1:
-immer -5 h). Abweichung = implizit - erwartet.
+der Stempelungsregel im Ereigniszeitpunkt (berlin_minus_6: -5 h im
+EU-Winter, -4 h in der EU-Sommerzeit; fixed_est: immer -5 h). Abweichung =
+implizit - erwartet.
 HART (Quarantaene, Exit 4) nur Systematisches oder Bestaetigtes: Median-
 Abweichung != 0, Anteil 0 < 60 %, >= 2 UNABHAENGIGE Luecken in Folge mit
 derselben Abweichung != 0 ohne 0 dazwischen (auch ueber den Monatsrand: die
@@ -73,29 +85,32 @@ Cache ist (besteht -> Flag true, sonst aus dem Store + Quarantaene). Reicht
 ein bestaetigter Wechsel im Folge-Rohmonat in Monat M zurueck, wird M nicht
 geschrieben (check_following). Zu wenige Anker -> gemeinsam mit dem
 Nachbar-Rohmonat pruefen.
-Parquet-Metadatum source_timezone = SOURCE_TZ_META[mode], abgeleitet aus
-RAW_TZ und TZ_CHECK_VERSION. Zu Beginn JEDES Laufs werden alle Monatsdateien
+Parquet-Metadatum source_timezone = store_tz_label(mode, ym): Regel(n) der
+Rohmonate mit Zone/Verschiebung und TZ_CHECK_VERSION (5), z.B.
+"berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v5)".
+Zu Beginn JEDES Laufs werden alle Monatsdateien
 des Symbols/Modus geprueft (classify_store_file):
-- gleiche Umrechnungszone, aeltere Pruefversion (z.B. m1 der Vorversion,
-  Tick-Dateien v2/v3): Rohmonate aus dem Cache neu pruefen (kein Download);
+- andere oder aeltere Kennzeichnung, im UTC-Monat aber dieselben UTC-Zeiten
+  (aeltere Pruefversion, oder z.B. ny_local-Dateien von Januar/Juli): Roh-
+  monate aus dem Cache neu pruefen (kein Download);
   besteht -> nur Metadaten erneuern, faellt durch -> nach metals/stale/ +
   Quarantaene, Roh-Cache fehlt -> Datei bleibt (unverified_after_version_bump);
 - tz_right_padding=false und Rohmonat M+1 jetzt im Cache: ebenso nachpruefen
   (auch am Laufende);
-- andere Umrechnung mit anderen UTC-Zeiten im Monat (Tick-Monate mit EDT
-  aus der Fest-EST-Version): sofort nach metals/stale/ verschieben, auch
-  ausserhalb von --start/--end (Laufreport stale_retired_out_of_range);
-- andere Umrechnung, im Monat aber gleiche UTC-Zeiten (Dez/Jan/Feb): bleibt
-  liegen, bis der Neubau sie atomar ersetzt.
+- andere Umrechnung mit anderen UTC-Zeiten im Monat (ny_local: Maerz,
+  Oktober, November = die EU/US-Lueckenwochen; fest UTC-5: alle Monate mit
+  EU-Sommerzeit): sofort nach metals/stale/ verschieben, auch ausserhalb
+  von --start/--end (Laufreport stale_retired_out_of_range).
 Monate in [start, end] werden aus dem Roh-Cache neu gebaut (WARNING, Laufreport
 "rebuilt_timezone"); fehlt der Roh-Cache, wird normal geladen (Requests).
 --verify-month ist nur Bericht: Zustand der Monatsdatei (store_file), keine
 Quarantaene-Marker schreiben oder loeschen.
-Quarantaene-Marker tragen raw_tz und tz_check_version. Nicht freigegebene
-Marker aelterer Version/anderer Zone: neu pruefen (ohne Download). "accepted":
-true gilt nur fuer dieselbe Umrechnung (raw_tz); eine Freigabe unter anderer
-Umrechnung (v1) wird neu geprueft - besteht: Marker weg, sonst neuer Marker
-accepted false mit Hinweis. Unlesbarer Marker: ERROR, bleibt, sperrt weiter.
+Quarantaene-Marker tragen tz_rule, raw_tz (Zone), tz_shift_h und
+tz_check_version. Nicht freigegebene Marker aelterer Version/anderer Regel
+(z.B. v4 ny_local): neu pruefen (ohne Download). "accepted": true gilt nur
+fuer dieselbe Regel (Zone + Verschiebung); eine Freigabe unter anderer
+Regel wird neu geprueft - besteht: Marker weg, sonst neuer Marker accepted
+false mit Hinweis. Unlesbarer Marker: ERROR, bleibt, sperrt weiter.
 
 Ablage (DATA_ROOT = $MARKETDATA_DATA_ROOT, sonst <repo>/data), SRC =
 histdata (tick) bzw. histdata_m1 (m1):
@@ -138,7 +153,7 @@ abgeleitet) nicht weitergeben und nicht committen (data/ ist git-ignored).
 
 Usage:
     python fetch_histdata.py --symbol XAUUSD --start 2009-03
-    python fetch_histdata.py --symbol EURUSD --start 2024-01 --end 2024-06 --mode m1
+    python fetch_histdata.py --symbol XAGUSD --start 2024-01 --end 2024-06 --mode m1
     python fetch_histdata.py --symbol XAUUSD --verify-month 2024-03
     python fetch_histdata.py --symbol XAUUSD --mode m1 --verify-month 2024-07   # M1-Zeitzone pruefen
 """
@@ -185,7 +200,13 @@ USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) marketdata-pipeline/1.0"
 UTC = timezone.utc
 NY = ZoneInfo("America/New_York")
 
-SYMBOLS = ("XAUUSD", "XAGUSD", "EURUSD")
+SYMBOLS = ("XAUUSD", "XAGUSD")
+# EURUSD kommt NICHT mehr von HistData: keine Tagespause, zu wenige Zeitanker
+# (2024-11 bestand --verify-month faelschlich). Der Bot nutzt einen Tages-
+# Referenzkurs (EZB/FRED); fetch_dukascopy.py bleibt unveraendert.
+REMOVED_SYMBOLS = {"EURUSD": "EURUSD wird nicht mehr ueber HistData geladen (keine Tagespause, "
+                             "zu wenige Zeitanker, --verify-month 2024-11 bestand faelschlich) - "
+                             "der Bot nutzt dafuer einen Tages-Referenzkurs (EZB/FRED)"}
 METALS = ("XAUUSD", "XAGUSD")
 MODES = ("tick", "m1")
 TF_PATH = {"tick": "tick-data-quotes", "m1": "1-minute-bar-quotes"}
@@ -195,32 +216,24 @@ PARQUET_MODE = {"tick": "histdata_tick", "m1": "histdata_m1"}
 # Erster Monat laut HistData-Auswahlliste (ASCII M1; Quellen: histdatacom
 # data/.repo, ai-trader QA). Fuer TICKS nicht verifiziert - fehlen dort
 # fruehe Monate, werden sie als "keine Daten" bestaetigt (24 h) und gelistet.
-HISTORY_START = {"XAUUSD": (2009, 3), "XAGUSD": (2009, 5), "EURUSD": (2000, 5)}
+HISTORY_START = {"XAUUSD": (2009, 3), "XAGUSD": (2009, 5)}
 
 HOUR_MS, MIN_MS, DAY_MS = 3_600_000, 60_000, 86_400_000
 
-# Zeitzone der Rohzeitstempel je Modus (zoneinfo-Namen). Tick: New-York-
-# Ortszeit MIT Sommerzeit (gemessen an echten Daten, s. docs/histdata_research.md).
-# M1: weiter fest UTC-5 ("Etc/GMT+5" = UTC-5, Vorzeichen POSIX-verdreht) laut
-# HistData-Angabe - fuer M1 NICHT verifiziert, mit --mode m1 --verify-month pruefen.
-RAW_TZ = {"tick": "America/New_York", "m1": "Etc/GMT+5"}
 # Version der Zeitzonen-Pruefung; steht in jedem Quarantaene-Marker und im
 # Parquet-Metadatum. v1 = fest UTC-5 fuer beide Modi (ohne Versionsfeld),
 # v2 = Zone je Modus, v3 = Anker je Luecke (duenne Daten, Nachbar-Randticks,
 # Umstellungsfenster), v4 = hart nur Systematisches/Bestaetigtes (>= 2 unabhaengige
-# Luecken), Einzelausreisser nur Warnung, vorlaeufige Ergebnisse nie gespeichert.
+# Luecken), Einzelausreisser nur Warnung, vorlaeufige Ergebnisse nie gespeichert,
+# v5 = Stempelungsregel je Rohmonat (TzRule, config/histdata_timezone.yaml;
+# Ticks: Europe/Berlin - 6 h statt America/New_York, im Homelab gemessen).
 # Nicht freigegebene Marker und Store-Dateien aelterer Version werden neu geprueft.
-TZ_CHECK_VERSION = 4
-# Parquet-Metadatum source_timezone: aus RAW_TZ abgeleitet (nie von Hand pflegen),
-# damit eine Umstellung von RAW_TZ alte Dateien automatisch als veraltet erkennt.
-def source_tz_label(zone: str) -> str:
-    return f"{zone} -> UTC, je Rohmonat geprueft (tz_check v{TZ_CHECK_VERSION})"
-
-
-SOURCE_TZ_META = {m: source_tz_label(RAW_TZ[m]) for m in ("tick", "m1")}
-# Fruehere Metadaten -> damalige Umrechnungszone (fuer "gleiche Umrechnung?")
-LEGACY_TZ_META = {"EST fixed UTC-5, converted to UTC, checked per month": "Etc/GMT+5"}
-
+TZ_CHECK_VERSION = 5
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_TZ_CONFIG = REPO_ROOT / "config" / "histdata_timezone.yaml"
+TZ_CONFIG_ENV = "HISTDATA_TZ_CONFIG"
+# Fruehere Metadaten -> damalige Umrechnung (Zone, Verschiebung) fuer "gleiche Umrechnung?"
+LEGACY_TZ_META = {"EST fixed UTC-5, converted to UTC, checked per month": ("Etc/GMT+5", 0)}
 # ---- Drosselung / Wiederholung (Defaults, alle per CLI aenderbar) ----------
 PAUSE_S = 5.0              # Mindestabstand zwischen zwei Requests
 ATTEMPTS = 5               # Versuche je Datei (429 zaehlt NICHT)
@@ -240,7 +253,7 @@ MAX_EMPTY_IN_ROW = 3             # so viele leere Antworten in Folge (in der His
 EMPTY_RECHECK_DAYS = 30          # bestaetigt leere Monate in der Historie danach erneut pruefen
 
 # ---- Zeitzonen-Pruefung -----------------------------------------------------
-# Offset = Rohzeit - UTC in Stunden; erwartet je Anker aus RAW_TZ[mode],
+# Offset = Rohzeit - UTC in Stunden; erwartet je Anker aus der Stempelungsregel,
 # Abweichung = impliziter - erwarteter Offset (soll 0 sein)
 TZ_MIN_ANCHORS = 3         # so viele eindeutige Anker (eigene Seite) mindestens, sonst nicht pruefbar
 TZ_MIN_SHARE = 0.6         # Anteil der eindeutigen Anker mit Abweichung 0
@@ -257,7 +270,7 @@ REGRESSION_MAX_MS = 30 * MIN_MS  # Ruecksprung in Dateireihenfolge ab dem -> Uhr
 WEEKEND_GAP_MS = 24 * HOUR_MS
 BREAK_GAP_MS = (45 * MIN_MS, 3 * HOUR_MS)
 CLOSE_H_NY = 17
-OPEN_H_NY = {"XAUUSD": 18, "XAGUSD": 18, "EURUSD": 17}
+OPEN_H_NY = {"XAUUSD": 18, "XAGUSD": 18}
 
 EXIT_OK, EXIT_VALIDATION, EXIT_GAPS, EXIT_MANUAL = dk.EXIT_OK, dk.EXIT_VALIDATION, dk.EXIT_GAPS, dk.EXIT_MANUAL
 N_EXAMPLES = 10
@@ -414,39 +427,218 @@ def _table_for(tzname: str, ms: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return _tz_table(tzname, _ms_year(lo), _ms_year(hi))
 
 
-def utc_to_raw_ms(utc_ms: np.ndarray, mode: str) -> np.ndarray:
-    """UTC-ms -> Rohzeit-ms (Ortszeit RAW_TZ[mode], Ziffern als UTC gelesen); immer eindeutig."""
+# ------------------------------------------------ stempelungsregeln (v5) ---
+@dataclass(frozen=True)
+class TzRule:
+    """Stempelungsregel: Rohzeit (Wanduhr-Ziffern der Datei) = Ortszeit in `zone`
+    + shift_h Stunden. berlin_minus_6: Europe/Berlin - 6 h = UTC-5 im EU-Winter,
+    UTC-4 in der EU-Sommerzeit (Umstellung letzter So Maerz/Oktober 01:00 UTC)."""
+    name: str
+    zone: str
+    shift_h: int
+
+    def describe(self) -> str:
+        return f"{self.name} ({self.zone} {self.shift_h:+d} h)"
+
+
+TZ_RULES = {"berlin_minus_6": TzRule("berlin_minus_6", "Europe/Berlin", -6),
+            "ny_local": TzRule("ny_local", "America/New_York", 0),
+            "fixed_est": TzRule("fixed_est", "Etc/GMT+5", 0)}
+# Default-Fahrplan, falls die Konfiguration keinen liefert (identisch mit der
+# ausgelieferten config/histdata_timezone.yaml). M1 ist NICHT verifiziert.
+DEFAULT_TZ_SCHEDULE = {"tick": [((2000, 1), "berlin_minus_6")], "m1": [((2000, 1), "fixed_est")]}
+
+
+@dataclass(frozen=True)
+class TzConfig:
+    rules: dict                    # name -> TzRule (eingebaute + Konfiguration)
+    schedule: dict                 # mode -> tuple[((y, m), TzRule), ...], aufsteigend
+    path: str | None = None
+
+
+def _check_zone(zone: str, where: str) -> None:
+    try:
+        ZoneInfo(str(zone))
+    except Exception as e:                       # ZoneInfoNotFoundError, ValueError
+        raise ValueError(f"{where}: unbekannte Zeitzone {zone!r} ({e})")
+
+
+def _parse_ym_str(v, where: str) -> tuple[int, int]:
+    m = re.fullmatch(r"(\d{4})-(\d{2})", str(v))
+    if not m or not 1 <= int(m.group(2)) <= 12:
+        raise ValueError(f"{where}: 'from' muss YYYY-MM sein, nicht {v!r}")
+    return int(m.group(1)), int(m.group(2))
+
+
+def build_tz_config(data: dict | None, path: str | None = None) -> TzConfig:
+    """Konfiguration pruefen und aufbauen; jeder Fehler -> ValueError (nie still ein Default)."""
+    data = data or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path}: oberste Ebene muss ein Mapping sein")
+    unknown = set(data) - {"rules", "schedule"}
+    if unknown:
+        raise ValueError(f"{path}: unbekannte Schluessel {sorted(unknown)}")
+    rules = dict(TZ_RULES)
+    for i, r in enumerate(data.get("rules") or []):
+        where = f"{path}: rules[{i}]"
+        if not isinstance(r, dict) or set(r) != {"name", "zone", "shift_h"}:
+            raise ValueError(f"{where}: genau name, zone, shift_h erwartet, nicht {r!r}")
+        name = str(r["name"])
+        if not re.fullmatch(r"[a-z0-9_]+", name):
+            raise ValueError(f"{where}: Name {name!r} nur a-z, 0-9, _")
+        if name in rules:
+            raise ValueError(f"{where}: Regelname {name!r} doppelt (auch eingebaute Namen sind belegt)")
+        _check_zone(r["zone"], where)
+        if not isinstance(r["shift_h"], int) or isinstance(r["shift_h"], bool) or abs(r["shift_h"]) > 14:
+            raise ValueError(f"{where}: shift_h muss ganze Stunden (-14..14) sein, nicht {r['shift_h']!r}")
+        rules[name] = TzRule(name, str(r["zone"]), int(r["shift_h"]))
+    sched_in = data.get("schedule")
+    if sched_in is None:
+        sched_in = {m: [{"from": f"{y}-{mm:02d}", "rule": n} for (y, mm), n in v]
+                    for m, v in DEFAULT_TZ_SCHEDULE.items()}
+    if not isinstance(sched_in, dict) or set(sched_in) != set(MODES):
+        raise ValueError(f"{path}: schedule braucht genau die Modi {list(MODES)}")
+    schedule = {}
+    for mode in MODES:
+        entries = sched_in[mode]
+        if not entries:
+            raise ValueError(f"{path}: schedule.{mode} ist leer")
+        out = []
+        for i, e in enumerate(entries):
+            where = f"{path}: schedule.{mode}[{i}]"
+            if not isinstance(e, dict) or set(e) != {"from", "rule"}:
+                raise ValueError(f"{where}: genau from, rule erwartet, nicht {e!r}")
+            ym = _parse_ym_str(e["from"], where)
+            if e["rule"] not in rules:
+                raise ValueError(f"{where}: unbekannte Regel {e['rule']!r}; bekannt: {sorted(rules)}")
+            if out and ym <= out[-1][0]:
+                raise ValueError(f"{where}: 'from' {e['from']} nicht aufsteigend/doppelt")
+            out.append((ym, rules[e["rule"]]))
+        schedule[mode] = tuple(out)
+    return TzConfig(rules, schedule, path)
+
+
+_TZ_CFG_CACHE: dict = {}
+
+
+def load_tz_config(path: str | Path | None = None) -> TzConfig:
+    """config/histdata_timezone.yaml (oder $HISTDATA_TZ_CONFIG, oder `path`) laden
+    und pruefen. Fehlt die Default-Datei, gilt DEFAULT_TZ_SCHEDULE; eine
+    ausdruecklich angegebene Datei muss existieren. Fehler -> ValueError."""
+    explicit = path is not None or bool(os.environ.get(TZ_CONFIG_ENV))
+    p = Path(path or os.environ.get(TZ_CONFIG_ENV) or DEFAULT_TZ_CONFIG)
+    if not p.exists():
+        if explicit:
+            raise ValueError(f"Zeitzonen-Konfiguration {p} fehlt")
+        return build_tz_config(None, None)
+    key = (str(p.resolve()), p.stat().st_mtime_ns)
+    if key not in _TZ_CFG_CACHE:
+        import yaml
+        try:
+            data = yaml.safe_load(p.read_text())
+        except yaml.YAMLError as e:
+            raise ValueError(f"{p}: kein gueltiges YAML ({e})")
+        _TZ_CFG_CACHE[key] = build_tz_config(data, str(p))
+    return _TZ_CFG_CACHE[key]
+
+
+def rule_for(mode: str, ym: tuple[int, int], cfg: TzConfig | None = None) -> TzRule:
+    """Stempelungsregel fuer den ROHmonat ym (Wechsel nur an Rohmonatsgrenzen)."""
+    cfg = cfg or load_tz_config()
+    if mode not in cfg.schedule:
+        raise ValueError(f"unbekannter Modus {mode}")
+    found = None
+    for start, rule in cfg.schedule[mode]:
+        if tuple(ym) >= start:
+            found = rule
+    if found is None:
+        raise ValueError(f"keine Stempelungsregel fuer {mode} {ym[0]}-{ym[1]:02d} "
+                         f"(Fahrplan beginnt {cfg.schedule[mode][0][0]})")
+    return found
+
+
+def as_rule(rule: "TzRule | str", cfg: TzConfig | None = None) -> TzRule:
+    if isinstance(rule, TzRule):
+        return rule
+    cfg = cfg or load_tz_config()
+    if rule not in cfg.rules:
+        raise ValueError(f"unbekannte Stempelungsregel {rule!r}; bekannt: {sorted(cfg.rules)}")
+    return cfg.rules[rule]
+
+
+def source_tz_label(rules) -> str:
+    """Parquet-Metadatum source_timezone: Regel(n) mit Zone/Verschiebung und
+    Pruefversion (abgeleitet, nie von Hand gepflegt)."""
+    rules = [rules] if isinstance(rules, TzRule) else list(dict.fromkeys(rules))
+    return " + ".join(r.describe() for r in rules) + \
+        f" -> UTC, je Rohmonat geprueft (tz_check v{TZ_CHECK_VERSION})"
+
+
+def store_tz_label(mode: str, ym: tuple[int, int]) -> str:
+    """Erwartetes source_timezone fuer UTC-Monat ym (Regeln seiner Rohmonate)."""
+    return source_tz_label([rule_for(mode, r) for r in _raw_months_for(ym, mode)])
+
+
+class _SourceTzMeta(dict):
+    """SOURCE_TZ_META[mode]: Label der juengsten Regel des Fahrplans (Bequemlichkeit;
+    massgeblich je Monat ist store_tz_label)."""
+
+    def __getitem__(self, mode):
+        return source_tz_label(load_tz_config().schedule[mode][-1][1])
+
+    def __contains__(self, mode):
+        return mode in MODES
+
+    def keys(self):
+        return list(MODES)
+
+    def __iter__(self):
+        return iter(MODES)
+
+    def __len__(self):
+        return len(MODES)
+
+
+SOURCE_TZ_META = _SourceTzMeta()
+
+
+def _zone_offset_ms(zone: str, utc_ms: np.ndarray) -> np.ndarray:
+    T, O = _table_for(zone, utc_ms)
+    return O[np.searchsorted(T, utc_ms, side="right") - 1]
+
+
+def utc_to_raw_ms(utc_ms: np.ndarray, rule: TzRule) -> np.ndarray:
+    """UTC-ms -> Rohzeit-ms nach `rule` (Ortszeit in rule.zone + shift_h); immer eindeutig."""
     utc_ms = np.asarray(utc_ms, dtype=np.int64)
     if not len(utc_ms):
         return utc_ms.copy()
-    T, O = _table_for(RAW_TZ[mode], utc_ms)
-    return utc_ms + O[np.searchsorted(T, utc_ms, side="right") - 1]
+    return utc_ms + _zone_offset_ms(rule.zone, utc_ms) + rule.shift_h * HOUR_MS
 
 
-def raw_to_utc_ms(raw_ms: np.ndarray, mode: str) -> np.ndarray:
+def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
     """
-    Rohzeit-ms (Wanduhr-Ziffern in RAW_TZ[mode], als UTC gelesen) -> UTC-ms
-    (int64, gleiche Reihenfolge/Laenge). Vektorisiert: je moeglichem Offset
-    der Zone (America/New_York: -5 h, -4 h) Kandidat u = roh - offset bilden;
-    gueltig, wenn die Zone im Zeitpunkt u genau diesen Offset hat
+    Rohzeit-ms (Wanduhr-Ziffern, als UTC gelesen) -> UTC-ms nach `rule`
+    (int64, gleiche Reihenfolge/Laenge): roh - shift_h ist Ortszeit in
+    rule.zone. Vektorisiert: je moeglichem Offset der Zone Kandidat
+    u = ortszeit - offset; gueltig, wenn die Zone in u genau diesen Offset hat
     (searchsorted in der Wechseltabelle, exakt auf die Millisekunde).
-    Kein gueltiger Kandidat = Ortszeit existiert nicht (Sommerzeitbeginn,
-    z.B. 2024-03-10 02:00-02:59:59.999), zwei = mehrdeutig (Sommerzeitende,
-    z.B. 2024-11-03 01:00-01:59:59.999) -> TimezoneError mit Beispielen; nie
-    raten (der Markt ist dann zu, ein Tick dort heisst: etwas stimmt nicht).
+    Kein gueltiger Kandidat = Ortszeit existiert nicht (Sommerzeitbeginn), zwei
+    = mehrdeutig (Sommerzeitende) -> TimezoneError mit Beispielen (Rohzeit);
+    nie raten. berlin_minus_6: roh Samstag 20:00-20:59:59.999 in den
+    Umstellungsnaechten (Markt zu); ny_local: 02:00-02:59 bzw. 01:00-01:59.
     """
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
     if not len(raw_ms):
         return raw_ms.copy()
-    tzname = RAW_TZ[mode]
-    T, O = _table_for(tzname, raw_ms)
+    local = raw_ms - rule.shift_h * HOUR_MS
+    T, O = _table_for(rule.zone, local)
     cands = np.unique(O)
     if len(cands) == 1:                         # feste Zone (Etc/GMT+5)
-        return raw_ms - cands[0]
+        return local - cands[0]
     out = np.zeros(len(raw_ms), dtype=np.int64)
     n_ok = np.zeros(len(raw_ms), dtype=np.int8)
     for off in cands:
-        u = raw_ms - off
+        u = local - off
         ok = O[np.searchsorted(T, u, side="right") - 1] == off
         out[ok] = u[ok]
         n_ok += ok
@@ -457,19 +649,59 @@ def raw_to_utc_ms(raw_ms: np.ndarray, mode: str) -> np.ndarray:
             idx = np.nonzero(mask)[0]
             if len(idx):
                 ex = ", ".join(_raw_iso(int(raw_ms[i]), ms_digits=True) for i in idx[:5])
-                msg.append(f"{len(idx)} Zeitstempel in {what} {tzname}, z.B. {ex}")
+                msg.append(f"{len(idx)} Zeitstempel (roh) in {what} nach {rule.describe()}, z.B. {ex}")
         raise TimezoneError("; ".join(msg) + " - Markt ist dann geschlossen, nicht umgerechnet")
     return out
 
 
-def tz_offset_h(utc_ms: int, mode: str) -> float:
-    """Offset (Ortszeit - UTC) von RAW_TZ[mode] im UTC-Zeitpunkt utc_ms, in Stunden."""
-    return _utcoff_ms(ZoneInfo(RAW_TZ[mode]), utc_ms // 1000) / HOUR_MS
+def _raw_month_index(ms: np.ndarray) -> np.ndarray:
+    """Monatsindex y*12+m-1 je Rohzeit-ms."""
+    m = np.asarray(ms, dtype=np.int64).astype("datetime64[ms]").astype("datetime64[M]").astype(np.int64)
+    return m + 1970 * 12
+
+
+def raw_to_utc_ms_mode(raw_ms: np.ndarray, mode: str, ym: tuple[int, int] | None = None,
+                       cfg: TzConfig | None = None) -> np.ndarray:
+    """Wie raw_to_utc_ms, Regel je ROHmonat aus dem Fahrplan (ym fest oder je Wert)."""
+    raw_ms = np.asarray(raw_ms, dtype=np.int64)
+    if ym is not None:
+        return raw_to_utc_ms(raw_ms, rule_for(mode, ym, cfg))
+    if not len(raw_ms):
+        return raw_ms.copy()
+    idx = _raw_month_index(raw_ms)
+    out = np.empty(len(raw_ms), dtype=np.int64)
+    for k in np.unique(idx):
+        sel = idx == k
+        out[sel] = raw_to_utc_ms(raw_ms[sel], rule_for(mode, (int(k) // 12, int(k) % 12 + 1), cfg))
+    return out
+
+
+def utc_to_raw_ms_mode(utc_ms: np.ndarray, mode: str, cfg: TzConfig | None = None) -> np.ndarray:
+    """UTC-ms -> Rohzeit-ms, Regel des resultierenden Rohmonats aus dem Fahrplan."""
+    utc_ms = np.asarray(utc_ms, dtype=np.int64)
+    if not len(utc_ms):
+        return utc_ms.copy()
+    out = np.empty(len(utc_ms), dtype=np.int64)
+    idx = _raw_month_index(utc_ms)
+    for k in np.unique(idx):
+        sel = idx == k
+        out[sel] = utc_to_raw_ms(utc_ms[sel], rule_for(mode, (int(k) // 12, int(k) % 12 + 1), cfg))
+    # Rohmonat weicht vom UTC-Monat ab und hat eine andere Regel: damit neu rechnen
+    ridx = _raw_month_index(out)
+    for k in np.unique(ridx[ridx != idx]):
+        sel = ridx == k
+        out[sel] = utc_to_raw_ms(utc_ms[sel], rule_for(mode, (int(k) // 12, int(k) % 12 + 1), cfg))
+    return out
+
+
+def tz_offset_h(utc_ms: int, rule: TzRule) -> float:
+    """Offset (Rohzeit - UTC) nach `rule` im UTC-Zeitpunkt utc_ms, in Stunden."""
+    return (_utcoff_ms(ZoneInfo(rule.zone), utc_ms // 1000) + rule.shift_h * HOUR_MS) / HOUR_MS
 
 
 def raw_month_end_utc(ym: tuple[int, int], mode: str = "tick") -> datetime:
-    """Ende des Rohmonats ym in UTC (Monatsende Ortszeit; nie in einer Umstellung)."""
-    end = raw_to_utc_ms(np.array([raw_month_bounds_ms(ym)[1]]), mode)[0]
+    """Ende des Rohmonats ym in UTC (Regel des Rohmonats ym; nie in einer Umstellung)."""
+    end = raw_to_utc_ms(np.array([raw_month_bounds_ms(ym)[1]]), rule_for(mode, ym))[0]
     return datetime.fromtimestamp(int(end) / 1000, UTC)
 
 
@@ -516,8 +748,9 @@ class Unit:
 
     @property
     def end_utc(self) -> datetime:
-        """Ende der Rohperiode in UTC (Ortszeit RAW_TZ[mode] -> UTC)."""
-        end = raw_to_utc_ms(np.array([self.raw_bounds_ms()[1]]), self.mode)[0]
+        """Ende der Rohperiode in UTC (Regel ihres letzten Rohmonats)."""
+        end = raw_to_utc_ms(np.array([self.raw_bounds_ms()[1]]),
+                            rule_for(self.mode, (self.year, self.month or 12)))[0]
         return datetime.fromtimestamp(int(end) / 1000, UTC)
 
     def page_url(self) -> str:
@@ -551,7 +784,8 @@ def unit_for(symbol: str, mode: str, ym: tuple[int, int], current_raw_year: int,
 
 
 # ------------------------------------------------------- atomar schreiben ---
-def write_parquet(out: Path, df: pd.DataFrame, mode: str, right_padding: bool = True) -> None:
+def write_parquet(out: Path, df: pd.DataFrame, mode: str, right_padding: bool = True,
+                  label: str | None = None) -> None:
     """Atomar wie fetch_dukascopy.write_parquet; Metadaten: Modus, Spread, Zeitzone,
     tz_right_padding (false: Rohmonat M ohne Randticks von M+1 geprueft -> nachpruefen)."""
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -559,16 +793,17 @@ def write_parquet(out: Path, df: pd.DataFrame, mode: str, right_padding: bool = 
     meta = dict(table.schema.metadata or {})
     meta[b"histdata_mode"] = PARQUET_MODE[mode].encode()
     meta[b"spread_available"] = b"true" if mode == "tick" else b"false"
-    meta[b"source_timezone"] = SOURCE_TZ_META[mode].encode()
+    meta[b"source_timezone"] = (label or SOURCE_TZ_META[mode]).encode()
     meta[b"tz_right_padding"] = b"true" if right_padding else b"false"
     _write_table_atomic(out, table.replace_schema_metadata(meta))
 
 
-def relabel_store_file(out: Path, mode: str, right_padding: bool = True) -> None:
+def relabel_store_file(out: Path, mode: str, right_padding: bool = True,
+                       label: str | None = None) -> None:
     """Nur die Zeitzonen-Metadaten aktualisieren (Inhalt unveraendert, atomar)."""
     table = pq.read_table(out)
     meta = dict(table.schema.metadata or {})
-    meta[b"source_timezone"] = SOURCE_TZ_META[mode].encode()
+    meta[b"source_timezone"] = (label or SOURCE_TZ_META[mode]).encode()
     meta[b"tz_right_padding"] = b"true" if right_padding else b"false"
     _write_table_atomic(out, table.replace_schema_metadata(meta))
 
@@ -579,63 +814,69 @@ def label_version(label: str | None) -> int:
     return int(m.group(1)) if m else 0
 
 
-def label_zone(label: str | None) -> str | None:
-    """Umrechnungszone aus einem source_timezone-Metadatum (None: unbekannt)."""
+def label_rules(label: str | None) -> list[tuple[str, int]] | None:
+    """Umrechnung(en) (Zone, Verschiebung) aus einem source_timezone-Metadatum
+    (v5: "name (Zone +-N h) [+ ...] -> UTC ...", aeltere: "Zone ... -> UTC ...",
+    Vorversion fest UTC-5); None: unbekannt."""
     if not label:
         return None
     if label in LEGACY_TZ_META:
-        return LEGACY_TZ_META[label]
+        return [LEGACY_TZ_META[label]]
     if "->" not in label:
         return None
-    zone = label.split()[0]
-    try:
-        ZoneInfo(zone)
-    except (ValueError, KeyError, OSError):
-        return None
-    return zone
+    found = re.findall(r"\S+ \((\S+) ([+-]\d+) h\)", label.split("->")[0])
+    out = [(z, int(h)) for z, h in found] if found else [(label.split()[0], 0)]
+    for z, _ in out:
+        try:
+            ZoneInfo(z)
+        except Exception:
+            return None
+    return out
 
 
-def _zones_differ_in(old_zone: str | None, mode: str, ym: tuple[int, int]) -> bool:
-    """Liefert die alte Umrechnung im UTC-Monat ym (inkl. der Rohmonatsraender)
-    irgendwo eine andere UTC-Zeit als RAW_TZ[mode]? (stuendlich, Offsets ganzzahlig)"""
-    if old_zone is None:
+def _zones_differ_in(old: list[tuple[str, int]] | None, mode: str, ym: tuple[int, int]) -> bool:
+    """Liefert die alte Umrechnung (Zone, Verschiebung) im UTC-Monat ym irgendwo
+    eine andere Rohzeit als der aktuelle Fahrplan?
+    (Viertelstunden-Raster; mehrere alte Regeln: nur gleich, wenn identisch)."""
+    if not old:
         return True
-    lo = int(datetime(*ym, 1, tzinfo=UTC).timestamp() * 1000) - DAY_MS
-    hi = int(datetime(*_ym_add(ym, 1), 1, tzinfo=UTC).timestamp() * 1000) + DAY_MS
+    new_rules = [(r.zone, r.shift_h) for r in dict.fromkeys(rule_for(mode, m) for m in _raw_months_for(ym, mode))]
+    if old == new_rules:
+        return False
+    if len(set(old)) != 1:
+        return True
+    # nur Zeitpunkte IM UTC-Monat zaehlen (nur die stehen in der Datei)
+    lo = int(datetime(*ym, 1, tzinfo=UTC).timestamp() * 1000)
+    hi = int(datetime(*_ym_add(ym, 1), 1, tzinfo=UTC).timestamp() * 1000)
     grid = np.arange(lo, hi, HOUR_MS // 4, dtype=np.int64)
-    new = utc_to_raw_ms(grid, mode)
-    T, O = _table_for(old_zone, grid)
-    old = grid + O[np.searchsorted(T, grid, side="right") - 1]
-    return bool((new != old).any())
+    zone, shift = old[0]
+    return bool((utc_to_raw_ms_mode(grid, mode) != utc_to_raw_ms(grid, TzRule("alt", zone, shift))).any())
 
 
 def classify_store_file(out: Path, mode: str, ym: tuple[int, int]) -> tuple[str, str | None]:
     """
     Zeitzonen-Zustand einer vorhandenen Monatsdatei desselben Modus ->
     (zustand, altes_metadatum):
-      current     Metadatum = SOURCE_TZ_META[mode] (und rechter Nachbar geprueft)
+      current     Metadatum = store_tz_label(mode, ym) (und rechter Nachbar geprueft)
       recheck_padding  aktuelles Metadatum, aber tz_right_padding=false: nachpruefen,
                   sobald Rohmonat M+1 im Cache ist (besteht -> Flag setzen, sonst
                   aus dem Store nehmen)
-      recheck     gleiche Umrechnungszone, aeltere Pruefversion (z.B. altes
-                  m1-Metadatum, v2/v3): Rohmonate aus dem Cache neu pruefen; besteht
-                  -> nur Metadatum neu, sonst aus dem Store nehmen + Quarantaene;
-                  ohne Roh-Cache bleibt die Datei (unverified_after_version_bump)
-      stale       andere Umrechnung, in diesem Monat aber gleiche UTC-Zeiten
-                  (z.B. Tick-Wintermonat der Fest-EST-Version): neu bauen, Datei
-                  bleibt bis zum erfolgreichen Neubau liegen
-      stale_shifted  andere Umrechnung mit anderen UTC-Zeiten (Monate mit EDT):
+      recheck     andere/aeltere Kennzeichnung, aber in diesem Monat dieselben
+                  UTC-Zeiten (gleiche Umrechnung, aeltere Pruefversion, oder andere
+                  Regel ohne Unterschied hier, z.B. Jan/Jul ny_local vs.
+                  berlin_minus_6): Rohmonate aus dem Cache neu pruefen; besteht ->
+                  nur Metadaten neu, sonst aus dem Store nehmen + Quarantaene; ohne
+                  Roh-Cache bleibt die Datei (unverified_after_version_bump)
+      stale_shifted  andere Umrechnung mit anderen UTC-Zeiten in diesem Monat (z.B.
+                  die EU/US-Luecken-Wochen im Maerz und Okt/Nov unter ny_local):
                   sofort nach metals/stale/ verschieben, dann neu bauen
     """
     old = stored_timezone(out)
-    if old == SOURCE_TZ_META[mode]:
+    if old == store_tz_label(mode, ym):
         if _stored_meta(out, b"tz_right_padding") == "false":
             return "recheck_padding", old
         return "current", old
-    zone = label_zone(old)
-    if zone == RAW_TZ[mode]:
-        return "recheck", old
-    return ("stale_shifted" if _zones_differ_in(zone, mode, ym) else "stale"), old
+    return ("stale_shifted" if _zones_differ_in(label_rules(old), mode, ym) else "recheck"), old
 
 
 def _store_months(data_root: Path, symbol: str, mode: str) -> list[tuple[tuple[int, int], Path]]:
@@ -891,7 +1132,7 @@ def parse_status(txt: str | None, mode: str = "tick") -> dict:
     """
     Status-.txt von HistData (Lueckenliste). Format NICHT verifiziert (keine
     echte Datei gesehen): erwartet Zeilen wie "Gap of 62s found between
-    20120201000106 and 20120201000208" (Rohzeit, RAW_TZ[mode] -> UTC; nicht
+    20120201000106 and 20120201000208" (Rohzeit, Regel des Rohmonats -> UTC; nicht
     eindeutige Ortszeit -> *_utc None, *_raw bleibt). Unbekanntes Format ->
     nur die ersten Zeilen im Report.
     """
@@ -901,7 +1142,7 @@ def parse_status(txt: str | None, mode: str = "tick") -> dict:
     def utc(digits: str) -> tuple[str, str | None]:
         r = datetime.strptime(digits, "%Y%m%d%H%M%S").replace(tzinfo=UTC)
         try:
-            u = int(raw_to_utc_ms(np.array([int(r.timestamp() * 1000)]), mode)[0])
+            u = int(raw_to_utc_ms_mode(np.array([int(r.timestamp() * 1000)]), mode)[0])
         except TimezoneError:
             return r.strftime("%Y-%m-%d %H:%M:%S"), None
         return r.strftime("%Y-%m-%d %H:%M:%S"), datetime.fromtimestamp(u / 1000, UTC).isoformat()
@@ -970,7 +1211,7 @@ def _expected_ms(r_ms: int, hour_ny: int) -> int:
     return int(datetime(d.year, d.month, d.day, hour_ny, tzinfo=NY).timestamp() * 1000)
 
 
-def _gap_fit(a: int, b: int, hours: tuple[int, int], mode: str) -> dict:
+def _gap_fit(a: int, b: int, hours: tuple[int, int], rule_at) -> dict:
     """
     Luecke [a, b] (a = letzter Tick davor, b = erster danach) gegen erwarteten
     Schluss hours[0]:00 (Rohdatum von a) und Oeffnung hours[1]:00 New York
@@ -982,7 +1223,8 @@ def _gap_fit(a: int, b: int, hours: tuple[int, int], mode: str) -> dict:
     """
     hc, ho = hours
     ec, eo = _expected_ms(a, hc), _expected_ms(b, ho)
-    xc, xo = int(round(tz_offset_h(ec, mode))), int(round(tz_offset_h(eo, mode)))
+    # erwartet: Offset der Stempelungsregel (des jeweiligen Rohmonats) im Ereigniszeitpunkt
+    xc, xo = int(round(tz_offset_h(ec, rule_at(a)))), int(round(tz_offset_h(eo, rule_at(b))))
     lo = math.ceil((a - ec - xc * HOUR_MS - TZ_TOL_MS) / HOUR_MS)
     hi = math.floor((b - eo - xo * HOUR_MS + TZ_TOL_OPEN_MS) / HOUR_MS)
     vc = math.floor((a - ec - xc * HOUR_MS) / HOUR_MS + 0.5)        # naechste volle Stunde je Seite
@@ -991,11 +1233,21 @@ def _gap_fit(a: int, b: int, hours: tuple[int, int], mode: str) -> dict:
             "vc": vc, "vo": vo, "rc": a - ec - (xc + vc) * HOUR_MS, "ro": b - eo - (xo + vo) * HOUR_MS}
 
 
-def _transitions_ms(mode: str, lo_ms: int, hi_ms: int) -> np.ndarray:
-    """UTC-ms der Uhrumstellungen von RAW_TZ[mode] in [lo_ms, hi_ms] (leer bei fester Zone)."""
-    T, _ = _table_for(RAW_TZ[mode], np.array([lo_ms, hi_ms], dtype=np.int64))
+def _transitions_ms(rule: TzRule, lo_ms: int, hi_ms: int) -> np.ndarray:
+    """UTC-ms der Uhrumstellungen der Regel-Zone in [lo_ms, hi_ms] (leer bei fester Zone)."""
+    T, _ = _table_for(rule.zone, np.array([lo_ms, hi_ms], dtype=np.int64))
     T = T[1:]
     return T[(T >= lo_ms) & (T <= hi_ms)]
+
+
+def _ambig_before_run(run: list, entries: list, ambig: list, own_lo: int) -> bool:
+    """Liegt direkt vor dem Lauf (ohne Eintrag mit 0 dazwischen) ein mehrdeutiges
+    Wochenende im Vormonat, das zur Abweichung des Laufs passt? Dann kann der
+    Wechsel schon dort begonnen haben (duenne Daten: Oeffnung nicht eindeutig)."""
+    start, dev = run[0][0], run[0][1]
+    zeros = [e[0] for e in entries if e[1] == 0 and e[0] < start]
+    after = max(zeros) if zeros else -1
+    return any(after < a < start and a < own_lo and lo <= dev <= hi for a, lo, hi in ambig)
 
 
 def _wd(ms: int) -> int:
@@ -1005,16 +1257,18 @@ def _wd(ms: int) -> int:
 
 def check_timezone(raw_ms: np.ndarray, symbol: str,
                    bounds: tuple[int, int] | None = None, mode: str = "tick",
-                   neighbours: tuple = (None, None)) -> dict:
+                   rule: TzRule | None = None, neighbours: tuple = (None, None)) -> dict:
     """
     Impliziten Offset (Rohzeit - UTC, ganze Stunden) aus Marktluecken schaetzen
-    und mit dem erwarteten Offset von RAW_TZ[mode] im Ereigniszeitpunkt
-    vergleichen (tick America/New_York: -4 h in EDT, -5 h in EST; m1 Etc/GMT+5:
-    immer -5 h). Abweichung = implizit - erwartet.
+    (Marktzeiten bleiben New York/CME) und mit dem erwarteten Offset der
+    Stempelungsregel im Ereigniszeitpunkt vergleichen (tick berlin_minus_6:
+    -5 h im EU-Winter, -4 h in der EU-Sommerzeit; m1 fixed_est: immer -5 h).
+    rule: fest vorgegeben (z.B. Kandidat beim Abgleich) oder None = je Rohmonat
+    aus dem Fahrplan (rule_for). Abweichung = implizit - erwartet.
 
     Luecken (Marktzeiten New York):
       Wochenende   >= 24 h, Schluss Do/Fr (Fr oder Feiertagsvorabend), Oeffnung
-                   So/Mo: Schluss 17:00, Oeffnung 18:00 Metalle / 17:00 EURUSD.
+                   So/Mo: Schluss 17:00, Oeffnung 18:00 New York.
                    Andere Luecken >= 24 h sind Ausfaelle (Bericht "outages").
       Tagespause   (nur Metalle, Mo-Do) 45 min..3 h, nur eindeutig und
                    |Abweichung| <= 1 h; je Rohtag die Luecke mit Beginn am
@@ -1053,8 +1307,28 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
     if bounds is None and len(raw_ms):        # Rohmonat des Medians als Monatsrand
         mid = datetime.fromtimestamp(float(np.median(raw_ms)) / 1000, UTC)
         bounds = raw_month_bounds_ms((mid.year, mid.month))
-    rep: dict = {"raw_tz": RAW_TZ[mode], "mode": mode, "check_version": TZ_CHECK_VERSION,
-                 "rows": int(len(raw_ms))}
+    own_ym = None
+    if bounds is not None:
+        b0 = datetime.fromtimestamp(bounds[0] / 1000, UTC)
+        own_ym = (b0.year, b0.month)
+    if rule is None:
+        rule = rule_for(mode, own_ym) if own_ym else load_tz_config().schedule[mode][-1][1]
+        fixed = None
+    else:
+        fixed = rule
+
+    @functools.lru_cache(maxsize=None)
+    def _rule_of_month(k: int) -> TzRule:
+        return rule_for(mode, (k // 12, k % 12 + 1))
+
+    def rule_at(r_ms: int) -> TzRule:
+        """Regel fuer einen Tick: fest vorgegeben, sonst die seines Rohmonats."""
+        if fixed is not None:
+            return fixed
+        return _rule_of_month(int(_raw_month_index(np.array([r_ms]))[0]))
+
+    rep: dict = {"rule": rule.name, "rule_detail": rule.describe(), "raw_tz": rule.describe(),
+                 "mode": mode, "check_version": TZ_CHECK_VERSION, "rows": int(len(raw_ms))}
     d0 = np.diff(raw_ms)
     rep["reversals"] = int((d0 < 0).sum())
     rep["max_reversal_s"] = float(max(0, -int(d0.min())) / 1000) if len(d0) else 0.0
@@ -1081,6 +1355,7 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
     anchors: list[tuple] = []      # eindeutig, eigene Seite: roh, art, stunde, implizit, erwartet
     entries: list[tuple] = []      # zeit, abweichung, luecke, eigen, art, eindeutig
     outages, contradictions, warnings = [], [], []
+    ambig_gaps: list[tuple[int, int, int]] = []    # (schluss-tick, lo, hi) mehrdeutiger Wochenenden
     ambiguous = 0
 
     def add_unique(f: dict, gid: int, kinds: tuple[str, str], hours: tuple[int, int]) -> None:
@@ -1099,10 +1374,12 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
                             "hours": round((b - a) / HOUR_MS, 1)})
             continue
         hours = (CLOSE_H_NY, OPEN_H_NY[symbol])
-        f = _gap_fit(a, b, hours, mode)
+        f = _gap_fit(a, b, hours, rule_at)
         if f["lo"] == f["hi"]:
             add_unique(f, a, ("wochenschluss", "wochenstart"), hours)
             continue
+        if f["lo"] <= f["hi"]:
+            ambig_gaps.append((a, f["lo"], f["hi"]))
         if f["lo"] > f["hi"]:
             # Widerspruch (bei richtigen Daten jeder Dichte unmoeglich): beide Seiten
             # als Eintraege (Schluss = kleinste, Oeffnung = groesste vertraegliche
@@ -1127,7 +1404,7 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
             a = int(t[i])
             if _wd(a) >= 4:
                 continue
-            f = _gap_fit(a, int(t[i + 1]), (CLOSE_H_NY, 18), mode)
+            f = _gap_fit(a, int(t[i + 1]), (CLOSE_H_NY, 18), rule_at)
             f["rng"] = (max(f["lo"], -TZ_BREAK_MAX_DEV_H), min(f["hi"], TZ_BREAK_MAX_DEV_H))
             if f["rng"][0] > f["rng"][1]:
                 ignored_breaks += 1               # keine Pause (Ausfall, naechtliche Luecke)
@@ -1180,7 +1457,7 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
     med_dev = float(np.median(devs)) if n else None
     blo, bhi = bounds if bounds is not None else (own_lo, own_hi + 1)
     nonzero = [e for e in entries if e[1] and e[3]]
-    tr = (_transitions_ms(mode, own_lo - TZ_TRANSITION_MS, own_hi + TZ_TRANSITION_MS)
+    tr = (_transitions_ms(rule, own_lo - TZ_TRANSITION_MS, own_hi + TZ_TRANSITION_MS)
           if len(raw_ms) else np.array([], dtype=np.int64))
 
     def erow(e) -> dict:
@@ -1214,7 +1491,8 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
                first_entry_in_prev_month=bool(first and first[0] < own_lo),
                # ein Wechsel-Lauf reicht in den Vormonat (Schluss-Seite dort):
                # check_following sperrt dann den Vormonat
-               switch_reaches_prev_month=any(e[0] < own_lo for r in runs for e in r),
+               switch_reaches_prev_month=any(e[0] < own_lo for r in runs for e in r)
+               or any(_ambig_before_run(r, entries, ambig_gaps, own_lo) for r in runs),
                # erster/letzter Eintrag weicht ab und ist (noch) nicht bestaetigt: ohne
                # Nachbar-Kontext auf dieser Seite haelt raw_slice den Monat zurueck
                leading_suspect=bool(first and first[1] and first[3] and not any(first in r for r in runs)),
@@ -1235,15 +1513,15 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
                        f"in Dateireihenfolge (max {rep['max_reversal_s'] / 60:.0f} min, Uhrumstellung?)")
     for r in runs[:1]:
         reasons.append(f"{len(runs)} Stempelungswechsel: {len({x[2] for x in r})} unabhaengige Luecken in "
-                       f"Folge mit {r[0][1]:+d} h Abweichung von {RAW_TZ[mode]}, z.B. "
+                       f"Folge mit {r[0][1]:+d} h Abweichung von {rule.describe()}, z.B. "
                        + ", ".join(f"{_raw_iso(x[0])} {x[4]}" for x in r[:3])
                        + " (andere Sommerzeitregel/Verschiebung?)")
     if n >= TZ_MIN_ANCHORS:
         if med_dev != 0:
             reasons.append(f"Median-Abweichung {med_dev:+g} h (Median-Offset {med:g} h, erwartet "
-                           f"{_fmt_counter(rep['expected_offsets'])} h aus {RAW_TZ[mode]})")
+                           f"{_fmt_counter(rep['expected_offsets'])} h aus {rule.describe()})")
         if share < TZ_MIN_SHARE:
-            reasons.append(f"nur {share:.0%} der Anker ohne Abweichung von {RAW_TZ[mode]}")
+            reasons.append(f"nur {share:.0%} der Anker ohne Abweichung von {rule.describe()}")
     rep["status"] = "failed" if reasons else ("ok" if n >= TZ_MIN_ANCHORS else "not_checkable")
     if rep["status"] == "not_checkable":
         reasons.append(f"nur {n} eindeutige Ankerpunkte (< {TZ_MIN_ANCHORS}), Zeitzone nicht pruefbar")
@@ -1266,12 +1544,12 @@ def _utc_of(df: pd.DataFrame, mode: str) -> np.ndarray:
     """UTC-ms einer Rohtabelle: vorberechnete Spalte utc_ms, sonst aus raw_ms (TimezoneError)."""
     if "utc_ms" in df:
         return df["utc_ms"].to_numpy(dtype=np.int64)
-    return raw_to_utc_ms(df["raw_ms"].to_numpy(), mode)
+    return raw_to_utc_ms_mode(df["raw_ms"].to_numpy(), mode)
 
 
 def ticks_to_bars(ticks: pd.DataFrame) -> pd.DataFrame:
     """Ticks (raw_ms, bid, ask, volume) -> 1m-Bars im Store-Schema (UTC; Rohzeit =
-    New-York-Ortszeit, RAW_TZ["tick"]; nicht eindeutige Ortszeit -> TimezoneError)."""
+    Regel des Rohmonats aus dem Fahrplan; nicht eindeutige Ortszeit -> TimezoneError)."""
     t = pd.DataFrame({
         "ts": pd.to_datetime(_utc_of(ticks, "tick"), unit="ms", utc=True).as_unit("ms"),
         "bid": ticks["bid"].to_numpy(), "ask": ticks["ask"].to_numpy(),
@@ -1284,7 +1562,7 @@ def ticks_to_bars(ticks: pd.DataFrame) -> pd.DataFrame:
 
 def m1_to_bars(m1: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     """
-    M1-Bid-Bars -> Store-Schema (Rohzeit RAW_TZ["m1"] = fest UTC-5, NICHT
+    M1-Bid-Bars -> Store-Schema (Rohzeit nach Fahrplan, Default fixed_est = fest UTC-5, NICHT
     verifiziert); ask = bid (kein Spread). Doppelte Minuten
     mit abweichenden Werten (von HistData beobachtet) werden zusammengefasst:
     open erste, high max, low min, close letzte Zeile in Dateireihenfolge.
@@ -1376,9 +1654,9 @@ class Ctx:
         return self.first_data is not None and u.first_month > self.first_data
 
     def unit(self, ym: tuple[int, int]) -> Unit:
-        # Jahresdatei erst, wenn das Rohjahr (Ortszeit RAW_TZ) samt SETTLE_S vorbei ist
+        # Jahresdatei erst, wenn das Rohjahr (Stempelungsregel) samt SETTLE_S vorbei ist
         t = int((self.now() - timedelta(seconds=SETTLE_S)).timestamp() * 1000)
-        cur = datetime.fromtimestamp(int(utc_to_raw_ms(np.array([t]), self.mode)[0]) / 1000, UTC).year
+        cur = datetime.fromtimestamp(int(utc_to_raw_ms_mode(np.array([t]), self.mode)[0]) / 1000, UTC).year
         return unit_for(self.symbol, self.mode, ym, cur, self.data_root)
 
     def _since(self, iso: str | None) -> float:
@@ -1569,12 +1847,13 @@ class Ctx:
         Vorhandenen Quarantaene-Marker bewerten -> (accepted, alter_marker_zum_neupruefen).
         - unlesbar: ERROR, Marker bleibt, Monat bleibt gesperrt (ein "accepted"
           mit Tippfehler geht nicht still verloren)
-        - "accepted": true mit raw_tz == RAW_TZ[mode]: gilt (gleiche Umrechnung)
-        - "accepted": true ohne/mit anderem raw_tz (Freigabe unter einer anderen
-          Umrechnung, z.B. v1 fest UTC-5): neu pruefen; besteht -> Marker weg,
-          sonst neuer Marker accepted false mit Hinweis
-        - nicht freigegeben, aktuelle tz_check_version und raw_tz: sperrt
-        - nicht freigegeben, aeltere Version/andere Zone: neu pruefen
+        - "accepted": true mit derselben Stempelungsregel (raw_tz + tz_shift_h ==
+          Regel des Rohmonats): gilt (gleiche Umrechnung)
+        - "accepted": true unter einer anderen Regel (v1 fest UTC-5, v2-v4
+          ny_local, ...): neu pruefen; besteht -> Marker weg, sonst neuer Marker
+          accepted false mit Hinweis
+        - nicht freigegeben, aktuelle tz_check_version und Regel: sperrt
+        - nicht freigegeben, aeltere Version/andere Regel: neu pruefen
         """
         if not q.exists():
             return False, None
@@ -1584,14 +1863,15 @@ class Ctx:
                       "Marker reparieren (z.B. \"accepted\": true) oder loeschen", q)
             raise Quarantined(u, ym, f"Quarantaene-Marker {q.name} unlesbar (kein gueltiges JSON) - "
                               "reparieren oder loeschen (= neu pruefen)", None)
-        same_tz = info.get("raw_tz") == RAW_TZ[self.mode]
+        rule = rule_for(self.mode, ym)
+        same_tz = (info.get("raw_tz"), info.get("tz_shift_h", 0)) == (rule.zone, rule.shift_h)
         if info.get("accepted") and same_tz:
             return True, None
         if not info.get("accepted") and same_tz and info.get("tz_check_version") == TZ_CHECK_VERSION:
             raise Quarantined(u, ym, info.get("reason") or "Quarantaene", info.get("check"))
         log.warning("Quarantaene-Marker %s stammt aus aelterer Zeitzonen-Pruefung (Version %s, %s%s) - "
                     "Rohmonat wird neu geprueft (ohne Download)", q.name,
-                    info.get("tz_check_version", 1), info.get("raw_tz") or "fest UTC-5",
+                    info.get("tz_check_version", 1), info.get("tz_rule") or info.get("raw_tz") or "fest UTC-5",
                     ", war freigegeben" if info.get("accepted") else "")
         return False, info
 
@@ -1630,7 +1910,7 @@ class Ctx:
         if old is not None and old.get("accepted"):
             note = (f"Fruehere Freigabe (\"accepted\": true, Pruefversion "
                     f"{old.get('tz_check_version', 1)}, {old.get('raw_tz') or 'fest UTC-5'}) galt "
-                    f"einer anderen Umrechnung; unter {RAW_TZ[self.mode]} neu geprueft und "
+                    f"einer anderen Umrechnung; unter {rule_for(self.mode, ym).describe()} neu geprueft und "
                     "durchgefallen - erneut pruefen und ggf. neu freigeben")
         try:
             sel = self._month_rows(u, ym)
@@ -1639,7 +1919,7 @@ class Ctx:
                 raise Quarantined(u, ym, f"Format nicht lesbar: {e}", None)
             self._quarantine(u, ym, f"Format nicht lesbar: {e}", None, note)
         try:
-            sel = sel.assign(utc_ms=raw_to_utc_ms(sel["raw_ms"].to_numpy(), self.mode))
+            sel = sel.assign(utc_ms=raw_to_utc_ms(sel["raw_ms"].to_numpy(), rule_for(self.mode, ym)))
         except TimezoneError as e:
             # auch bei "accepted": nicht eindeutige Ortszeit wird nie geraten
             reason = f"Rohzeit nicht eindeutig nach UTC umrechenbar: {e}"
@@ -1655,7 +1935,8 @@ class Ctx:
         chk = self.tz.get(key)
         if chk is None:
             bounds = raw_month_bounds_ms(ym)
-            chk = check_timezone(sel["raw_ms"].to_numpy(), self.symbol, bounds, self.mode, nb)
+            chk = check_timezone(sel["raw_ms"].to_numpy(), self.symbol, bounds, self.mode,
+                                 neighbours=nb)
             if chk["status"] == "not_checkable":
                 # zu wenige Anker (kurzer erster Historienmonat, duenner Monat):
                 # gemeinsam mit gecachten Nachbar-Rohmonaten pruefen
@@ -1687,7 +1968,7 @@ class Ctx:
                               f"{', '.join(hold)}", chk)
         if not chk["ok"]:
             reason = ("" if chk["status"] == "not_checkable" else
-                      f"Zeitzone passt nicht zu {RAW_TZ[self.mode]}: ") + chk["reason"]
+                      f"Zeitzone passt nicht zu {rule_for(self.mode, ym).describe()}: ") + chk["reason"]
             if pad["provisional"]:
                 miss = [_ymstr(_ym_add(ym, k)) for k, s_ in ((-1, "left_missing"), (1, "right_missing"))
                         if pad[s_]]
@@ -1697,7 +1978,7 @@ class Ctx:
         if old is not None and q.exists() and not self.report_only and not pad["provisional"]:
             q.unlink(missing_ok=True)                  # neu geprueft und bestanden
             log.warning("Quarantaene-Marker %s (aeltere Pruefung) entfernt: %s besteht die Pruefung "
-                        "unter %s", q.name, _ymstr(ym), RAW_TZ[self.mode])
+                        "unter %s", q.name, _ymstr(ym), rule_for(self.mode, ym).describe())
         return sel, chk
 
     def check_following(self, ym: tuple[int, int]) -> None:
@@ -1748,8 +2029,10 @@ class Ctx:
         return pad
 
     def _quarantine(self, u: Unit, ym, reason: str, check: dict | None, note: str | None = None):
+        rule = rule_for(self.mode, ym)
         info = {"reason": reason, "check": check, "since": self.now().isoformat(),
-                "accepted": False, "raw_tz": RAW_TZ[self.mode], "tz_check_version": TZ_CHECK_VERSION}
+                "accepted": False, "tz_rule": rule.name, "raw_tz": rule.zone,
+                "tz_shift_h": rule.shift_h, "tz_check_version": TZ_CHECK_VERSION}
         if note:
             info["note"] = note
             reason = f"{reason} [{note}]"
@@ -1763,19 +2046,23 @@ class Ctx:
 
 
 # ------------------------------------------------------------- monatsbau ---
-def needed(symbol: str, ym: tuple[int, int], mode: str = "tick") -> list[tuple[int, int]]:
-    """Rohmonate, die UTC-Monat ym ueberdecken (aus RAW_TZ[mode] berechnet, nicht
-    fest verdrahtet): fuer New York/UTC-5 M-1 (dessen letzte 4 h in EDT bzw.
-    5 h in EST) und M; vor Historienbeginn entfaellt."""
+def _raw_months_for(ym: tuple[int, int], mode: str) -> list[tuple[int, int]]:
     lo = int(datetime(*ym, 1, tzinfo=UTC).timestamp() * 1000)
     hi = int(datetime(*_ym_add(ym, 1), 1, tzinfo=UTC).timestamp() * 1000) - 1
     a, b = (datetime.fromtimestamp(int(x) / 1000, UTC)
-            for x in utc_to_raw_ms(np.array([lo, hi]), mode))
+            for x in utc_to_raw_ms_mode(np.array([lo, hi]), mode))
     out, r = [], (a.year, a.month)
     while r <= (b.year, b.month):
         out.append(r)
         r = _ym_add(r, 1)
-    return [r for r in out if not before_history(symbol, r)]
+    return out
+
+
+def needed(symbol: str, ym: tuple[int, int], mode: str = "tick") -> list[tuple[int, int]]:
+    """Rohmonate, die UTC-Monat ym ueberdecken (aus dem Stempelungsfahrplan
+    berechnet, nicht fest verdrahtet): fuer UTC-5/UTC-4 M-1 (dessen letzte
+    4 bzw. 5 h) und M; vor Historienbeginn entfaellt."""
+    return [r for r in _raw_months_for(ym, mode) if not before_history(symbol, r)]
 
 
 def build_month(ctx: Ctx, ym: tuple[int, int]) -> tuple[pd.DataFrame, dict]:
@@ -1789,7 +2076,7 @@ def build_month(ctx: Ctx, ym: tuple[int, int]) -> tuple[pd.DataFrame, dict]:
         stats["raw_months"][_ymstr(r)] = info
         if info["state"] != "data":
             continue
-        sel, tz = ctx.raw_slice(u, r)                 # mit utc_ms (RAW_TZ[mode] -> UTC)
+        sel, tz = ctx.raw_slice(u, r)                 # mit utc_ms (Regel des Rohmonats -> UTC)
         if r == ym:
             # rechter Nachbar (Rohmonat M+1) fehlte bei der Pruefung von M: Datei
             # wird mit tz_right_padding=false geschrieben und spaeter nachgeprueft
@@ -1832,8 +2119,7 @@ def run(symbol: str, start: date, end: date, data_root: Path | None = None, *,
     zurueck (exit_code, s. Docstring oben). Der Laufreport wird immer
     geschrieben, ausser wenn ein anderer Prozess den Symbol-Lock haelt.
     """
-    if symbol not in SYMBOLS:
-        raise ValueError(f"unbekanntes Symbol {symbol}; bekannt: {SYMBOLS}")
+    _check_symbol(symbol)
     if mode not in MODES:
         raise ValueError(f"unbekannter Modus {mode}; bekannt: {MODES}")
     data_root = data_root or dk.default_data_root()
@@ -1917,10 +2203,10 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
                     continue
                 if st == "recheck_padding" and not pad:
                     continue
-                relabel_store_file(out, mode, pad)
+                relabel_store_file(out, mode, pad, store_tz_label(mode, ym))
                 relabelled.append(ym)
                 log.info("%s: nachgeprueft (%s) und bestanden -> source_timezone %r, tz_right_padding=%s",
-                         out.name, st, SOURCE_TZ_META[mode], pad)
+                         out.name, st, store_tz_label(mode, ym), pad)
                 continue
             moved = None
             if st == "stale_shifted":
@@ -1929,7 +2215,7 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
                 # verschobenen Monats
                 moved = retire_stale_store_file(data_root, out)
             log.warning("%s: source_timezone %r statt %r (andere Umrechnung%s) - %s", out.name,
-                        old_tz, SOURCE_TZ_META[mode],
+                        old_tz, store_tz_label(mode, ym),
                         ", UTC-Zeiten verschoben" if moved else ", in diesem Monat gleiche UTC-Zeiten",
                         (f"aus dem Store genommen ({moved}); " if moved else "bleibt bis zum Neubau; ")
                         + ("wird aus dem Roh-Cache neu gebaut" if ym in in_range else
@@ -1946,7 +2232,7 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
     for ym in dk.months(start, end):
         if not _month_closed(ctx.now(), ym, mode):
             log.info("skip %s %s (Monat nicht abgeschlossen: Rohmonatsende %s in UTC + %g h)", sym,
-                     _ymstr(ym), RAW_TZ[mode], SETTLE_S / 3600)
+                     _ymstr(ym), rule_for(mode, ym).describe(), SETTLE_S / 3600)
             continue
         if before_history(sym, ym):
             unavailable[ym] = f"vor Historienbeginn {HISTORY_START[sym][0]}-{HISTORY_START[sym][1]:02d}"
@@ -2001,7 +2287,8 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
             return
         out = store_path(data_root, sym, *ym, mode)
         rep["file"] = str(out.relative_to(data_root))
-        write_parquet(out, df, mode, right_padding=stats.get("tz_right_padding", True))
+        write_parquet(out, df, mode, right_padding=stats.get("tz_right_padding", True),
+                      label=store_tz_label(mode, ym))
         dk.write_json_atomic(report_path(data_root, sym, *ym, mode), rep)
         written.append(ym)
         log.info("%-15s %6d Bars  gekreuzt=%-3d spread_median=%g  mode=%s", label, rep["rows"],
@@ -2209,6 +2496,13 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
     }
 
 
+def _check_symbol(symbol: str) -> None:
+    if symbol in REMOVED_SYMBOLS:
+        raise ValueError(REMOVED_SYMBOLS[symbol])
+    if symbol not in SYMBOLS:
+        raise ValueError(f"unbekanntes Symbol {symbol}; bekannt: {', '.join(SYMBOLS)}")
+
+
 # ----------------------------------------------------------- verify-month ---
 def verify_month(symbol: str, ym: tuple[int, int], data_root: Path | None = None, *,
                  mode: str = "tick", now=None, stop: threading.Event | None = None,
@@ -2220,6 +2514,7 @@ def verify_month(symbol: str, ym: tuple[int, int], data_root: Path | None = None
     Marker werden nur ausgewertet). exit_code: 0 ok, 2 Validierung,
     3 Download/pending/429-Budget/Lock, 4 Zeitzone/Format (Quarantaene).
     """
+    _check_symbol(symbol)
     data_root = data_root or dk.default_data_root()
     now = now or dk.utc_now
     if not _month_closed(now(), ym, mode):
@@ -2244,7 +2539,7 @@ def verify_month(symbol: str, ym: tuple[int, int], data_root: Path | None = None
             else:
                 st, old_tz = classify_store_file(out, mode, ym)
                 rep["store_file"] = {"path": str(out), "state": st, "source_timezone": old_tz,
-                                     "expected": SOURCE_TZ_META[mode]}
+                                     "expected": store_tz_label(mode, ym)}
                 if st != "current":
                     log.warning("VERIFY %s: Store-Datei %s hat source_timezone %r (%s) - der "
                                 "naechste normale Lauf %s", _ymstr(ym), out.name, old_tz, st,
@@ -2279,11 +2574,52 @@ def verify_month(symbol: str, ym: tuple[int, int], data_root: Path | None = None
                for k, v in rep.get("raw_months", {}).items()}
         log.info("VERIFY %s %s (%s, Rohzeit %s): ok=%s exit=%d Bars=%s Spread-Median=%s "
                  "(Offset, Abweichung) Median h=%s Requests=%d", symbol, _ymstr(ym), mode,
-                 RAW_TZ[mode], rep["ok"], rep["exit_code"], rep.get("rows"),
+                 rule_for(mode, ym).describe(), rep["ok"], rep["exit_code"], rep.get("rows"),
                  rep.get("spread_median"), tzs, rep["requests"])
         return rep
     finally:
         lock.close()
+
+
+# ------------------------------------------------- regel offline abgleichen ---
+def evaluate_raw_month(data_root: Path, symbol: str, ym: tuple[int, int], mode: str = "tick",
+                       rule: "TzRule | str | None" = None) -> dict:
+    """
+    Einen Rohmonat NUR aus dem Roh-Cache gegen eine Stempelungsregel pruefen
+    (Default: Regel aus dem Fahrplan; z.B. fuer den Abgleich von Kandidaten).
+    Wie im echten Bau mit den Ticks der gecachten Nachbar-Rohmonate als Kontext.
+    Kein Download, keine Marker, keine Store-Aenderung. Rueckgabe: Bericht von
+    check_timezone plus cached, neighbours (prev/next vorhanden, *_missing =
+    sollte existieren, fehlt im Cache) und convert_error (nicht eindeutige Ortszeit).
+    """
+    _check_symbol(symbol)
+    data_root = Path(data_root)
+    rule = as_rule(rule) if rule is not None else rule_for(mode, ym)
+    ctx = Ctx(symbol, mode, data_root, None, dk.utc_now, report_only=True)
+    base = {"symbol": symbol, "mode": mode, "month": _ymstr(tuple(ym)), "rule": rule.name,
+            "rule_detail": rule.describe()}
+    u = ctx.unit(tuple(ym))
+    if not u.path(data_root).exists():
+        return {**base, "cached": False, "status": "not_cached", "ok": False,
+                "reason": f"Rohdatei {u.name} nicht im Cache", "neighbours": {}}
+    try:
+        raw = ctx._month_rows(u, tuple(ym))["raw_ms"].to_numpy()
+    except (CorruptZip, FormatError) as e:
+        return {**base, "cached": True, "status": "unreadable", "ok": False,
+                "reason": f"Rohdatei nicht lesbar: {e}", "neighbours": {}}
+    nb, pad = ctx._neighbours(tuple(ym))
+    rep = check_timezone(raw, symbol, raw_month_bounds_ms(tuple(ym)), mode, rule=rule, neighbours=nb)
+    rep["convert_error"] = None
+    try:
+        raw_to_utc_ms(raw, rule)
+    except TimezoneError as e:
+        rep.update(convert_error=str(e), status="failed", ok=False,
+                   reason="; ".join(x for x in (rep.get("reason"), f"nicht eindeutige Ortszeit: {e}") if x))
+    rep.update(base)
+    rep.update(cached=True, neighbours={"prev": pad["left"], "next": pad["right"],
+                                        "prev_missing": pad["left_missing"],
+                                        "next_missing": pad["right_missing"]})
+    return rep
 
 
 # -------------------------------------------------------------------- cli ---
@@ -2296,7 +2632,7 @@ def _ym(s: str) -> tuple[int, int]:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("--symbol", required=True, type=str.upper, choices=SYMBOLS)
+    p.add_argument("--symbol", required=True, type=str.upper, help=f"eines von {', '.join(SYMBOLS)}")
     p.add_argument("--start", help="YYYY-MM (default: Historienbeginn des Symbols)")
     p.add_argument("--end", default=None, help="YYYY-MM (default: laufender Monat)")
     p.add_argument("--mode", choices=MODES, default="tick",
@@ -2325,6 +2661,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="einen Monat laden, decodieren, Zeitzone pruefen, validieren (Report)")
     p.add_argument("-v", "--verbose", action="store_true")
     a = p.parse_args(argv)
+    try:
+        _check_symbol(a.symbol)
+    except ValueError as e:
+        p.error(str(e))
     if a.attempts < 1 or a.max_consecutive_failures < 0 or \
             min(a.pause, a.backoff_base, a.max_backoff, a.max_rate_limit_wait) < 0:
         p.error("--attempts >= 1, uebrige Zahlen >= 0")

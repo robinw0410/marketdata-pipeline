@@ -1,6 +1,6 @@
 # HistData.com: Download, Formate, Zeitzone - Recherche
 
-Stand 2026-11-05. **histdata.com war aus dieser Umgebung nicht erreichbar** (Proxy 403, WebFetch: Host nicht auflösbar). Von hier aus wurde nichts live gegen HistData verifiziert. **Ausnahme: die Tick-Zeitzone**, gemessen vom Eigentümer im Homelab an echten XAUUSD-Ticks (Abschnitt 4). Alles andere unten stammt aus Quellcode-Lektüre (nichts davon ausgeführt), aus Dokumenten Dritter, die echte HistData-Dateien verarbeitet haben, und aus einer Websuche. Getestet ist `scripts/fetch_histdata.py` ausschließlich mit synthetischen Daten und gemocktem HTTP.
+Stand 2026-11-05. **histdata.com war aus dieser Umgebung nicht erreichbar** (Proxy 403, WebFetch: Host nicht auflösbar). Von hier aus wurde nichts live gegen HistData verifiziert. **Ausnahme: die Tick-Zeitzone**, gemessen vom Eigentümer im Homelab an echten Ticks (XAUUSD, XAGUSD, EURUSD; Abschnitt 4). Alles andere unten stammt aus Quellcode-Lektüre (nichts davon ausgeführt), aus Dokumenten Dritter, die echte HistData-Dateien verarbeitet haben, und aus einer Websuche. Getestet ist `scripts/fetch_histdata.py` ausschließlich mit synthetischen Daten und gemocktem HTTP.
 
 ## Quellen
 
@@ -66,41 +66,50 @@ Weitere Beobachtungen an echten Dateien (Drittquellen, nicht selbst geprüft):
 
 **Aussage HistData** (HDC-SPEC, für jedes Format wörtlich): "TimeZone: Eastern Standard Time (EST) time-zone WITHOUT Day Light Savings adjustments". Gleichlautend: HD-README, HF ("Per HistData's own FAQ ... EST, UTC-5 ... WITHOUT daylight-savings adjustment, year-round"), HDC (`EST_NO_DST_OFFSET_MS = 18_000_000`, `SOURCE_UTC_OFFSET = "-05:00"`), AIT (`UTC_MINUS_FIVE`), WEB.
 
-### Verifizierter Befund: Ticks sind New-York-Ortszeit MIT Sommerzeit
+### Verifizierter Befund: Ticks = Europe/Berlin minus 6 h (`berlin_minus_6`)
 
-Messung des Eigentümers im Homelab an **echten** HistData-Daten (XAUUSD, `--mode tick`, `check_timezone` der Vorversion, die fest UTC-5 erwartete):
+Zweite Messung des Eigentümers im Homelab an **echten** HistData-Ticks, **alle drei Symbole** (XAUUSD, XAGUSD, EURUSD), `--mode tick`:
 
-| Rohmonat | Ergebnis | Rohdaten |
+| Rohmonat | Rohdaten | Folgerung |
 |---|---|---|
-| 2024-01 | impliziter Offset -5 h, ok | (Winter: EST = UTC-5) |
-| 2024-07 | Quarantäne, **alle 38 Anker bei -4 h** | Tagespause 16:59:58 -> 18:00:01, Wochenschluss Fr 16:59:58, Wochenstart So 18:00:01; 0 Rücksprünge, Daten sonst sauber |
+| 2024-01 | impliziter Offset -5 h | passt (EU-Winter) |
+| 2024-03 | ab 10.03. (US-Umstellung) bis Monatsende weiter -5 h: Tagespause roh 15:59:59 -> 17:00:00 statt 16:59 -> 18:00; Wechsel auf -4 h erst zur EU-Umstellung (31.03.) | nicht New York |
+| 2024-07 | -4 h: Tagespause roh 16:59:58 -> 18:00:01, Wochenschluss Fr 16:59:58, Wochenstart So 18:00:01 | passt (EU-Sommer) |
+| 2024-10/11 | ab 27.10. (EU-Umstellung) schon -5 h, nicht erst ab 03.11. | nicht New York |
 
-Die Rohzeiten sind im Juli genau die Sessionzeiten in New-York-Ortszeit (Schluss 17:00, Öffnung 18:00), also EDT = UTC-4. **Schluss: HistData-Tick-Zeitstempel sind America/New_York-Ortszeit mit Sommerzeit, nicht fest EST.** Die HistData-Angabe stimmt für Ticks nicht. Das passt zur Beobachtung 3 unten (AIT, August 2026: erster Tick roh Sonntag 18:00).
+**Schluss: Rohzeit = Europe/Berlin-Ortszeit minus 6 h**, also UTC-5 in der EU-Winterzeit und UTC-4 in der EU-Sommerzeit; Wechsel am letzten Sonntag im März bzw. Oktober um 01:00 UTC. Das widerlegt sowohl die HistData-Angabe "EST ohne Sommerzeit" als auch die erste Deutung (America/New_York, Prüfversion 2-4; die Juli-Messung allein konnte beide nicht unterscheiden). **Der Markt selbst bleibt New-York-basiert:** die erwarteten Anker sind weiter die CME/New-York-Sessionzeiten (17:00/18:00 America/New_York); nur die Stempelungsregel ist eine andere.
 
-**M1 ist NICHT verifiziert.** Für M1 bleibt die Annahme fest UTC-5 (`Etc/GMT+5`) laut HistData-Angabe. Sie wird nicht stillschweigend umgestellt. Prüfen mit einem Sommermonat:
+**M1 ist NICHT verifiziert.** Für M1 bleibt `fixed_est` (`Etc/GMT+5`, fest UTC-5) laut HistData-Angabe. Sie wird nicht stillschweigend umgestellt. Prüfen mit einem Sommermonat:
 
 ```
 python scripts/fetch_histdata.py --symbol XAUUSD --mode m1 --verify-month 2024-07
 ```
 
-Der Verify-Report zeigt je Rohmonat `raw_tz`, `median_offset_h`, `median_deviation_h`, `expected_offsets`, `deviations` und abweichende Beispiele. Liegt die Median-Abweichung bei +1 (impliziter Offset -4 h statt -5 h), sind auch die M1-Zeitstempel New-York-Ortszeit. Dann muss `RAW_TZ["m1"]` bewusst auf `America/New_York` umgestellt werden (mit Test).
+Liegt die Median-Abweichung bei +1 (impliziter Offset -4 h statt -5 h), ist auch M1 mit Sommerzeit gestempelt; dann den m1-Fahrplan in `config/histdata_timezone.yaml` bewusst umstellen (z.B. auf `berlin_minus_6`, vorher mit dem Survey prüfen).
 
-### Umrechnung (`RAW_TZ`, `raw_to_utc_ms`)
+**EURUSD** wird nicht mehr über HistData geladen: keine Tagespause, zu wenige Anker je Monat, und `--verify-month 2024-11` bestand trotz falscher Stempelung (NY-Regel). Der Bot nutzt einen Tages-Referenzkurs (EZB/FRED). `--symbol EURUSD` wird mit diesem Hinweis abgelehnt; `fetch_dukascopy.py` ist unverändert.
 
-- `RAW_TZ = {"tick": "America/New_York", "m1": "Etc/GMT+5"}` (zoneinfo; `Etc/GMT+5` ist fest UTC-5).
-- Die Rohziffern werden als Wanduhrzeit in `RAW_TZ[mode]` gelesen und vektorisiert nach UTC umgerechnet: Je möglichem Offset der Zone (-5 h, -4 h) wird ein Kandidat gebildet. Er gilt, wenn die Zone in genau diesem UTC-Zeitpunkt diesen Offset hat (Wechseltabelle aus zoneinfo, je Jahr berechnet, also auch die US-Regel vor 2007). Exakt auf die Millisekunde.
-- **Nie raten:** Ortszeiten in der Sommerzeit-Lücke (z.B. 2024-03-10 02:00:00-02:59:59.999) existieren nicht, Ortszeiten in der doppelten Stunde (z.B. 2024-11-03 01:00:00-01:59:59.999) sind mehrdeutig. Beides ergibt `TimezoneError` (Unterklasse von `FormatError`) mit den ersten Beispielen. Der Markt ist zu diesen Zeiten (Sonntag früh) geschlossen. Ein Tick dort heißt, dass etwas nicht stimmt. Der Rohmonat geht in Quarantäne (Exit 4), auch wenn sein Marker `"accepted": true` hat.
-- Folge: UTC-Monat M = Rohmonat M-1 (dessen letzte 4 h in EDT bzw. 5 h in EST) + Rohmonat M (ohne diese Stunden an seinem Ende). Die Rohmonate werden aus `RAW_TZ` berechnet, nicht fest verdrahtet. US-Umstellungen liegen nie auf einem Monatsrand.
+### Stempelungsregeln und Fahrplan (`config/histdata_timezone.yaml`)
 
-### Prüfung je Rohmonat (`check_timezone`, Prüfversion 4)
+- Regel (`TzRule`): Name, zoneinfo-Zone, ganze Stunden Verschiebung; Rohzeit = Ortszeit in `zone` + `shift_h`. Eingebaut: `berlin_minus_6` (Europe/Berlin, -6), `ny_local` (America/New_York, 0), `fixed_est` (Etc/GMT+5, 0). Weitere Regeln in der Datei (`rules`, Namen eindeutig, Zone wird geprüft).
+- `schedule` je Modus: Liste `{from: "YYYY-MM", rule: name}` nach **Roh**monaten, aufsteigend; ein Wechsel gilt nur an Rohmonatsgrenzen. Default: tick `berlin_minus_6` ab 2000-01, m1 `fixed_est` ab 2000-01. Andere Datei: `$HISTDATA_TZ_CONFIG`. Unbekannte Regel/Zone, unsortiertes oder doppeltes `from`, fehlender Modus → Abbruch, nie still ein Default.
+- Regel für einen Zeitraum ändern (z.B. falls ältere Jahre anders gestempelt sind): Kandidaten erst offline gegen den Roh-Cache abgleichen (`scripts/histdata_tz_survey.py`, nutzt `evaluate_raw_month`: nur Cache, kein Download, keine Marker, mit Nachbarmonaten als Kontext wie im echten Bau), dann einen Eintrag in `schedule` ergänzen. Der nächste Lauf erkennt betroffene Monatsdateien an `source_timezone` (s. Altbestand).
+
+### Umrechnung (`raw_to_utc_ms`)
+
+- `raw_to_utc_ms(raw_ms, rule)`: Rohziffern minus `shift_h` sind Wanduhrzeit in `rule.zone`; vektorisiert nach UTC: je möglichem Offset der Zone ein Kandidat, gültig, wenn die Zone in genau diesem UTC-Zeitpunkt diesen Offset hat (Wechseltabelle aus zoneinfo, je Jahr). Exakt auf die Millisekunde. Ein Rohmonat wird mit der Regel dieses Rohmonats umgerechnet (`raw_to_utc_ms_mode`).
+- **Nie raten:** Ortszeiten in der Sommerzeit-Lücke existieren nicht, Ortszeiten in der doppelten Stunde sind mehrdeutig - für `berlin_minus_6` roh Samstag 20:00:00-20:59:59.999 in den beiden Umstellungsnächten (z.B. 2024-03-30, 2024-10-26). Beides ergibt `TimezoneError` (Unterklasse von `FormatError`) mit den ersten Beispielen. Der Markt ist dann geschlossen; ein Tick dort heißt, dass etwas nicht stimmt. Der Rohmonat geht in Quarantäne (Exit 4), auch wenn sein Marker `"accepted": true` hat.
+- Folge: UTC-Monat M = Rohmonat M-1 (dessen letzte 4 h im EU-Sommer bzw. 5 h im EU-Winter) + Rohmonat M (ohne diese Stunden an seinem Ende). Die Rohmonate werden aus dem Fahrplan berechnet, nicht fest verdrahtet. EU-Umstellungen liegen nie auf einem Monatsrand (Sonntag 01:00 UTC am Monatsende, Rohzeit Samstag 20:00).
+
+### Prüfung je Rohmonat (`check_timezone`, Prüfversion 5)
 
 Grundsatz (Re-Review von v3, das echte Datenfehler als Zeitzonenfehler wertete): **hart nur Systematisches oder Bestätigtes, Einzelausreißer sind Warnungen.**
 
 - Anker: je Marktlücke ein Schluss- und ein Öffnungsanker.
-  - Wochenende: Lücke ≥ 24 h, Schluss Do/Fr (Freitag oder Feiertagsvorabend), Öffnung So/Mo; Schluss 17:00, Öffnung 18:00 (Metalle) bzw. 17:00 (EURUSD) New York. Andere Lücken ≥ 24 h sind Ausfälle: nur Bericht (`outages`), nie Anker.
+  - Wochenende: Lücke ≥ 24 h, Schluss Do/Fr (Freitag oder Feiertagsvorabend), Öffnung So/Mo; Schluss 17:00, Öffnung 18:00 New York. Andere Lücken ≥ 24 h sind Ausfälle: nur Bericht (`outages`), nie Anker.
   - Tagespause der Metalle Mo-Do (17:00-18:00 New York): nur wenn **alle** pausenartigen Lücken des Tages (45 min bis 3 h, verträglich mit ±1 h) dieselbe eindeutige Abweichung ergeben. Bei richtigen Daten passt die echte Pause immer zu 0, ein Ausfall (z.B. genau 20:00-21:00) kann sie also nicht ersetzen.
 - **Kontext:** Die Ticks der ersten/letzten 8 Tage der gecachten Nachbar-Rohmonate werden mitbetrachtet. Lücken dort liefern Kontext-Einträge (für Läufe über den Monatsrand), aber keine Anker für Median und Anteil. Vorher hatte EURUSD (keine Tagespause) am Monatsrand gar keinen Anker (Review: EURUSD 2025-10 mit EU-Stempelung bestand mit `{0: 7, -1: 1}`).
-- Je Anker der **implizite** Offset (Rohzeit minus UTC des Marktereignisses) und der **erwartete** Offset von `RAW_TZ[mode]` in genau diesem Zeitpunkt (tick: -4 h in EDT, -5 h in EST; m1: immer -5 h). Entschieden wird über die **Abweichung** = implizit - erwartet.
+- Je Anker der **implizite** Offset (Rohzeit minus UTC des Marktereignisses) und der **erwartete** Offset der Stempelungsregel in genau diesem Zeitpunkt (`berlin_minus_6`: -5 h im EU-Winter, -4 h im EU-Sommer; `fixed_est`: immer -5 h). `check_timezone(..., rule=...)` prüft gegen eine vorgegebene Kandidatenregel, sonst die Regel des Rohmonats; der Bericht nennt sie (`rule`). Entschieden wird über die **Abweichung** = implizit - erwartet.
 - Die Abweichung einer Lücke wird **aus beiden Seiten gemeinsam** bestimmt: alle ganzen Abweichungen F, mit denen der Schluss nicht vor dem letzten Tick (Toleranz 15 min: verirrte Ticks, alter 17:15-Schluss) und die Öffnung nicht nach dem ersten Tick läge (Toleranz 5 min). Bei richtigen Daten jeder Dichte liegt 0 in F.
   - Genau ein Wert: **eindeutiger** Eintrag, auch wenn die Ticks Minuten vom Ereignis entfernt sind (dünne Daten). Nur diese zählen für Median und Anteil.
   - F leer (Widerspruch): je Seite ein Eintrag (Schluss = kleinste, Öffnung = größte verträgliche Abweichung).
@@ -130,16 +139,18 @@ Grundsatz (Re-Review von v3, das echte Datenfehler als Zeitzonenfehler wertete):
 
 ### Altbestand
 
-Monatsdateien tragen das Parquet-Metadatum `source_timezone`, abgeleitet aus `RAW_TZ` und `TZ_CHECK_VERSION` (z.B. `America/New_York -> UTC, je Rohmonat geprueft (tz_check v4)`), dazu `tz_right_padding`. Wird `RAW_TZ` geändert (z.B. für M1 nach einer Messung), passen alte Dateien automatisch nicht mehr. Zu Beginn **jedes** Laufs werden alle Monatsdateien des Symbols/Modus geprüft, nicht nur `--start`/`--end`:
+Monatsdateien tragen das Parquet-Metadatum `source_timezone` = Regel(n) ihrer Rohmonate mit Zone/Verschiebung und `TZ_CHECK_VERSION` (z.B. `berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v5)`), dazu `tz_right_padding`. Wird der Fahrplan geändert, passen betroffene Dateien automatisch nicht mehr. Zu Beginn **jedes** Laufs werden alle Monatsdateien des Symbols/Modus geprüft, nicht nur `--start`/`--end`:
 
-- Gleiche Umrechnungszone, ältere Prüfversion (M1-Dateien der Vorversionen, Tick-Dateien von v2/v3): Rohmonate aus dem Cache neu prüfen (kein Download). Besteht → nur Metadaten erneuert (`relabelled_timezone`). Fällt durch → nach `metals/stale/` und Quarantäne (`retired_after_recheck`). Roh-Cache fehlt → Datei bleibt, gemeldet als `unverified_after_version_bump` (richtige Daten werden nicht weggeworfen).
+- Andere oder ältere Kennzeichnung, die im UTC-Monat **dieselben UTC-Zeiten** ergibt (ältere Prüfversion; `ny_local`-Dateien von Januar, Februar, April bis September und Dezember, wo beide Regeln übereinstimmen; M1-Dateien der Vorversionen): Rohmonate aus dem Cache unter der aktuellen Regel neu prüfen (kein Download). Besteht → nur Metadaten erneuert (`relabelled_timezone`). Fällt durch → nach `metals/stale/` und Quarantäne (`retired_after_recheck`). Roh-Cache fehlt → Datei bleibt, gemeldet als `unverified_after_version_bump`.
 - `tz_right_padding=false` und Rohmonat M+1 jetzt im Cache: ebenso nachprüfen.
-- Andere Umrechnung, die im Monat UTC-Zeiten verschiebt (Tick-Monate mit EDT aus der Fest-UTC-5-Version, 1 h verschoben): sofort nach `metals/stale/...` verschoben (nichts gelöscht; der Bot sieht eher eine Lücke als einen verschobenen Monat), auch außerhalb des Bereichs (`stale_retired_out_of_range`).
-- Andere Umrechnung, im Monat aber gleiche UTC-Zeiten (Dezember bis Februar, nur EST): bleibt liegen, bis der Neubau sie atomar ersetzt (`stale_out_of_range`).
+- Andere Umrechnung, die im Monat **UTC-Zeiten verschiebt** (`ny_local`: März, Oktober, November = die Wochen zwischen US- und EU-Umstellung; fest UTC-5: alle Monate mit EU-Sommerzeit): sofort nach `metals/stale/...` verschoben (nichts gelöscht; der Bot sieht eher eine Lücke als einen verschobenen Monat), im Bereich neu gebaut, außerhalb gemeldet (`stale_retired_out_of_range`).
+- Quarantäne-Marker tragen `tz_rule`, `raw_tz` (Zone), `tz_shift_h`, `tz_check_version`. Marker von v4 (`ny_local`) werden ohne Download unter der neuen Regel neu geprüft; `"accepted": true` gilt nur für dieselbe Regel.
 
 Monate im Bereich werden aus dem Roh-Cache neu gebaut (WARNING, `rebuilt_timezone`, Ergebnis `summary.months_rebuilt_timezone` bzw. `summary.months_stale_timezone_not_rebuilt`; der nächste Lauf versucht es erneut). Ohne Requests nur, wenn die Roh-ZIPs gecached sind; sonst wird normal geladen. `--verify-month` meldet den Zustand der Monatsdatei (`store_file`), ändert aber nichts.
 
-### Messungen v4
+### Messungen v4 (unter der damaligen Annahme America/New_York)
+
+Die Zahlen unten stammen aus Prüfversion 4 mit `ny_local` als richtiger Stempelung und EURUSD; die Entscheidungslogik ist in v5 unverändert, nur die erwartete Regel (`berlin_minus_6`) und die Symbolliste (ohne EURUSD) sind neu. Die Regressionstests laufen mit `berlin_minus_6`: richtige Stempelung besteht 2001-2026 jeden Monat (XAUUSD, XAGUSD), US-Regel (`ny_local`) und US-Regel vor 2007 landen nie in einem geschriebenen UTC-Monat, dünnes Silber (~1 Tick/20 min) besteht jeden Monat und falsch gestempeltes (fest UTC-5, US-Regel) wird nie geschrieben, die Datenfehler des Re-Reviews (verirrte Ticks, Feed-Kanten, 17:15-Schluss, Ausfälle) bleiben Warnungen.
 
 Synthetisch (Re-Review-Skripte `/tmp/claude-0/rereview_tz/`, Generator mit US-Feiertagskalender; eigene Durchläufe durch `run()`). Stand Prüfversion 4.
 
@@ -184,7 +195,7 @@ Falsch gestempelte Daten **im echten Ablauf** (`run()`, Backfill bzw. Monat für
 2. AIT: je 60 exakt doppelte M1-Zeilen in **jedem Oktober** 2019-2024, also eine Stunde doppelt. Für M1 ein Hinweis auf eine Uhr mit Umstellung (unverifiziert, s. oben).
 3. AIT: XAUUSD-Tickarchiv 2026-08, umgerechnet mit +5 h, beginnt am 2026-08-02 23:00 UTC, also erster Tick roh Sonntag 18:00. Gold öffnet sonntags 18:00 New York, im August 22:00 UTC. Passt zum Befund oben (New-York-Ortszeit).
 
-Tests (synthetisch): Ticks in New-York-Ortszeit bestehen im Januar, März, Juli und November (XAUUSD, XAGUSD, EURUSD). Fest UTC-5 gestempelte Ticks fallen im Juli durch, UTC-gestempelte immer. M1 fest UTC-5 besteht im Januar und Juli, New-York-gestempeltes M1 fällt im Juli durch. Ein Wechsel mitten im Monat, eine Umstellung kurz vor Monatsende und eine wiederholte Stunde fallen durch. Ein Feiertag (früher Schluss) besteht. Ein Tick in der doppelten Stunde führt zu Quarantäne.
+Tests (synthetisch, Prüfversion 5): Ticks nach `berlin_minus_6` bestehen im Januar, März, Juli, Oktober und November (XAUUSD, XAGUSD); nach US-Regel gestempelte Ticks fallen im März und Oktober durch (bestätigter Wechsel in den Lückenwochen). Fest UTC-5 gestempelte Ticks fallen im Juli durch, UTC-gestempelte immer. M1 fest UTC-5 besteht im Januar und Juli, New-York-gestempeltes M1 fällt im Juli durch. Ein Wechsel mitten im Monat, eine Umstellung kurz vor Monatsende und eine wiederholte Stunde fallen durch. Ein Feiertag (früher Schluss) besteht. Ein Tick in der doppelten Stunde führt zu Quarantäne.
 
 ## 5. Historienbeginn
 
@@ -204,7 +215,8 @@ Der Fetcher nimmt diese M1-Startmonate als `HISTORY_START`. Monate davor gelten 
 
 ## 7. Offene Punkte (unverifiziert)
 
-1. Zeitzone der **M1**-Dateien (Abschnitt 4): `--mode m1 --verify-month 2024-07`. Ticks sind verifiziert (New York mit Sommerzeit), M1 nicht.
+1. Zeitzone der **M1**-Dateien (Abschnitt 4): `--mode m1 --verify-month 2024-07`. Ticks sind für 2024 verifiziert (`berlin_minus_6`), M1 nicht.
+1a. Ob ältere Jahre anders gestempelt sind (vor 2024 nicht gemessen): `scripts/histdata_tz_survey.py` über mehrere Jahre laufen lassen und bei Bedarf den Fahrplan in `config/histdata_timezone.yaml` je Zeitraum ändern.
 2. Tick-Historienbeginn je Symbol.
 3. Format der Status-.txt.
 4. Ob HistData bestimmte User-Agents oder Request-Raten blockt, und wie eine Fehler-, Captcha- oder WAF-Seite aussieht. Jede Nicht-ZIP-Antwort mit Inhalt ist ein Fehlschlag mit Textausschnitt im Report, nie Daten.

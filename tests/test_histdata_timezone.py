@@ -1,10 +1,12 @@
 """
 Regressionstests Zeitzone HistData (fetch_histdata.py).
 
-Befund (Homelab, XAUUSD-Ticks): Tick-Zeitstempel sind New-York-Ortszeit MIT
-Sommerzeit (2024-01 implizit -5 h, 2024-07 alle Anker -4 h; Tagespause roh
-16:59:58 -> 18:00:01, Wochenschluss Fr 16:59:58, Wochenstart So 18:00:01).
-M1 bleibt (unverifiziert) fest EST = Etc/GMT+5.
+Befund (Homelab, echte Ticks aller drei Symbole): Tick-Zeitstempel =
+Europe/Berlin - 6 h (Regel berlin_minus_6): UTC-5 im EU-Winter, UTC-4 in der
+EU-Sommerzeit. 2024-01 -5 h, 2024-07 -4 h (Tagespause roh 16:59:58 ->
+18:00:01); 2024-03 bleibt nach der US-Umstellung (10.03.) bis 31.03. bei -5 h
+(Tagespause roh 15:59:59 -> 17:00:00), 2024-10 ab 27.10. schon -5 h.
+Marktzeiten bleiben New York. M1 bleibt (unverifiziert) fest EST = Etc/GMT+5.
 
 Erwartete Werte werden hier unabhaengig mit zoneinfo berechnet, nicht mit
 Helfern aus fetch_histdata. Nur synthetische Daten, HTTP gemockt.
@@ -27,6 +29,7 @@ import fetch_histdata as fh
 
 UTC = timezone.utc
 NY = ZoneInfo("America/New_York")
+BERLIN = ZoneInfo("Europe/Berlin")
 SYM = "XAUUSD"
 OLD_TZ_META = b"EST fixed UTC-5, converted to UTC, checked per month"
 NOW = datetime(2025, 3, 1, 12, tzinfo=UTC)
@@ -43,14 +46,25 @@ def _ny_to_utc(*args) -> datetime:
     return datetime(*args, tzinfo=NY).astimezone(UTC)
 
 
+def _raw_to_utc_ref(*args) -> datetime:
+    """Unabhaengige Referenz berlin_minus_6: Rohzeit + 6 h ist Berliner Ortszeit."""
+    local = datetime(*args) + timedelta(hours=6)
+    return local.replace(tzinfo=BERLIN).astimezone(UTC)
+
+
+BERLIN6 = fh.TZ_RULES["berlin_minus_6"]
+FIXED_EST = fh.TZ_RULES["fixed_est"]
+
+
 @functools.lru_cache(maxsize=None)
-def raw_month(y: int, m: int, stamping: str = "ny", step_s: int = 30) -> pd.DataFrame:
+def raw_month(y: int, m: int, stamping: str = "berlin", step_s: int = 30) -> pd.DataFrame:
     """
     Ticks eines ROH-Monats wie beobachtet, in New-York-Marktzeiten:
       So 18:00:01 .. Fr 16:59:58, Mo-Do Tagespause 16:59:58 -> 18:00:01.
     Regulaere Ticks alle step_s Sekunden auf Sekunde :01 (und :31), dazu je
     Handelstag Mo-Fr ein letzter Tick 16:59:58.
-    stamping: ny (Ortszeit mit Sommerzeit), est (fest UTC-5), utc.
+    stamping: berlin (berlin_minus_6, richtig), ny (NY-Ortszeit, US-Regel),
+    est (fest UTC-5), utc.
     Rueckgabe (nicht veraendern - gecached): raw (naiv), utc, bid, ask.
     """
     lo = pd.Timestamp(y, m, 1) - pd.Timedelta(days=3)
@@ -65,7 +79,9 @@ def raw_month(y: int, m: int, stamping: str = "ny", step_s: int = 30) -> pd.Data
     local = local[(local >= lo) & (local < hi)]
     # Wochenende deckt 02:00-02:59 (Fruehjahr) und 01:00-01:59 (Herbst) ab -> eindeutig
     utc = local.tz_localize("America/New_York").tz_convert("UTC")
-    if stamping == "ny":
+    if stamping == "berlin":
+        raw = utc.tz_convert(BERLIN).tz_localize(None) - pd.Timedelta(hours=6)
+    elif stamping == "ny":
         raw = local
     elif stamping == "est":
         raw = (utc - pd.Timedelta(hours=5)).tz_localize(None)
@@ -208,13 +224,18 @@ def _check(ms, ym, mode):
 
 
 # ======================================================= neue Schnittstelle ---
-def test_raw_tz_constants_and_error_type():
-    assert fh.RAW_TZ == {"tick": "America/New_York", "m1": "Etc/GMT+5"}
+def test_rule_constants_and_error_type():
+    assert fh.TZ_RULES["berlin_minus_6"] == fh.TzRule("berlin_minus_6", "Europe/Berlin", -6)
+    assert fh.TZ_RULES["ny_local"] == fh.TzRule("ny_local", "America/New_York", 0)
+    assert fh.TZ_RULES["fixed_est"] == fh.TzRule("fixed_est", "Etc/GMT+5", 0)
+    assert fh.rule_for("tick", (2024, 3)) == BERLIN6 and fh.rule_for("m1", (2024, 3)) == FIXED_EST
     assert issubclass(fh.TimezoneError, fh.FormatError)
     assert set(fh.SOURCE_TZ_META) >= {"tick", "m1"}
     tick_meta = _meta_value(fh.SOURCE_TZ_META["tick"])
     assert tick_meta != OLD_TZ_META               # sonst erkennt der Lauf alte Dateien nicht
     assert tick_meta != _meta_value(fh.SOURCE_TZ_META["m1"])
+    assert b"berlin_minus_6" in tick_meta and b"Europe/Berlin" in tick_meta
+    assert f"v{fh.TZ_CHECK_VERSION}".encode() in tick_meta and fh.TZ_CHECK_VERSION == 5
 
 
 # =========================================== 1. Anker wie beobachtet: ok ---
@@ -230,11 +251,11 @@ def test_observed_anchors_pass_in_tick_mode(ym, offset):
     assert sun.min().time() == datetime(2000, 1, 1, 18, 0, 1).time()
 
     rep = _check(raw_ms_of(df), ym, "tick")
-    for k in ("status", "ok", "reason", "anchors", "raw_tz", "expected_offsets", "deviations",
+    for k in ("status", "ok", "reason", "anchors", "rule", "expected_offsets", "deviations",
               "median_deviation_h", "median_offset_h", "edge_violations"):
         assert k in rep, k
     assert rep["status"] == "ok" and rep["ok"] is True, rep["reason"]
-    assert rep["raw_tz"] == "America/New_York"
+    assert rep["rule"] == "berlin_minus_6"
     assert rep["anchors"] >= 20
     assert rep["median_deviation_h"] == 0
     assert rep["median_offset_h"] == offset
@@ -242,10 +263,36 @@ def test_observed_anchors_pass_in_tick_mode(ym, offset):
     assert not rep["edge_violations"]
 
 
-@pytest.mark.parametrize("ym,offsets", [((2024, 3), {-5, -4}), ((2024, 11), {-4, -5})])
+def test_homelab_march_2024_gap_weeks_measured():
+    """Wie im Homelab gemessen: nach der US-Umstellung (10.3.) bleibt die Rohzeit
+    bis 31.3. bei -5 h - Tagespause roh 15:59:xx -> 17:00:xx. berlin_minus_6
+    besteht, ny_local (US-Regel) faellt mit bestaetigtem Wechsel durch."""
+    df = raw_month(2024, 3)
+    raw = pd.DatetimeIndex(df["raw"])
+    tue = raw[(raw >= pd.Timestamp("2024-03-12 15:00")) & (raw < pd.Timestamp("2024-03-12 18:00"))]
+    gap = np.diff(tue.asi8).argmax()
+    assert (str(tue[gap].time()), str(tue[gap + 1].time())) == ("15:59:58", "17:00:01")
+    ok = _check(raw_ms_of(df), (2024, 3), "tick")
+    assert ok["ok"] and ok["rule"] == "berlin_minus_6", ok["reason"]
+    bad = fh.check_timezone(raw_ms_of(df), SYM, fh.raw_month_bounds_ms((2024, 3)), "tick",
+                            rule=fh.TZ_RULES["ny_local"])
+    assert not bad["ok"] and bad["switch_runs"]
+    assert {e["deviation_h"] for r in bad["switch_runs"] for e in r} == {-1}
+    # Oktober: ab 27.10. (EU) schon -5 h
+    oct_ = raw_month(2024, 10)
+    raw = pd.DatetimeIndex(oct_["raw"])
+    tue = raw[(raw >= pd.Timestamp("2024-10-29 15:00")) & (raw < pd.Timestamp("2024-10-29 18:00"))]
+    gap = np.diff(tue.asi8).argmax()
+    assert (str(tue[gap].time()), str(tue[gap + 1].time())) == ("15:59:58", "17:00:01")
+    assert _check(raw_ms_of(oct_), (2024, 10), "tick")["ok"]
+    assert not fh.check_timezone(raw_ms_of(oct_), SYM, fh.raw_month_bounds_ms((2024, 10)), "tick",
+                                 rule=fh.TZ_RULES["ny_local"])["ok"]
+
+
+@pytest.mark.parametrize("ym,offsets", [((2024, 3), {-5, -4}), ((2024, 10), {-4, -5})])
 def test_dst_switch_inside_month_passes_in_tick_mode(ym, offsets):
-    """Umstellung mitten im Rohmonat (10.3.) bzw. in den ersten 72 h (3.11.):
-    erwarteter Offset je Anker -> keine Abweichung, kein Randverstoss."""
+    """EU-Umstellung im Rohmonat (31.3. bzw. 27.10.): erwarteter Offset je Anker
+    -> keine Abweichung, kein Randverstoss."""
     rep = _check(raw_ms_of(raw_month(*ym)), ym, "tick")
     assert rep["ok"], rep["reason"]
     assert rep["median_deviation_h"] == 0 and not rep["edge_violations"]
@@ -253,17 +300,17 @@ def test_dst_switch_inside_month_passes_in_tick_mode(ym, offsets):
 
 
 # ===================================== 2. falsche Hypothesen schlagen fehl ---
-def test_july_ny_data_fails_under_m1_hypothesis():
+def test_july_tick_data_fails_under_m1_hypothesis():
     rep = _check(raw_ms_of(raw_month(2024, 7)), (2024, 7), "m1")
     assert rep["status"] == "failed" and rep["ok"] is False
-    assert rep["raw_tz"] == "Etc/GMT+5"
+    assert rep["rule"] == "fixed_est"
     assert _offset_set(rep["expected_offsets"]) == {-5}
     assert rep["median_deviation_h"] == 1 and rep["median_offset_h"] == -4
     assert _offset_set(rep["deviations"]) == {1}          # +1 an jedem Anker
 
 
-def test_january_ny_data_passes_under_m1_hypothesis():
-    """Im Winter sind NY-Ortszeit und fest EST identisch."""
+def test_january_tick_data_passes_under_m1_hypothesis():
+    """Im Winter sind Berlin - 6 h und fest EST identisch."""
     rep = _check(raw_ms_of(raw_month(2024, 1)), (2024, 1), "m1")
     assert rep["ok"] and rep["median_deviation_h"] == 0
 
@@ -290,83 +337,90 @@ def test_utc_stamped_fails_in_tick_mode(ym, dev):
 TICK_CASES = [
     ((2024, 1, 12, 16, 59, 58), (2024, 1, 12, 21, 59, 58)),
     ((2024, 7, 12, 16, 59, 58), (2024, 7, 12, 20, 59, 58)),
-    ((2024, 3, 10, 18, 0, 1), (2024, 3, 10, 22, 0, 1)),     # erster So-Start nach Umstellung
-    ((2024, 11, 3, 18, 0, 1), (2024, 11, 3, 23, 0, 1)),     # nach Rueckstellung
-    ((2024, 3, 8, 16, 59, 58), (2024, 3, 8, 21, 59, 58)),   # Freitag davor
+    ((2024, 3, 10, 18, 0, 1), (2024, 3, 10, 23, 0, 1)),     # So nach US-Umstellung: noch -5 h
+    ((2024, 3, 12, 15, 59, 59), (2024, 3, 12, 20, 59, 59)),  # gemessene Pause 15:59:59 = 16:59:59 EDT
+    ((2024, 3, 31, 18, 0, 1), (2024, 3, 31, 22, 0, 1)),     # erster So-Start nach EU-Umstellung
+    ((2024, 10, 28, 15, 59, 58), (2024, 10, 28, 20, 59, 58)),  # nach EU-Rueckstellung, NY noch EDT
+    ((2024, 11, 3, 18, 0, 1), (2024, 11, 3, 23, 0, 1)),
 ]
 
 
 @pytest.mark.parametrize("raw,utc", TICK_CASES)
 def test_raw_to_utc_tick_values(raw, utc):
-    assert _ny_to_utc(*raw) == datetime(*utc, tzinfo=UTC)        # Referenz stimmt
-    out = fh.raw_to_utc_ms(np.array([_ms(*raw)], dtype=np.int64), "tick")
+    assert _raw_to_utc_ref(*raw) == datetime(*utc, tzinfo=UTC)        # Referenz stimmt
+    out = fh.raw_to_utc_ms(np.array([_ms(*raw)], dtype=np.int64), BERLIN6)
     assert np.asarray(out).dtype == np.int64
     assert int(out[0]) == _ms(*utc)
+    assert int(fh.raw_to_utc_ms_mode(np.array([_ms(*raw)], dtype=np.int64), "tick")[0]) == _ms(*utc)
 
 
 def test_raw_to_utc_tick_vectorised_and_milliseconds():
     raws = [r for r, _ in TICK_CASES] + [(2024, 7, 12, 16, 59, 58, 999_000)]
     arr = np.array([_ms(*r) for r in raws], dtype=np.int64)
-    out = fh.raw_to_utc_ms(arr, "tick")
-    exp = [int(_ny_to_utc(*r).timestamp() * 1000) for r in raws]
+    out = fh.raw_to_utc_ms(arr, BERLIN6)
+    exp = [int(_raw_to_utc_ref(*r).timestamp() * 1000) for r in raws]
     assert [int(v) for v in out] == exp
+    assert [int(v) for v in fh.utc_to_raw_ms(out, BERLIN6)] == [int(v) for v in arr]
 
 
 def test_raw_to_utc_m1_is_fixed_plus_5h():
-    out = fh.raw_to_utc_ms(np.array([_ms(2024, 7, 12, 16, 59)], dtype=np.int64), "m1")
+    out = fh.raw_to_utc_ms(np.array([_ms(2024, 7, 12, 16, 59)], dtype=np.int64), FIXED_EST)
     assert int(out[0]) == _ms(2024, 7, 12, 21, 59)
     arr = np.array([_ms(2024, 1, 12, 16, 59, 58), _ms(2024, 7, 12, 16, 59, 58)], dtype=np.int64)
-    assert [int(v) for v in fh.raw_to_utc_ms(arr, "m1")] == [int(v) + 5 * 3_600_000 for v in arr]
+    assert [int(v) for v in fh.raw_to_utc_ms_mode(arr, "m1")] == [int(v) + 5 * 3_600_000 for v in arr]
 
 
-def test_ticks_to_bars_uses_new_york_and_m1_to_bars_fixed_est():
-    ticks = fh.parse_csv(b"20240712 165958000,2400.10,2400.35,0\n"
-                         b"20240712 180001000,2400.20,2400.45,0\n", "tick")
+def test_ticks_to_bars_uses_berlin_minus_6_and_m1_to_bars_fixed_est():
+    ticks = fh.parse_csv(b"20240312 155959000,2150.10,2150.35,0\n"
+                         b"20240312 170000000,2150.20,2150.45,0\n", "tick")
     bars = fh.ticks_to_bars(ticks)
-    assert list(bars["ts"]) == [pd.Timestamp("2024-07-12 20:59", tz="UTC"),
-                                pd.Timestamp("2024-07-12 22:00", tz="UTC")]
+    assert list(bars["ts"]) == [pd.Timestamp("2024-03-12 20:59", tz="UTC"),
+                                pd.Timestamp("2024-03-12 22:00", tz="UTC")]
     m1 = fh.parse_csv(b"20240712 165900;2400.1;2400.5;2399.9;2400.2;0\n", "m1")
     b, _ = fh.m1_to_bars(m1)
     assert list(b["ts"]) == [pd.Timestamp("2024-07-12 21:59", tz="UTC")]
 
 
 def test_ticks_to_bars_rejects_nonexistent_local_time():
-    ticks = fh.parse_csv(b"20240310 023000000,2100.10,2100.35,0\n", "tick")
+    ticks = fh.parse_csv(b"20240330 203000000,2100.10,2100.35,0\n", "tick")    # Berlin 02:30
     with pytest.raises(fh.TimezoneError):
         fh.ticks_to_bars(ticks)
 
 
 # ================================ 4. nicht existent / mehrdeutig (tick) ---
 def _is_nonexistent(*a) -> bool:
-    d = datetime(*a, tzinfo=NY)
-    return d.astimezone(UTC).astimezone(NY).replace(tzinfo=None) != d.replace(tzinfo=None)
+    d = (datetime(*a) + timedelta(hours=6)).replace(tzinfo=BERLIN)
+    return d.astimezone(UTC).astimezone(BERLIN).replace(tzinfo=None) != d.replace(tzinfo=None)
 
 
 def _is_ambiguous(*a) -> bool:
-    return datetime(*a, fold=0, tzinfo=NY).utcoffset() != datetime(*a, fold=1, tzinfo=NY).utcoffset()
+    d = datetime(*a) + timedelta(hours=6)
+    return d.replace(fold=0, tzinfo=BERLIN).utcoffset() != d.replace(fold=1, tzinfo=BERLIN).utcoffset()
 
 
-BAD = [  # (Rohzeit, Art)
-    ((2024, 3, 10, 2, 30), "nonexistent"),
-    ((2024, 11, 3, 1, 30), "ambiguous"),
-    ((2024, 3, 10, 2, 0, 0), "nonexistent"),
-    ((2024, 3, 10, 2, 59, 59, 999_000), "nonexistent"),
-    ((2024, 11, 3, 1, 0, 0), "ambiguous"),
-    ((2024, 11, 3, 1, 59, 59, 999_000), "ambiguous"),
-    ((2010, 3, 14, 2, 30), "nonexistent"),
-    ((2010, 11, 7, 1, 30), "ambiguous"),
-    ((2026, 3, 8, 2, 30), "nonexistent"),
-    ((2026, 11, 1, 1, 30), "ambiguous"),
-    ((2009, 3, 8, 2, 0), "nonexistent"),
-    ((2019, 11, 3, 1, 0), "ambiguous"),
+BAD = [  # (Rohzeit, Art): roh Samstag 20:00-21:00 in den EU-Umstellungsnaechten
+    ((2024, 3, 30, 20, 30), "nonexistent"),
+    ((2024, 10, 26, 20, 30), "ambiguous"),
+    ((2024, 3, 30, 20, 0, 0), "nonexistent"),
+    ((2024, 3, 30, 20, 59, 59, 999_000), "nonexistent"),
+    ((2024, 10, 26, 20, 0, 0), "ambiguous"),
+    ((2024, 10, 26, 20, 59, 59, 999_000), "ambiguous"),
+    ((2010, 3, 27, 20, 30), "nonexistent"),
+    ((2010, 10, 30, 20, 30), "ambiguous"),
+    ((2026, 3, 28, 20, 30), "nonexistent"),
+    ((2026, 10, 24, 20, 30), "ambiguous"),
+    ((2009, 3, 28, 20, 0), "nonexistent"),
+    ((2019, 10, 26, 20, 0), "ambiguous"),
 ]
 GOOD_EDGES = [
-    (2024, 3, 10, 1, 59, 59, 999_000),
-    (2024, 3, 10, 3, 0, 0),
-    (2024, 11, 3, 0, 59, 59, 999_000),
-    (2024, 11, 3, 2, 0, 0),
-    (2026, 3, 8, 3, 0, 0),
-    (2026, 11, 1, 2, 0, 0),
+    (2024, 3, 30, 19, 59, 59, 999_000),
+    (2024, 3, 30, 21, 0, 0),
+    (2024, 10, 26, 19, 59, 59, 999_000),
+    (2024, 10, 26, 21, 0, 0),
+    (2026, 3, 28, 21, 0, 0),
+    (2026, 10, 24, 21, 0, 0),
+    (2024, 3, 10, 2, 30),          # US-Luecke: unter berlin_minus_6 eindeutig
+    (2024, 11, 3, 1, 30),
 ]
 
 
@@ -374,23 +428,23 @@ GOOD_EDGES = [
 def test_nonexistent_and_ambiguous_raise_in_tick_mode(raw, kind):
     assert (_is_nonexistent if kind == "nonexistent" else _is_ambiguous)(*raw)   # Referenz
     with pytest.raises(fh.TimezoneError):
-        fh.raw_to_utc_ms(np.array([_ms(*raw)], dtype=np.int64), "tick")
+        fh.raw_to_utc_ms(np.array([_ms(*raw)], dtype=np.int64), BERLIN6)
     # auch eingebettet zwischen gueltigen Zeiten: nie raten
     arr = np.array([_ms(2024, 1, 5, 12), _ms(*raw), _ms(2024, 7, 5, 12)], dtype=np.int64)
     with pytest.raises(fh.TimezoneError):
-        fh.raw_to_utc_ms(arr, "tick")
+        fh.raw_to_utc_ms(arr, BERLIN6)
 
 
 @pytest.mark.parametrize("raw", GOOD_EDGES)
 def test_dst_edges_just_outside_are_converted(raw):
     assert not _is_nonexistent(*raw) and not _is_ambiguous(*raw)
-    out = fh.raw_to_utc_ms(np.array([_ms(*raw)], dtype=np.int64), "tick")
-    assert int(out[0]) == int(_ny_to_utc(*raw).timestamp() * 1000)
+    out = fh.raw_to_utc_ms(np.array([_ms(*raw)], dtype=np.int64), BERLIN6)
+    assert int(out[0]) == int(_raw_to_utc_ref(*raw).timestamp() * 1000)
 
 
 @pytest.mark.parametrize("raw,kind", BAD)
 def test_m1_mode_never_raises_on_dst_hours(raw, kind):
-    out = fh.raw_to_utc_ms(np.array([_ms(*raw)], dtype=np.int64), "m1")
+    out = fh.raw_to_utc_ms_mode(np.array([_ms(*raw)], dtype=np.int64), "m1")
     assert int(out[0]) == _ms(*raw) + 5 * 3_600_000
 
 
@@ -417,7 +471,7 @@ def built(tmp_path_factory):
 
 
 @pytest.mark.parametrize("ym", list(STITCH))
-def test_month_stitching_uses_new_york_offset(built, ym):
+def test_month_stitching_uses_rule_offset(built, ym):
     root, rep, site = built(ym)
     assert rep["exit_code"] == 0, rep
     assert rep["summary"]["months_written"] == [f"{ym[0]}-{ym[1]:02d}"]
@@ -433,7 +487,7 @@ def test_month_stitching_uses_new_york_offset(built, ym):
     first_raw, last_utc = pd.Timestamp(STITCH[ym][1]), pd.Timestamp(STITCH[ym][2], tz="UTC")
     first = ticks.sort_values("utc").iloc[0]
     assert first["raw"] == first_raw
-    assert first["utc"] == pd.Timestamp(_ny_to_utc(*first_raw.timetuple()[:6]))
+    assert first["utc"] == pd.Timestamp(_raw_to_utc_ref(*first_raw.timetuple()[:6]))
     assert df["ts"].iloc[0] == lo
     assert df["bid_open"].iloc[0] == pytest.approx(first["bid"])
     assert df["ts"].iloc[-1] == last_utc
@@ -734,8 +788,8 @@ def test_store_file_with_old_source_timezone_is_rebuilt_from_cache(tmp_path, wit
 
 # ============================== 8. Tick in nicht existenter Stunde: Quarantaene ---
 @pytest.mark.parametrize("bad_raw,raw_ym,utc_months", [
-    ("2024-03-10 02:30:00", (2024, 3), [(2024, 3), (2024, 4)]),     # Fruehjahr: nicht existent
-    ("2024-11-03 01:30:00", (2024, 11), [(2024, 11), (2024, 12)]),  # Herbst: mehrdeutig
+    ("2024-03-30 20:30:00", (2024, 3), [(2024, 3), (2024, 4)]),     # Fruehjahr (Berlin 02:30): nicht existent
+    ("2024-10-26 20:30:00", (2024, 10), [(2024, 10), (2024, 11)]),  # Herbst (Berlin 02:30): mehrdeutig
 ], ids=["nonexistent", "ambiguous"])
 def test_tick_in_dst_gap_quarantines_raw_month(tmp_path, bad_raw, raw_ym, utc_months):
     df = raw_month(*raw_ym)
@@ -768,12 +822,12 @@ def test_tick_in_dst_gap_quarantines_raw_month(tmp_path, bad_raw, raw_ym, utc_mo
 HOMELAB_RAW = [(2023, 12), (2024, 1), (2024, 6), (2024, 7)]
 
 
-def _seed_cache(root, months, stamping="ny"):
+def _seed_cache(root, months, stamping="berlin"):
     """Roh-ZIPs direkt in den Cache legen (wie nach frueheren Laeufen)."""
     for y, m in months:
         p = fh.Unit(SYM, "tick", y, m).path(root)
         p.parent.mkdir(parents=True, exist_ok=True)
-        blob = tick_zip(y, m) if stamping == "ny" else make_zip(y, m, tick_csv(raw_month(y, m, stamping)))
+        blob = tick_zip(y, m) if stamping == "berlin" else make_zip(y, m, tick_csv(raw_month(y, m, stamping)))
         p.write_bytes(blob)
 
 
@@ -948,9 +1002,9 @@ def _written_with_wrong_ticks(sym, how, y0, y1, step_s, thin=None):
         pad = fh.TZ_PAD_MS                                      # wie Ctx._edge_ms
         nb = (raw[int(np.searchsorted(raw, lo - pad)):a] if a else None,
               raw[b:int(np.searchsorted(raw, hi + pad))] if b < len(raw) else None)
-        chk = fh.check_timezone(raw[a:b], sym, (lo, hi), "tick", nb)
+        chk = fh.check_timezone(raw[a:b], sym, (lo, hi), "tick", neighbours=nb)
         try:
-            bad = fh.raw_to_utc_ms(raw[a:b], "tick") != u[a:b]
+            bad = fh.raw_to_utc_ms_mode(raw[a:b], "tick", ym) != u[a:b]
         except fh.TimezoneError:
             chk, bad = {"ok": False}, np.ones(b - a, bool)
         res[ym] = chk
@@ -967,30 +1021,32 @@ def _written_with_wrong_ticks(sym, how, y0, y1, step_s, thin=None):
     return out, fails
 
 
-@pytest.mark.parametrize("sym", ["EURUSD", "XAUUSD"])
-@pytest.mark.parametrize("how", ["eu", "us2006"])
+@pytest.mark.parametrize("sym", ["XAUUSD", "XAGUSD"])
+@pytest.mark.parametrize("how", ["ny", "us2006"])
 def test_other_dst_rules_never_written_2001_2026(sym, how):
-    """EU- bzw. Vor-2007-US-Stempelung: kein falsch umgerechneter Tick landet in
-    einem geschriebenen UTC-Monat (Review: EURUSD 2025-10 bestand mit {0: 7, -1: 1})."""
+    """US-Regel (ny_local) bzw. Vor-2007-US-Regel statt berlin_minus_6: kein falsch
+    umgerechneter Tick landet in einem geschriebenen UTC-Monat (die EU/US-Luecken-
+    wochen im Maerz und Okt/Nov werden als bestaetigter Wechsel erkannt)."""
     wrong, fails = _written_with_wrong_ticks(sym, how, 2001, 2026, step_s=180)
     assert wrong == []
     assert len(fails) >= 30                                     # die Abweichungen werden gesehen
 
 
-@pytest.mark.parametrize("sym", ["EURUSD", "XAUUSD"])
-def test_new_york_stamping_passes_every_month_2001_2026(sym):
-    wrong, fails = _written_with_wrong_ticks(sym, "ny", 2001, 2026, step_s=180)
+@pytest.mark.parametrize("sym", ["XAUUSD", "XAGUSD"])
+def test_berlin_minus_6_stamping_passes_every_month_2001_2026(sym):
+    wrong, fails = _written_with_wrong_ticks(sym, "eu", 2001, 2026, step_s=180)
     assert wrong == [] and fails == []
 
 
-@pytest.mark.parametrize("how", ["ny", "est", "eu"])
+@pytest.mark.parametrize("how", ["eu", "est", "ny"])
 def test_thin_silver_one_tick_per_20_min(how):
     """Review 8: ~1 Tick je 20 min (XAGUSD nachts/frueh). Vorher fiel jeder Monat
     an der +-1-h-Randregel durch (letzter Tick > 30 min vor 17:00 rundete auf -1).
-    Jetzt: New York besteht ueberall; falsch gestempelte Monate werden nie geschrieben."""
+    Jetzt: berlin_minus_6 ("eu") besteht ueberall; falsch gestempelte Monate
+    (fest EST, US-Regel) werden nie geschrieben."""
     wrong, fails = _written_with_wrong_ticks("XAGUSD", how, 2014, 2025, step_s=60, thin=0.05)
     assert wrong == []
-    if how == "ny":
+    if how == "eu":
         assert fails == []
     else:
         assert len(fails) >= (90 if how == "est" else 20)
@@ -1005,14 +1061,21 @@ def _ny_local(sym, lo, hi, step_s=30):
     return pd.DatetimeIndex(utc.tz_convert(NY).tz_localize(None))
 
 
+def _to_raw(loc):
+    """NY-Ortszeit (Marktzeit, naiv) -> Rohzeit nach berlin_minus_6."""
+    utc = pd.DatetimeIndex(loc).tz_localize(NY, ambiguous="NaT", nonexistent="NaT").dropna()
+    return utc.tz_convert(BERLIN).tz_localize(None) - pd.Timedelta(hours=6)
+
+
 def _check_with_context(loc, sym, ym):
-    """Wie Ctx.raw_slice: eigener Rohmonat + TZ_PAD_MS Kontext der Nachbarmonate."""
-    raw = np.asarray(pd.DatetimeIndex(loc).sort_values().as_unit("ms").asi8, dtype=np.int64)
+    """Wie Ctx.raw_slice: eigener Rohmonat + TZ_PAD_MS Kontext der Nachbarmonate.
+    loc: Marktzeiten in NY-Ortszeit, gestempelt nach berlin_minus_6."""
+    raw = np.asarray(_to_raw(loc).sort_values().as_unit("ms").asi8, dtype=np.int64)
     lo, hi = fh.raw_month_bounds_ms(ym)
     a, b = int(np.searchsorted(raw, lo)), int(np.searchsorted(raw, hi))
     pad = fh.TZ_PAD_MS
     nb = (raw[int(np.searchsorted(raw, lo - pad)):a], raw[b:int(np.searchsorted(raw, hi + pad))])
-    return fh.check_timezone(raw[a:b], sym, (lo, hi), "tick", nb)
+    return fh.check_timezone(raw[a:b], sym, (lo, hi), "tick", neighbours=nb)
 
 
 def _nth(ym, wd, n):
@@ -1070,12 +1133,10 @@ def _base_local(sym, ym):
 
 
 @pytest.mark.parametrize("ym", [(2021, 3), (2019, 7)], ids=["2021-03_transition", "2019-07"])
-@pytest.mark.parametrize("sym", ["XAUUSD", "EURUSD"])
+@pytest.mark.parametrize("sym", ["XAUUSD", "XAGUSD"])
 @pytest.mark.parametrize("case", FAULTS)
 def test_v4_data_faults_on_correct_stamping_pass(case, sym, ym):
     """Jeder dieser Fehler liess v3 den ganzen Monat durchfallen; jetzt hoechstens Warnung."""
-    if case == "close_1715_every_week" and sym == "EURUSD":
-        pytest.skip("CME-Plan nur Metalle")
     loc = _fault(case, sym, ym, _base_local(sym, ym)).sort_values()
     rep = _check_with_context(loc, sym, ym)
     assert rep["ok"], (case, rep["reason"])
@@ -1083,7 +1144,7 @@ def test_v4_data_faults_on_correct_stamping_pass(case, sym, ym):
         assert rep["outages"]                    # gemeldet, kein Wochenend-Anker
 
 
-@pytest.mark.parametrize("sym", ["XAUUSD", "EURUSD"])
+@pytest.mark.parametrize("sym", ["XAUUSD", "XAGUSD"])
 def test_v4_two_independent_gaps_with_same_shift_fail(sym):
     """Gegenprobe: eine Woche +1 h (Sonntag bis Sonntag) mitten im Monat -> Wechsel."""
     ym = (2021, 3)
@@ -1095,21 +1156,21 @@ def test_v4_two_independent_gaps_with_same_shift_fail(sym):
     assert {e["deviation_h"] for r in rep["switch_runs"] for e in r} == {1}
 
 
-def test_v4_e2e_week_shift_eurusd_not_written(tmp_path):
-    """Re-Review e2e_week: EURUSD +1 h So 2025-05-25 21:00 UTC .. 06-01, die ersten
-    4 Minuten nach der verschobenen Oeffnung fehlen. Im echten Lauf (Backfill
-    April..Juni, Juli veroeffentlicht) darf UTC-Mai nicht geschrieben werden."""
+def test_v4_e2e_week_shift_not_written(tmp_path):
+    """Re-Review e2e_week (jetzt XAUUSD, berlin_minus_6): +1 h So 2025-05-25 22:00 UTC
+    .. 06-01, die ersten 4 Minuten nach der verschobenen Oeffnung fehlen. Im echten
+    Lauf (Backfill April..Juni, Juli veroeffentlicht) darf UTC-Mai nicht geschrieben werden."""
     import test_fetch_histdata as tf
-    sym = "EURUSD"
+    sym = "XAUUSD"
     utc = tf.market_utc(sym, pd.Timestamp("2025-02-20", tz="UTC"), pd.Timestamp("2025-07-05", tz="UTC"), 60)
-    s, e = pd.Timestamp("2025-05-25 21:00", tz="UTC"), pd.Timestamp("2025-06-01 21:00", tz="UTC")
+    s, e = pd.Timestamp("2025-05-25 22:00", tz="UTC"), pd.Timestamp("2025-06-01 22:00", tz="UTC")
     utc = utc[~((utc >= s) & (utc < s + pd.Timedelta(minutes=4)))]
-    raw = utc.tz_convert(NY).tz_localize(None)
+    raw = utc.tz_convert(BERLIN).tz_localize(None) - pd.Timedelta(hours=6)
     shift = (utc >= s) & (utc < e)
     raw = raw.where(~shift, raw + pd.Timedelta(hours=1))
     i = (utc.as_unit("ms").asi8 // 60_000).astype(float)
-    bid = np.round(1.1 * (1 + 0.002 * np.sin(i / 97.0)), 5)
-    df = pd.DataFrame({"raw": raw, "utc": utc, "bid": bid, "ask": bid + 0.00008})
+    bid = np.round(3300.0 * (1 + 0.002 * np.sin(i / 97.0)), 2)
+    df = pd.DataFrame({"raw": raw, "utc": utc, "bid": bid, "ask": bid + 0.25})
     files = {}
     for (y, m) in ((2025, 3), (2025, 4), (2025, 5), (2025, 6), (2025, 7)):
         sel = (df.raw >= pd.Timestamp(y, m, 1)) & (df.raw < pd.Timestamp(y, m, 1) + pd.offsets.MonthBegin(1))

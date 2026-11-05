@@ -195,9 +195,14 @@ Store and validation:
 - **License:** check Dukascopy's terms of use yourself. Do not redistribute
   or commit the data, raw or derived (`data/` is git-ignored).
 
-### HistData (metals / FX, default source)
+### HistData (metals, default source)
 
-`fetch_histdata.py` is the **default source** for XAUUSD, XAGUSD and EURUSD.
+`fetch_histdata.py` is the **default source** for XAUUSD and XAGUSD.
+**EURUSD is no longer fetched from HistData**: it has no daily break, too few
+time anchors per month, and its 2024-11 `--verify-month` passed although the
+stamping was wrong. The bot uses a daily reference rate (ECB/FRED) instead;
+`--symbol EURUSD` is rejected with that hint (`fetch_dukascopy.py` is
+unchanged).
 Dukascopy answers HTTP 429 per client IP in the homelab, even with one
 worker. The output is the same as the Dukascopy store (columns, dtypes,
 atomic writes, reports, exit codes). The bot can tell the two sources apart
@@ -235,39 +240,69 @@ Two modes (`--mode`):
 
 Time zone:
 
-- **Tick timestamps are New York local time with daylight saving**
-  (`America/New_York`: UTC-5 in winter, UTC-4 in summer), although HistData
-  documents "EST without daylight saving". This was measured in the homelab
-  on real XAUUSD ticks: in 2024-07 every one of the 38 anchors sat at -4 h
-  (daily break 16:59:58 -> 18:00:01, weekly close Friday 16:59:58, weekly
-  open Sunday 18:00:01, which are exactly the New York session times);
-  2024-01 sat at -5 h.
-- **M1 keeps the documented fixed UTC-5** (`Etc/GMT+5`). This is **not
-  verified** for M1. Check it with
-  `--mode m1 --verify-month 2024-07` before relying on M1 summer months.
-- The zones live in `RAW_TZ = {"tick": "America/New_York", "m1": "Etc/GMT+5"}`.
-  `raw_to_utc_ms` reads the raw digits as wall-clock time in that zone and
-  converts them exactly to UTC (vectorized). A local time that does not
-  exist (spring-forward gap, e.g. 2024-03-10 02:00–02:59:59.999) or is
-  ambiguous (fall-back hour, e.g. 2024-11-03 01:00–01:59:59.999) is never
-  guessed. The market is closed then, so such a tick raises `TimezoneError`
-  and the raw month goes to quarantine (exit 4).
-- A UTC month M therefore needs raw months M-1 (its last 4 hours in EDT, 5
-  hours in EST) and M; the raw months are computed from `RAW_TZ`. M is
-  written only when both are present, or when M-1 is before the symbol's
-  history or confirmed empty.
-- The time zone is **checked in code for every raw month** (check version 4).
+- **Tick timestamps follow the rule `berlin_minus_6`**: raw wall clock =
+  Europe/Berlin local time minus 6 hours, i.e. UTC-5 during EU winter time
+  and UTC-4 during EU summer time; the switch is the last Sunday of March and
+  October at 01:00 UTC. Measured in the homelab on real ticks of all three
+  symbols: in March 2024 the raw time stays at -5 h from the US change
+  (10 March) to the end of March (daily break raw 15:59:59 -> 17:00:00 instead
+  of 16:59 -> 18:00) and switches to -4 h only at the EU change (31 March);
+  from 27 October (EU) it is -5 h again, not only from 3 November. January
+  and July fit. This overturns both HistData's "EST without daylight saving"
+  and the America/New_York rule of check version 4.
+- **The market stays New York-based**: the expected anchors are still the
+  CME/New York session times (17:00/18:00 `America/New_York`); only the
+  stamping rule changed.
+- **M1 keeps the documented fixed UTC-5** (`fixed_est` = `Etc/GMT+5`). This is
+  **not verified** for M1. Check it with `--mode m1 --verify-month 2024-07`
+  before relying on M1 summer months.
+- **Rules and schedule** live in `config/histdata_timezone.yaml`
+  (`$HISTDATA_TZ_CONFIG` selects another file). A rule (`TzRule`) has a name, a
+  zoneinfo zone and a whole-hour shift (raw = local time in `zone` +
+  `shift_h`). Built in: `berlin_minus_6` (Europe/Berlin, -6), `ny_local`
+  (America/New_York, 0), `fixed_est` (Etc/GMT+5, 0); the file may define more.
+  `schedule` lists per mode `{from: "YYYY-MM", rule: name}` keyed on **raw**
+  months, sorted; a rule change takes effect only at a raw-month boundary.
+  To use another rule for a period, add an entry, e.g.
+
+  ```yaml
+  schedule:
+    tick:
+      - {from: "2000-01", rule: fixed_est}
+      - {from: "2012-01", rule: berlin_minus_6}
+    m1:
+      - {from: "2000-01", rule: fixed_est}
+  ```
+
+  An unknown rule or zone, an unsorted or duplicate `from`, or a missing mode
+  stops the run; there is never a silent fallback. Before changing the
+  schedule, compare candidate rules offline against the raw cache with
+  `scripts/histdata_tz_survey.py` (uses `evaluate_raw_month`: cached raw files
+  only, no download, no markers). After a change, the next run detects every
+  monthly file whose `source_timezone` no longer matches (see below).
+- `raw_to_utc_ms(raw_ms, rule)` converts exactly (vectorized). A local time
+  that does not exist or is ambiguous in the rule's zone is never guessed:
+  for `berlin_minus_6` that is raw Saturday 20:00–20:59:59.999 in the two
+  transition nights. The market is closed then, so such a tick raises
+  `TimezoneError` and the raw month goes to quarantine (exit 4).
+- A UTC month M therefore needs raw months M-1 (its last 4 or 5 hours) and
+  M; the raw months are computed from the schedule. M is written only when
+  both are present, or when M-1 is before the symbol's history or confirmed
+  empty.
+- The time zone is **checked in code for every raw month** (check version 5).
   Every market gap gives a close anchor and an open anchor:
   - weekend (gap of 24 h or more, closing on Thursday/Friday and opening on
-    Sunday/Monday): close 17:00 New York, open 18:00 for metals, 17:00 for
-    EURUSD. Other gaps of 24 h or more are outages: reported, never anchors;
+    Sunday/Monday): close 17:00, open 18:00 New York. Other gaps of 24 h or
+    more are outages: reported, never anchors;
   - for metals, the daily break (Mon–Thu, 17:00–18:00 New York): used only
     if every break-like gap of that day gives the same unique deviation of
     at most 1 h, so a random outage cannot replace the real break.
 
   Expected market times come from `zoneinfo` `America/New_York`. The
-  expected offset is taken per anchor from `RAW_TZ[mode]` at that moment
-  (tick: -4 h in EDT, -5 h in EST; m1: always -5 h). Decisions use the
+  expected offset (raw minus UTC) is taken per anchor from the raw month's
+  stamping rule at that moment (`berlin_minus_6`: -5 h in EU winter, -4 h in
+  EU summer; `fixed_est`: always -5 h). `check_timezone(..., rule=...)`
+  accepts a fixed candidate rule; the report names it in `rule`. Decisions use the
   **deviation** = implied minus expected. A gap's deviation is estimated
   from both sides together: the close may not lie before the last tick (15
   minutes tolerance for late ticks) and the open not after the first tick (5
@@ -310,38 +345,36 @@ Time zone:
     marker and the month is checked again.
   - Setting `"accepted": true` in the marker releases the month after a
     manual check.
-  - Markers carry `raw_tz` and `tz_check_version`. A marker that is not
-    released and comes from an older check version or another zone is
-    removed with a WARNING and the raw month is re-checked without a
-    download.
-  - `"accepted": true` holds only for the same conversion (`raw_tz`). A
-    release made under another conversion (the old fixed-UTC-5 check, no
-    `raw_tz`) is re-checked: if the month passes, the marker is removed;
-    if not, it is rewritten with `"accepted": false` and a note that the
-    earlier release applied to the old conversion. A tick at an ambiguous or
-    nonexistent local time blocks even a released month.
+  - Markers carry `tz_rule`, `raw_tz` (zone), `tz_shift_h` and
+    `tz_check_version`. A marker that is not released and comes from an
+    older check version or another rule (e.g. check v4 with `ny_local`) is
+    re-checked under the current rule without a download.
+  - `"accepted": true` holds only for the same rule (zone and shift). A
+    release made under another rule is re-checked: if the month passes, the
+    marker is removed; if not, it is rewritten with `"accepted": false` and a
+    note that the earlier release applied to the old conversion. A tick at an
+    ambiguous or nonexistent local time blocks even a released month.
   - An unreadable marker (invalid JSON, e.g. a typo while setting
     `"accepted": true`) is kept, logged as ERROR and keeps blocking.
 - Monthly files carry the parquet metadata `source_timezone`, derived from
-  `RAW_TZ` and the check version, e.g.
-  `America/New_York -> UTC, je Rohmonat geprueft (tz_check v4)`. At the start
-  of **every** run, all monthly files of the symbol and mode are checked,
-  not only those in `--start`/`--end`:
-  - same conversion zone but an older check version (e.g. m1 files of the
-    previous versions, tick files written by check v2/v3): the raw months
-    are re-checked from the cache, with no download. If they pass, only the
-    metadata is rewritten (`relabelled_timezone`). If they fail, the file
-    is moved to `metals/stale/` and quarantined (`retired_after_recheck`).
-    Without the raw cache the file stays and is listed under
-    `unverified_after_version_bump`;
-  - different conversion that shifts UTC times in this month (tick months
-    touching EDT, written by the fixed-UTC-5 code, 1 h off): the file is
-    **moved to `metals/stale/` at once**, so the bot sees a gap rather than a
-    shifted month. Outside the range it is listed under
-    `stale_retired_out_of_range`;
-  - different conversion but identical UTC times in this month (fully EST:
-    December–February): the file stays until a rebuild replaces it
-    atomically (`stale_out_of_range` outside the range).
+  the stamping rule(s) of their raw months and the check version, e.g.
+  `berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v5)`.
+  At the start of **every** run, all monthly files of the symbol and mode
+  are checked, not only those in `--start`/`--end`:
+  - an older or different label whose conversion gives the **same UTC times
+    in this month** (an older check version, or e.g. `ny_local` files of
+    January or July, where both rules agree): the raw months are re-checked
+    from the cache under the current rule, with no download. If they pass,
+    only the metadata is rewritten (`relabelled_timezone`). If they fail,
+    the file is moved to `metals/stale/` and quarantined
+    (`retired_after_recheck`). Without the raw cache the file stays and is
+    listed under `unverified_after_version_bump`;
+  - a different conversion that **shifts UTC times in this month** (`ny_local`
+    files of March, October and November, i.e. the weeks between the US and
+    EU clock changes; fixed-UTC-5 files of every month with EU summer time):
+    the file is **moved to `metals/stale/` at once**, so the bot sees a gap
+    rather than a shifted month, and rebuilt if the month is in range.
+    Outside the range it is listed under `stale_retired_out_of_range`.
 
   Months inside the range are rebuilt from the raw cache (WARNING,
   `rebuilt_timezone`); this needs no requests when the raw ZIPs are cached,
@@ -356,7 +389,7 @@ Time zone:
 Unpublished and missing data:
 
 - A month is requested only after its raw month has ended (UTC month end
-  + 4 h in EDT or + 5 h in EST/m1, plus 6 h settle time).
+  + 4 h in EU summer or + 5 h in EU winter/m1, plus 6 h settle time).
 - An empty answer within 45 days of month end is **pending** (exit 3). It is
   checked again at most every 24 h.
 - An older empty answer is "no data". It is unconfirmed (exit 3) until a
@@ -375,7 +408,7 @@ Unpublished and missing data:
   (`status: aborted`, exit 3). This usually means a token, WAF or server
   problem, not missing data.
 - Months before the symbol's history need no request. The history starts
-  used are XAUUSD 2009-03, XAGUSD 2009-05 and EURUSD 2000-05; these are the
+  used are XAUUSD 2009-03 and XAGUSD 2009-05; these are the
   M1 start dates, and the tick start dates are unverified.
 
 HTTP and errors:
@@ -469,7 +502,7 @@ runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
   /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
   --symbol XAUUSD --start 2009-03
 # bid-only fallback
-python scripts/fetch_histdata.py --symbol EURUSD --start 2024-01 --end 2024-06 --mode m1
+python scripts/fetch_histdata.py --symbol XAGUSD --start 2024-01 --end 2024-06 --mode m1
 ```
 
 ### Economic calendar
