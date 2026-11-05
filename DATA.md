@@ -207,8 +207,10 @@ Quelle:   histdata.com, Generic ASCII; Default Ticks je Monat (--mode tick),
           liefert im Homelab HTTP 429 je IP.
 Format:   wie Dukascopy (Parquet/zstd, gleiche Spalten und dtypes), nur
           Partition source=histdata (Ticks) bzw. source=histdata_m1 (M1)
-Zeitzone: UTC; Rohzeit laut HistData fest UTC-5 (EST ohne Sommerzeit),
-          JE ROHMONAT im Code geprueft (s. u.)
+Zeitzone: UTC; Rohzeit Ticks = New-York-Ortszeit MIT Sommerzeit (gemessen,
+          entgegen der HistData-Angabe "EST ohne Sommerzeit"); M1 fest
+          UTC-5 laut HistData (NICHT verifiziert). JE ROHMONAT im Code
+          geprueft (s. u.)
 Recherche, Quellen, Offenes: docs/histdata_research.md
 
 Store (SRC = histdata im Tickmodus, histdata_m1 im M1-Modus):
@@ -222,11 +224,15 @@ Store (SRC = histdata im Tickmodus, histdata_m1 im M1-Modus):
         <zip>.empty                keine Daten (JSON: first_seen, last_checked,
                                    confirmed, confirmed_at, checks; "accepted": true
                                    = Luecke in der Historie manuell akzeptiert)
-        <zip>[.YYYY-MM].quarantine Zeitzone/Format (JSON mit Pruefbericht):
+        <zip>[.YYYY-MM].quarantine Zeitzone/Format (JSON mit Pruefbericht,
+                                   raw_tz, tz_check_version):
                                    loeschen = erneut pruefen (ohne Download);
                                    "accepted": true = nach manueller Pruefung frei;
                                    ZIP loeschen = neu laden, der Download entfernt
-                                   den Marker und es wird neu geprueft
+                                   den Marker und es wird neu geprueft; Marker
+                                   aelterer tz_check_version (Vorversion "fest
+                                   UTC-5") werden automatisch entfernt und neu
+                                   geprueft (ausser "accepted": true)
         <zip>.failed               dauerhafter Inhaltsfehler (JSON: error, count,
                                    last_checked); naechster Versuch fruehestens 24 h
         <zip>.corrupt              beiseitegelegtes kaputtes ZIP
@@ -236,7 +242,17 @@ Store (SRC = histdata im Tickmodus, histdata_m1 im M1-Modus):
 Spalten: wie Dukascopy (ts UTC ms, Label links; bid_/ask_open/high/low/close
 float64; tick_count int64; bid_volume, ask_volume float64; source = SRC).
 Parquet-Metadaten: histdata_mode = histdata_tick|histdata_m1,
-spread_available = true|false, source_timezone.
+spread_available = true|false, source_timezone =
+"America/New_York (mit Sommerzeit) -> UTC, je Monat geprueft" (tick) bzw.
+"Etc/GMT+5 (fest UTC-5) -> UTC, je Monat geprueft" (m1). Dateien desselben
+Modus mit anderem source_timezone (Vorversion: "EST fixed UTC-5, ...",
+Sommermonate um 1 h verschoben) werden im naechsten Lauf automatisch aus dem
+Roh-Cache neu gebaut, ohne Requests (WARNING, Laufreport rebuilt_timezone;
+Ergebnis summary.months_rebuilt_timezone bzw.
+summary.months_stale_timezone_not_rebuilt). Die alte Datei wird VOR dem
+Neubau nach metals/stale/... verschoben (nichts geloescht): scheitert der
+Neubau, sieht der Bot eine Luecke statt eines verschobenen Monats; der
+naechste Lauf versucht den Neubau erneut.
 - tick: aus Ticks "YYYYMMDD HHMMSSmmm,bid,ask,volume" verdichtet
         (fetch_dukascopy.aggregate_1m, stabil sortiert: gleiche Zeitstempel
         behalten die Dateireihenfolge). tick_count = echte Tickzahl.
@@ -253,23 +269,40 @@ spread_available = true|false, source_timezone.
         als Jahres-ZIP, laufendes Jahr monatlich.
 
 Zeitzone und Monatsgrenze:
-- ts_utc = roh + 5 h, keine Sommerzeitlogik. UTC-Monat M = letzte 5 h des
-  Rohmonats M-1 + Rohmonat M ohne dessen letzte 5 h. Geschrieben wird M nur,
-  wenn beide Rohmonate erledigt sind (Daten, bestaetigt leer oder vor
-  Historienbeginn).
+- Rohzeit-Zone je Modus (RAW_TZ): tick America/New_York (EST -5 h / EDT
+  -4 h; gemessen im Homelab an echten XAUUSD-Ticks: 2024-07 Tagespause
+  16:59:58 -> 18:00:01, Wochenschluss Fr 16:59:58, Wochenstart So 18:00:01,
+  alle 38 Anker bei -4 h; 2024-01 bei -5 h), m1 Etc/GMT+5 = fest UTC-5
+  (HistData-Angabe, fuer M1 NICHT verifiziert; pruefen mit
+  --mode m1 --verify-month 2024-07).
+- Umrechnung raw_to_utc_ms: Rohziffern als Ortszeit gelesen, exakt nach UTC.
+  Ortszeit in der Sommerzeit-Luecke (z.B. 2024-03-10 02:00-02:59:59.999,
+  existiert nicht) oder in der doppelten Stunde (z.B. 2024-11-03
+  01:00-01:59:59.999, mehrdeutig) wird NIE geraten: TimezoneError ->
+  Quarantaene (Exit 4); der Markt ist dann geschlossen.
+- UTC-Monat M = letzte 4 h (EDT) bzw. 5 h (EST) des Rohmonats M-1 +
+  Rohmonat M ohne diese Stunden an seinem Ende (aus RAW_TZ berechnet).
+  Geschrieben wird M nur, wenn beide Rohmonate erledigt sind (Daten,
+  bestaetigt leer oder vor Historienbeginn).
 - Pruefung je Rohmonat (check_timezone): Ankerpunkte Wochenschluss
   (Fr 17:00 New York), Wochenstart (So 18:00 Metalle / 17:00 EURUSD),
   Tagespause der Metalle Mo-Do (17:00-18:00 New York) - aber nur Luecken,
   deren Beginn hoechstens 3 h vom erwarteten Pausenbeginn liegt (duenne
   Maerkte wie Silber haben nachts weitere Luecken; die zaehlen nicht).
-  Erwartete Zeiten per zoneinfo America/New_York (mit Sommerzeit).
-  Impliziter Offset je Anker (ganze Stunden). Bestanden nur bei:
-    >= 3 Anker, Median -5 h, >= 60 % der Anker bei -5 h,
+  Erwartete Marktzeiten per zoneinfo America/New_York (mit Sommerzeit).
+  Impliziter Offset je Anker (ganze Stunden), erwarteter Offset je Anker
+  aus RAW_TZ[mode] in diesem Zeitpunkt (tick -4 h in EDT, -5 h in EST;
+  m1 immer -5 h); entschieden wird ueber Abweichung = implizit - erwartet.
+  Bestanden nur bei:
+    >= 3 Anker, Median-Abweichung 0, >= 60 % der Anker mit Abweichung 0,
     kein Lauf von 3 gleich abweichenden Ankern in Folge,
-    KEIN Anker mit genau +-1 h in den ersten/letzten 72 h des Rohmonats
-      (Uhrumstellung am Monatsrand, z.B. EU-Umstellung am letzten
-      Maerzsonntag; Feiertage weichen um >= 2 h ab und bleiben erlaubt),
+    KEIN Anker mit Abweichung genau +-1 h in den ersten/letzten 72 h des
+      Rohmonats (Uhrumstellung am Monatsrand, z.B. nach EU-Regel;
+      Feiertage weichen um >= 2 h ab und bleiben erlaubt),
     kein Ruecksprung >= 30 min in Dateireihenfolge.
+  Report: raw_tz, offsets, expected_offsets, deviations, median_offset_h
+  (implizit), median_deviation_h, share_expected, edge_violations,
+  deviating_examples, reversals.
   Zusaetzlich: beginnt der Folge-Rohmonat M+1 (im Cache; wird zuerst
   geholt, wenn UTC-Monat M+1 ohnehin offen ist) mit 1 h Abweichung, wird
   auch UTC-Monat M nicht geschrieben (Umstellung nach dem letzten Anker
@@ -277,17 +310,17 @@ Zeitzone und Monatsgrenze:
   gemeinsam mit gecachten Nachbar-Rohmonaten (joint_with im Report);
   bleibt es unpruefbar -> Quarantaene "NICHT PRUEFBAR".
   Sonst QUARANTAENE (Exit 4), nichts verschoben geschrieben.
-- Unverifiziert / Zweifel: Drittquellen sehen einstuendige Rueckspruenge
-  Ende Oktober und einen August-Wochenstart eine Stunde zu spaet (passt zu
-  Sommerzeit). Vor dem ersten Volllauf --verify-month auf einen Winter- und
-  einen Sommermonat; der Report zeigt median_offset_h und Beispiele.
+- Unverifiziert: Zeitzone der M1-Dateien. Drittquellen sehen je Oktober
+  60 doppelte M1-Minuten (Hinweis auf eine Uhr mit Umstellung). Vor dem
+  ersten M1-Volllauf: --mode m1 --verify-month 2024-07; liegt die
+  Median-Abweichung bei +1, RAW_TZ["m1"] bewusst umstellen.
 
 Verfuegbarkeit / "keine Daten":
 - Historienbeginn (ASCII M1, Auswahlliste): XAUUSD 2009-03, XAGUSD 2009-05,
   EURUSD 2000-05. Tick-Beginn NICHT verifiziert. Monate davor ohne Request
   als nicht verfuegbar gelistet.
-- Angefragt wird ein Monat erst nach Rohmonatsende (UTC-Monatsende + 5 h)
-  + 6 h. Leerer Body (keine Daten):
+- Angefragt wird ein Monat erst nach Rohmonatsende (UTC-Monatsende + 4 h
+  in EDT bzw. + 5 h in EST/M1) + 6 h. Leerer Body (keine Daten):
     bis 45 Tage nach Monatsende -> pending (Exit 3), erneute Pruefung
                                    fruehestens nach 24 h, nie bestaetigt
     danach                      -> unbestaetigt (Exit 3), bestaetigt, wenn

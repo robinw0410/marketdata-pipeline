@@ -1,0 +1,879 @@
+"""
+Regressionstests Zeitzone HistData (fetch_histdata.py).
+
+Befund (Homelab, XAUUSD-Ticks): Tick-Zeitstempel sind New-York-Ortszeit MIT
+Sommerzeit (2024-01 implizit -5 h, 2024-07 alle Anker -4 h; Tagespause roh
+16:59:58 -> 18:00:01, Wochenschluss Fr 16:59:58, Wochenstart So 18:00:01).
+M1 bleibt (unverifiziert) fest EST = Etc/GMT+5.
+
+Erwartete Werte werden hier unabhaengig mit zoneinfo berechnet, nicht mit
+Helfern aus fetch_histdata. Nur synthetische Daten, HTTP gemockt.
+"""
+import functools
+import io
+import json
+import re
+import zipfile
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+import fetch_histdata as fh
+
+UTC = timezone.utc
+NY = ZoneInfo("America/New_York")
+SYM = "XAUUSD"
+OLD_TZ_META = b"EST fixed UTC-5, converted to UTC, checked per month"
+NOW = datetime(2025, 3, 1, 12, tzinfo=UTC)
+
+
+# ------------------------------------------------------------ synthetik ---
+def _ms(*args) -> int:
+    """Rohzeit-ms: Wanduhr-Ziffern als UTC gelesen (wie parse_csv)."""
+    return int(datetime(*args, tzinfo=UTC).timestamp() * 1000)
+
+
+def _ny_to_utc(*args) -> datetime:
+    """Unabhaengige Referenz: NY-Ortszeit -> UTC via zoneinfo."""
+    return datetime(*args, tzinfo=NY).astimezone(UTC)
+
+
+@functools.lru_cache(maxsize=None)
+def raw_month(y: int, m: int, stamping: str = "ny", step_s: int = 30) -> pd.DataFrame:
+    """
+    Ticks eines ROH-Monats wie beobachtet, in New-York-Marktzeiten:
+      So 18:00:01 .. Fr 16:59:58, Mo-Do Tagespause 16:59:58 -> 18:00:01.
+    Regulaere Ticks alle step_s Sekunden auf Sekunde :01 (und :31), dazu je
+    Handelstag Mo-Fr ein letzter Tick 16:59:58.
+    stamping: ny (Ortszeit mit Sommerzeit), est (fest UTC-5), utc.
+    Rueckgabe (nicht veraendern - gecached): raw (naiv), utc, bid, ask.
+    """
+    lo = pd.Timestamp(y, m, 1) - pd.Timedelta(days=3)
+    hi = pd.Timestamp(y, m, 1) + pd.offsets.MonthBegin(1) + pd.Timedelta(days=3)
+    grid = pd.date_range(lo + pd.Timedelta(seconds=1), hi, freq=f"{step_s}s", inclusive="left")
+    wd, h = grid.dayofweek, grid.hour
+    is_open = (((wd <= 3) & ((h < 17) | (h >= 18))) | ((wd == 4) & (h < 17))
+               | ((wd == 6) & (h >= 18)))
+    days = pd.date_range(lo.normalize(), hi, freq="D")
+    closes = days[days.dayofweek <= 4] + pd.Timedelta(hours=16, minutes=59, seconds=58)
+    local = grid[np.asarray(is_open)].append(closes).sort_values()
+    local = local[(local >= lo) & (local < hi)]
+    # Wochenende deckt 02:00-02:59 (Fruehjahr) und 01:00-01:59 (Herbst) ab -> eindeutig
+    utc = local.tz_localize("America/New_York").tz_convert("UTC")
+    if stamping == "ny":
+        raw = local
+    elif stamping == "est":
+        raw = (utc - pd.Timedelta(hours=5)).tz_localize(None)
+    else:
+        assert stamping == "utc"
+        raw = utc.tz_localize(None)
+    keep = (raw >= pd.Timestamp(y, m, 1)) & (raw < pd.Timestamp(y, m, 1) + pd.offsets.MonthBegin(1))
+    raw, utc = raw[keep], utc[keep]
+    sec = (utc.as_unit("ms").asi8 // 1000).astype(float)
+    bid = np.round(2050.0 + 6.0 * np.sin(sec / 7200.0) + 0.4 * np.sin(sec / 53.0), 2)
+    spread = 0.25 + 0.05 * ((sec // 30) % 3)
+    ask = np.round(bid + spread, 2)
+    return pd.DataFrame({"raw": raw, "utc": utc, "bid": bid, "ask": ask}).reset_index(drop=True)
+
+
+def raw_ms_of(df: pd.DataFrame) -> np.ndarray:
+    return pd.DatetimeIndex(df["raw"]).as_unit("ms").asi8.astype(np.int64)
+
+
+def tick_csv(df: pd.DataFrame) -> bytes:
+    stamp = pd.DatetimeIndex(df["raw"]).strftime("%Y%m%d %H%M%S%f").str[:-3]
+    lines = [f"{s},{b:.2f},{a:.2f},0" for s, b, a in zip(stamp, df["bid"], df["ask"])]
+    return ("\n".join(lines) + "\n").encode()
+
+
+def make_zip(y: int, m: int, csv: bytes) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"DAT_ASCII_{SYM}_T_{y}{m:02d}.csv", csv)
+        zf.writestr(f"DAT_ASCII_{SYM}_T_{y}{m:02d}.txt", "HistData.com status report\n")
+    return buf.getvalue()
+
+
+@functools.lru_cache(maxsize=None)
+def tick_zip(y: int, m: int) -> bytes:
+    return make_zip(y, m, tick_csv(raw_month(y, m)))
+
+
+# ------------------------------------------------------------ http-mock ---
+PAGE = """<html><body>
+<form id="file_down" name="file_down" method="POST" action="/get.php">
+  <input type="hidden" name="tk" id="tk" value="tok-{period}" />
+  <input type="hidden" name="date" id="date" value="{year}" />
+  <input type="hidden" name="datemonth" id="datemonth" value="{datemonth}" />
+  <input type="hidden" name="platform" id="platform" value="ASCII" />
+  <input type="hidden" name="timeframe" id="timeframe" value="{code}" />
+  <input type="hidden" name="fxpair" id="fxpair" value="{pair}" />
+</form></body></html>"""
+
+
+class Resp:
+    def __init__(self, status=200, content=b"", headers=None):
+        self.status_code, self.content, self.headers = status, content, headers or {}
+
+    @property
+    def text(self):
+        return self.content.decode("utf-8", "replace")
+
+
+class Clock:
+    def __init__(self, t=1_700_000_000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+class Site:
+    """Fake-HistData: files[(code, period)] -> ZIP; unbekannt = leere Antwort."""
+
+    def __init__(self, clock, files=None):
+        self.clock, self.files, self.calls = clock, dict(files or {}), []
+
+    def get(self, url, timeout=None, **kw):
+        self.calls.append(("GET", url))
+        m = re.search(r"/ascii/([a-z0-9-]+)/([a-z]+)/(\d{4})(?:/(\d{1,2}))?$", url)
+        tf, pair, year, month = m.groups()
+        code = "T" if tf == "tick-data-quotes" else "M1"
+        period = f"{year}{int(month):02d}" if month else year
+        html = PAGE.format(period=period, year=year, datemonth=period if month else "",
+                           code=code, pair=pair.upper())
+        return Resp(200, html.encode())
+
+    def post(self, url, data=None, headers=None, timeout=None, **kw):
+        self.calls.append(("POST", url))
+        period = data["datemonth"] or data["date"]
+        return Resp(200, self.files.get((data["timeframe"], period), b""))
+
+    @property
+    def requests(self):
+        return len(self.calls)
+
+
+def site_for(clock, months, overrides=None):
+    files = {("T", f"{y}{m:02d}"): tick_zip(y, m) for y, m in months}
+    files.update(overrides or {})
+    return Site(clock, files)
+
+
+def do_run(root, site, clock, start, end=None, now=NOW, **extra):
+    return fh.run(SYM, date(*start, 1), date(*(end or start), 1), root, mode="tick",
+                  now=lambda: now, pause=0.0, attempts=2, backoff_base=1.0, max_backoff=10.0,
+                  jitter=0.0, sleep=clock.sleep, clock=clock, wall=clock, session=site, **extra)
+
+
+# --------------------------------------------------------------- helfer ---
+def _offset_set(x) -> set[int]:
+    """expected_offsets als Menge ganzer Stunden (dict {offset: n} oder Liste)."""
+    if isinstance(x, dict):
+        return {int(float(k)) for k in x}
+    return {int(v) for v in x}
+
+
+def _rebuilt(rep: dict):
+    v = rep.get("rebuilt_timezone")
+    if v is None:
+        v = (rep.get("summary") or {}).get("rebuilt_timezone")
+    return v
+
+
+def _months(v) -> set[str]:
+    """Monate aus einer Report-Liste (Strings 'YYYY-MM...' oder dicts mit 'month')."""
+    out = set()
+    for item in (v or []):
+        if isinstance(item, dict):
+            item = item.get("month") or json.dumps(item)
+        out.add(str(item)[:7])
+    return out
+
+
+def _meta_value(v) -> bytes:
+    return v.encode() if isinstance(v, str) else v
+
+
+def _check(ms, ym, mode):
+    return fh.check_timezone(ms, SYM, fh.raw_month_bounds_ms(ym), mode=mode)
+
+
+# ======================================================= neue Schnittstelle ---
+def test_raw_tz_constants_and_error_type():
+    assert fh.RAW_TZ == {"tick": "America/New_York", "m1": "Etc/GMT+5"}
+    assert issubclass(fh.TimezoneError, fh.FormatError)
+    assert set(fh.SOURCE_TZ_META) >= {"tick", "m1"}
+    tick_meta = _meta_value(fh.SOURCE_TZ_META["tick"])
+    assert tick_meta != OLD_TZ_META               # sonst erkennt der Lauf alte Dateien nicht
+    assert tick_meta != _meta_value(fh.SOURCE_TZ_META["m1"])
+
+
+# =========================================== 1. Anker wie beobachtet: ok ---
+@pytest.mark.parametrize("ym,offset", [((2024, 1), -5), ((2024, 7), -4)])
+def test_observed_anchors_pass_in_tick_mode(ym, offset):
+    df = raw_month(*ym)
+    raw = pd.DatetimeIndex(df["raw"])
+    # Generator-Sanity: Tagespause / Wochenrand exakt wie beobachtet
+    fri = raw[raw.dayofweek == 4]
+    assert set(fri[fri.hour >= 16].time.astype(str)) >= {"16:59:58"}
+    assert not ((raw.dayofweek <= 3) & (raw.hour == 17)).any()
+    sun = raw[raw.dayofweek == 6]
+    assert sun.min().time() == datetime(2000, 1, 1, 18, 0, 1).time()
+
+    rep = _check(raw_ms_of(df), ym, "tick")
+    for k in ("status", "ok", "reason", "anchors", "raw_tz", "expected_offsets", "deviations",
+              "median_deviation_h", "median_offset_h", "edge_violations"):
+        assert k in rep, k
+    assert rep["status"] == "ok" and rep["ok"] is True, rep["reason"]
+    assert rep["raw_tz"] == "America/New_York"
+    assert rep["anchors"] >= 20
+    assert rep["median_deviation_h"] == 0
+    assert rep["median_offset_h"] == offset
+    assert _offset_set(rep["expected_offsets"]) == {offset}
+    assert not rep["edge_violations"]
+
+
+@pytest.mark.parametrize("ym,offsets", [((2024, 3), {-5, -4}), ((2024, 11), {-4, -5})])
+def test_dst_switch_inside_month_passes_in_tick_mode(ym, offsets):
+    """Umstellung mitten im Rohmonat (10.3.) bzw. in den ersten 72 h (3.11.):
+    erwarteter Offset je Anker -> keine Abweichung, kein Randverstoss."""
+    rep = _check(raw_ms_of(raw_month(*ym)), ym, "tick")
+    assert rep["ok"], rep["reason"]
+    assert rep["median_deviation_h"] == 0 and not rep["edge_violations"]
+    assert _offset_set(rep["expected_offsets"]) == offsets
+
+
+# ===================================== 2. falsche Hypothesen schlagen fehl ---
+def test_july_ny_data_fails_under_m1_hypothesis():
+    rep = _check(raw_ms_of(raw_month(2024, 7)), (2024, 7), "m1")
+    assert rep["status"] == "failed" and rep["ok"] is False
+    assert rep["raw_tz"] == "Etc/GMT+5"
+    assert _offset_set(rep["expected_offsets"]) == {-5}
+    assert rep["median_deviation_h"] == 1 and rep["median_offset_h"] == -4
+    assert _offset_set(rep["deviations"]) == {1}          # +1 an jedem Anker
+
+
+def test_january_ny_data_passes_under_m1_hypothesis():
+    """Im Winter sind NY-Ortszeit und fest EST identisch."""
+    rep = _check(raw_ms_of(raw_month(2024, 1)), (2024, 1), "m1")
+    assert rep["ok"] and rep["median_deviation_h"] == 0
+
+
+def test_july_fixed_est_stamped_fails_in_tick_mode():
+    df = raw_month(2024, 7, stamping="est")
+    raw = pd.DatetimeIndex(df["raw"])
+    tue = raw[(raw >= pd.Timestamp("2024-07-09 15:00")) & (raw < pd.Timestamp("2024-07-09 18:00"))]
+    gap = np.diff(tue.asi8).argmax()
+    assert (str(tue[gap].time()), str(tue[gap + 1].time())) == ("15:59:58", "17:00:01")
+    rep = _check(raw_ms_of(df), (2024, 7), "tick")
+    assert rep["status"] == "failed" and not rep["ok"]
+    assert rep["median_deviation_h"] == -1 and rep["median_offset_h"] == -5
+
+
+@pytest.mark.parametrize("ym,dev", [((2024, 1), 5), ((2024, 7), 4)])
+def test_utc_stamped_fails_in_tick_mode(ym, dev):
+    rep = _check(raw_ms_of(raw_month(*ym, stamping="utc")), ym, "tick")
+    assert rep["status"] == "failed" and not rep["ok"]
+    assert rep["median_deviation_h"] == dev and rep["median_offset_h"] == 0
+
+
+# ============================================= 3. Umrechnung Rohzeit->UTC ---
+TICK_CASES = [
+    ((2024, 1, 12, 16, 59, 58), (2024, 1, 12, 21, 59, 58)),
+    ((2024, 7, 12, 16, 59, 58), (2024, 7, 12, 20, 59, 58)),
+    ((2024, 3, 10, 18, 0, 1), (2024, 3, 10, 22, 0, 1)),     # erster So-Start nach Umstellung
+    ((2024, 11, 3, 18, 0, 1), (2024, 11, 3, 23, 0, 1)),     # nach Rueckstellung
+    ((2024, 3, 8, 16, 59, 58), (2024, 3, 8, 21, 59, 58)),   # Freitag davor
+]
+
+
+@pytest.mark.parametrize("raw,utc", TICK_CASES)
+def test_raw_to_utc_tick_values(raw, utc):
+    assert _ny_to_utc(*raw) == datetime(*utc, tzinfo=UTC)        # Referenz stimmt
+    out = fh.raw_to_utc_ms(np.array([_ms(*raw)], dtype=np.int64), "tick")
+    assert np.asarray(out).dtype == np.int64
+    assert int(out[0]) == _ms(*utc)
+
+
+def test_raw_to_utc_tick_vectorised_and_milliseconds():
+    raws = [r for r, _ in TICK_CASES] + [(2024, 7, 12, 16, 59, 58, 999_000)]
+    arr = np.array([_ms(*r) for r in raws], dtype=np.int64)
+    out = fh.raw_to_utc_ms(arr, "tick")
+    exp = [int(_ny_to_utc(*r).timestamp() * 1000) for r in raws]
+    assert [int(v) for v in out] == exp
+
+
+def test_raw_to_utc_m1_is_fixed_plus_5h():
+    out = fh.raw_to_utc_ms(np.array([_ms(2024, 7, 12, 16, 59)], dtype=np.int64), "m1")
+    assert int(out[0]) == _ms(2024, 7, 12, 21, 59)
+    arr = np.array([_ms(2024, 1, 12, 16, 59, 58), _ms(2024, 7, 12, 16, 59, 58)], dtype=np.int64)
+    assert [int(v) for v in fh.raw_to_utc_ms(arr, "m1")] == [int(v) + 5 * 3_600_000 for v in arr]
+
+
+def test_ticks_to_bars_uses_new_york_and_m1_to_bars_fixed_est():
+    ticks = fh.parse_csv(b"20240712 165958000,2400.10,2400.35,0\n"
+                         b"20240712 180001000,2400.20,2400.45,0\n", "tick")
+    bars = fh.ticks_to_bars(ticks)
+    assert list(bars["ts"]) == [pd.Timestamp("2024-07-12 20:59", tz="UTC"),
+                                pd.Timestamp("2024-07-12 22:00", tz="UTC")]
+    m1 = fh.parse_csv(b"20240712 165900;2400.1;2400.5;2399.9;2400.2;0\n", "m1")
+    b, _ = fh.m1_to_bars(m1)
+    assert list(b["ts"]) == [pd.Timestamp("2024-07-12 21:59", tz="UTC")]
+
+
+def test_ticks_to_bars_rejects_nonexistent_local_time():
+    ticks = fh.parse_csv(b"20240310 023000000,2100.10,2100.35,0\n", "tick")
+    with pytest.raises(fh.TimezoneError):
+        fh.ticks_to_bars(ticks)
+
+
+# ================================ 4. nicht existent / mehrdeutig (tick) ---
+def _is_nonexistent(*a) -> bool:
+    d = datetime(*a, tzinfo=NY)
+    return d.astimezone(UTC).astimezone(NY).replace(tzinfo=None) != d.replace(tzinfo=None)
+
+
+def _is_ambiguous(*a) -> bool:
+    return datetime(*a, fold=0, tzinfo=NY).utcoffset() != datetime(*a, fold=1, tzinfo=NY).utcoffset()
+
+
+BAD = [  # (Rohzeit, Art)
+    ((2024, 3, 10, 2, 30), "nonexistent"),
+    ((2024, 11, 3, 1, 30), "ambiguous"),
+    ((2024, 3, 10, 2, 0, 0), "nonexistent"),
+    ((2024, 3, 10, 2, 59, 59, 999_000), "nonexistent"),
+    ((2024, 11, 3, 1, 0, 0), "ambiguous"),
+    ((2024, 11, 3, 1, 59, 59, 999_000), "ambiguous"),
+    ((2010, 3, 14, 2, 30), "nonexistent"),
+    ((2010, 11, 7, 1, 30), "ambiguous"),
+    ((2026, 3, 8, 2, 30), "nonexistent"),
+    ((2026, 11, 1, 1, 30), "ambiguous"),
+    ((2009, 3, 8, 2, 0), "nonexistent"),
+    ((2019, 11, 3, 1, 0), "ambiguous"),
+]
+GOOD_EDGES = [
+    (2024, 3, 10, 1, 59, 59, 999_000),
+    (2024, 3, 10, 3, 0, 0),
+    (2024, 11, 3, 0, 59, 59, 999_000),
+    (2024, 11, 3, 2, 0, 0),
+    (2026, 3, 8, 3, 0, 0),
+    (2026, 11, 1, 2, 0, 0),
+]
+
+
+@pytest.mark.parametrize("raw,kind", BAD)
+def test_nonexistent_and_ambiguous_raise_in_tick_mode(raw, kind):
+    assert (_is_nonexistent if kind == "nonexistent" else _is_ambiguous)(*raw)   # Referenz
+    with pytest.raises(fh.TimezoneError):
+        fh.raw_to_utc_ms(np.array([_ms(*raw)], dtype=np.int64), "tick")
+    # auch eingebettet zwischen gueltigen Zeiten: nie raten
+    arr = np.array([_ms(2024, 1, 5, 12), _ms(*raw), _ms(2024, 7, 5, 12)], dtype=np.int64)
+    with pytest.raises(fh.TimezoneError):
+        fh.raw_to_utc_ms(arr, "tick")
+
+
+@pytest.mark.parametrize("raw", GOOD_EDGES)
+def test_dst_edges_just_outside_are_converted(raw):
+    assert not _is_nonexistent(*raw) and not _is_ambiguous(*raw)
+    out = fh.raw_to_utc_ms(np.array([_ms(*raw)], dtype=np.int64), "tick")
+    assert int(out[0]) == int(_ny_to_utc(*raw).timestamp() * 1000)
+
+
+@pytest.mark.parametrize("raw,kind", BAD)
+def test_m1_mode_never_raises_on_dst_hours(raw, kind):
+    out = fh.raw_to_utc_ms(np.array([_ms(*raw)], dtype=np.int64), "m1")
+    assert int(out[0]) == _ms(*raw) + 5 * 3_600_000
+
+
+# ========================================== 5./6. Lauf mit gemocktem HTTP ---
+STITCH = {  # UTC-Monat: (Rohmonate, erster Roh-Tick des UTC-Monats, letzte UTC-Minute)
+    (2024, 7): ([(2024, 6), (2024, 7)], "2024-06-30 20:00:01", "2024-07-31 23:59"),
+    (2024, 2): ([(2024, 1), (2024, 2)], "2024-01-31 19:00:01", "2024-02-29 23:59"),
+}
+
+
+@pytest.fixture(scope="module")
+def built(tmp_path_factory):
+    cache = {}
+
+    def get(ym):
+        if ym not in cache:
+            root = tmp_path_factory.mktemp(f"run{ym[0]}{ym[1]:02d}")
+            clock = Clock()
+            site = site_for(clock, STITCH[ym][0])
+            rep = do_run(root, site, clock, ym)
+            cache[ym] = (root, rep, site)
+        return cache[ym]
+    return get
+
+
+@pytest.mark.parametrize("ym", list(STITCH))
+def test_month_stitching_uses_new_york_offset(built, ym):
+    root, rep, site = built(ym)
+    assert rep["exit_code"] == 0, rep
+    assert rep["summary"]["months_written"] == [f"{ym[0]}-{ym[1]:02d}"]
+    assert site.requests == 4                                  # genau Rohmonate M-1 und M
+    df = pd.read_parquet(fh.store_path(root, SYM, *ym))
+    lo = pd.Timestamp(datetime(*ym, 1, tzinfo=UTC))
+    hi = lo + pd.offsets.MonthBegin(1)
+    # erwartete Minuten direkt aus den UTC-Zeitpunkten beider Rohmonate
+    ticks = pd.concat([raw_month(*r) for r in STITCH[ym][0]], ignore_index=True)
+    ticks = ticks[(ticks["utc"] >= lo) & (ticks["utc"] < hi)]
+    assert list(df["ts"]) == sorted(set(ticks["utc"].dt.floor("1min")))
+    # Monatsanfang stammt aus dem Vor-Rohmonat (NY-Abend)
+    first_raw, last_utc = pd.Timestamp(STITCH[ym][1]), pd.Timestamp(STITCH[ym][2], tz="UTC")
+    first = ticks.sort_values("utc").iloc[0]
+    assert first["raw"] == first_raw
+    assert first["utc"] == pd.Timestamp(_ny_to_utc(*first_raw.timetuple()[:6]))
+    assert df["ts"].iloc[0] == lo
+    assert df["bid_open"].iloc[0] == pytest.approx(first["bid"])
+    assert df["ts"].iloc[-1] == last_utc
+
+
+def test_july_stitch_sunday_evening_hours(built):
+    """Roh 2024-06-30 20:00-23:59 (So, EDT) = UTC 2024-07-01 00:00-03:59 im Juli-File;
+    roh 18:00-19:59 = UTC 30.6. 22:00-23:59 gehoert NICHT dazu."""
+    root, rep, _ = built((2024, 7))
+    assert rep["exit_code"] == 0, rep
+    df = pd.read_parquet(fh.store_path(root, SYM, 2024, 7))
+    jun = raw_month(2024, 6)
+    sun = jun[jun["raw"] >= pd.Timestamp("2024-06-30 20:00")]
+    exp = sorted(set(sun["utc"].dt.floor("1min")))
+    assert exp[0] == pd.Timestamp("2024-07-01 00:00", tz="UTC")
+    assert exp[-1] == pd.Timestamp("2024-07-01 03:59", tz="UTC")
+    got = df[df["ts"] < pd.Timestamp("2024-07-01 04:00", tz="UTC")]
+    assert list(got["ts"]) == exp
+    # Preise der ersten Stunde = Juni-Ticks
+    by_min = sun.assign(ts=sun["utc"].dt.floor("1min")).groupby("ts")["bid"].first()
+    assert np.allclose(got.set_index("ts")["bid_open"].to_numpy(), by_min.loc[got["ts"]].to_numpy())
+
+
+def test_summer_month_written_in_utc_with_break_at_21_utc(built):
+    root, rep, _ = built((2024, 7))
+    assert rep["exit_code"] == 0, rep
+    t = pq.read_table(fh.store_path(root, SYM, 2024, 7))
+    meta = t.schema.metadata
+    assert meta[b"source_timezone"] == _meta_value(fh.SOURCE_TZ_META["tick"])
+    assert meta[b"histdata_mode"] == b"histdata_tick"
+    df = t.to_pandas()
+    assert str(df["ts"].dt.tz) == "UTC"
+    ts = df["ts"]
+    assert not (ts.dt.hour == 21).any()                    # 17-18 EDT = 21-22 UTC
+    for d in pd.date_range("2024-07-01", "2024-07-31", freq="D", tz="UTC"):
+        day = ts[ts.dt.normalize() == d]
+        wd = d.dayofweek
+        if wd <= 3:                                        # Mo-Do: Pause 20:59 -> 22:00
+            assert d + pd.Timedelta("20:59:00") in set(day), d
+            assert d + pd.Timedelta("22:00:00") in set(day), d
+        elif wd == 4:                                      # Fr: letzte Minute 20:59
+            assert day.max() == d + pd.Timedelta("20:59:00"), d
+        elif wd == 6:                                      # So: erste Minute 22:00
+            assert day.min() == d + pd.Timedelta("22:00:00"), d
+        else:
+            assert day.empty, d
+    mrep = json.loads(fh.report_path(root, SYM, 2024, 7).read_text())
+    assert mrep["raw_months"]["2024-07"]["timezone"]["ok"] is True
+    assert mrep["raw_months"]["2024-07"]["timezone"]["median_offset_h"] == -4
+
+
+def test_verify_month_summer_uses_cache_and_passes(built):
+    root, rep, _ = built((2024, 7))
+    assert rep["exit_code"] == 0, rep
+    clock = Clock()
+    site = Site(clock)
+    v = fh.verify_month(SYM, (2024, 7), root, now=lambda: NOW, pause=0.0, attempts=1,
+                        jitter=0.0, sleep=clock.sleep, clock=clock, wall=clock, session=site)
+    assert v["exit_code"] == 0 and v["ok"] and site.requests == 0
+    assert v["raw_months"]["2024-06"]["timezone"]["median_offset_h"] == -4
+    assert v["raw_months"]["2024-07"]["timezone"]["median_deviation_h"] == 0
+
+
+# ===================================== 7. alte Store-Dateien neu bauen ---
+# Exakt so von der alten Pruefung (git HEAD vor der Umstellung, fest UTC-5)
+# fuer die synthetischen Rohmonate erzeugt: Ctx._quarantine -> dk.write_json_atomic.
+OLD_FORMAT_MARKERS = {(2024, 6): {'reason': 'Zeitzone passt nicht zu fest UTC-5: 4 Anker am Monatsrand (erste/letzte 72 '
+                       'h) mit genau 1 h Abweichung, z.B. 2024-06-03 16:59:58 pause_beginn -> -4 h '
+                       '(Uhrumstellung am Monatsrand?); Median-Offset -4 h statt -5 h; nur 0% der '
+                       'Anker bei -5 h; 40 aufeinanderfolgende Anker mit gleichem abweichendem '
+                       'Offset (Wechsel mitten im Monat?)',
+             'check': {'expected_offset_h': -5,
+                       'rows': 55940,
+                       'reversals': 0,
+                       'max_reversal_s': 0.0,
+                       'large_reversals': [],
+                       'anchors': 40,
+                       'ignored_break_gaps': 0,
+                       'share_expected': 0.0,
+                       'median_offset_h': -4.0,
+                       'offsets': {'-4': 40},
+                       'first_offset_h': -4,
+                       'last_offset_h': -4,
+                       'longest_deviating_run': 40,
+                       'edge_violations': [{'raw': '2024-06-03 16:59:58',
+                                            'kind': 'pause_beginn',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-06-03 18:00:01',
+                                            'kind': 'pause_ende',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-06-28 16:59:58',
+                                            'kind': 'wochenschluss',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-06-30 18:00:01',
+                                            'kind': 'wochenstart',
+                                            'implied_offset_h': -4}],
+                       'deviating_examples': [{'raw': '2024-06-03 16:59:58',
+                                               'kind': 'pause_beginn',
+                                               'expected_ny': '17:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-06-03 18:00:01',
+                                               'kind': 'pause_ende',
+                                               'expected_ny': '18:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-06-04 16:59:58',
+                                               'kind': 'pause_beginn',
+                                               'expected_ny': '17:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-06-04 18:00:01',
+                                               'kind': 'pause_ende',
+                                               'expected_ny': '18:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-06-05 16:59:58',
+                                               'kind': 'pause_beginn',
+                                               'expected_ny': '17:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-06-05 18:00:01',
+                                               'kind': 'pause_ende',
+                                               'expected_ny': '18:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-06-06 16:59:58',
+                                               'kind': 'pause_beginn',
+                                               'expected_ny': '17:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-06-06 18:00:01',
+                                               'kind': 'pause_ende',
+                                               'expected_ny': '18:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-06-07 16:59:58',
+                                               'kind': 'wochenschluss',
+                                               'expected_ny': '17:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-06-09 18:00:01',
+                                               'kind': 'wochenstart',
+                                               'expected_ny': '18:00',
+                                               'implied_offset_h': -4}],
+                       'status': 'failed',
+                       'ok': False,
+                       'reason': '4 Anker am Monatsrand (erste/letzte 72 h) mit genau 1 h '
+                                 'Abweichung, z.B. 2024-06-03 16:59:58 pause_beginn -> -4 h '
+                                 '(Uhrumstellung am Monatsrand?); Median-Offset -4 h statt -5 h; '
+                                 'nur 0% der Anker bei -5 h; 40 aufeinanderfolgende Anker mit '
+                                 'gleichem abweichendem Offset (Wechsel mitten im Monat?)'},
+             'since': '2024-12-01T12:00:00+00:00',
+             'accepted': False},
+ (2024, 7): {'reason': 'Zeitzone passt nicht zu fest UTC-5: 12 Anker am Monatsrand (erste/letzte '
+                       '72 h) mit genau 1 h Abweichung, z.B. 2024-07-01 16:59:58 pause_beginn -> '
+                       '-4 h (Uhrumstellung am Monatsrand?); Median-Offset -4 h statt -5 h; nur 0% '
+                       'der Anker bei -5 h; 46 aufeinanderfolgende Anker mit gleichem abweichendem '
+                       'Offset (Wechsel mitten im Monat?)',
+             'check': {'expected_offset_h': -5,
+                       'rows': 63503,
+                       'reversals': 0,
+                       'max_reversal_s': 0.0,
+                       'large_reversals': [],
+                       'anchors': 46,
+                       'ignored_break_gaps': 0,
+                       'share_expected': 0.0,
+                       'median_offset_h': -4.0,
+                       'offsets': {'-4': 46},
+                       'first_offset_h': -4,
+                       'last_offset_h': -4,
+                       'longest_deviating_run': 46,
+                       'edge_violations': [{'raw': '2024-07-01 16:59:58',
+                                            'kind': 'pause_beginn',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-07-01 18:00:01',
+                                            'kind': 'pause_ende',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-07-02 16:59:58',
+                                            'kind': 'pause_beginn',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-07-02 18:00:01',
+                                            'kind': 'pause_ende',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-07-03 16:59:58',
+                                            'kind': 'pause_beginn',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-07-03 18:00:01',
+                                            'kind': 'pause_ende',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-07-29 16:59:58',
+                                            'kind': 'pause_beginn',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-07-29 18:00:01',
+                                            'kind': 'pause_ende',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-07-30 16:59:58',
+                                            'kind': 'pause_beginn',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-07-30 18:00:01',
+                                            'kind': 'pause_ende',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-07-31 16:59:58',
+                                            'kind': 'pause_beginn',
+                                            'implied_offset_h': -4},
+                                           {'raw': '2024-07-31 18:00:01',
+                                            'kind': 'pause_ende',
+                                            'implied_offset_h': -4}],
+                       'deviating_examples': [{'raw': '2024-07-01 16:59:58',
+                                               'kind': 'pause_beginn',
+                                               'expected_ny': '17:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-07-01 18:00:01',
+                                               'kind': 'pause_ende',
+                                               'expected_ny': '18:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-07-02 16:59:58',
+                                               'kind': 'pause_beginn',
+                                               'expected_ny': '17:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-07-02 18:00:01',
+                                               'kind': 'pause_ende',
+                                               'expected_ny': '18:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-07-03 16:59:58',
+                                               'kind': 'pause_beginn',
+                                               'expected_ny': '17:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-07-03 18:00:01',
+                                               'kind': 'pause_ende',
+                                               'expected_ny': '18:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-07-04 16:59:58',
+                                               'kind': 'pause_beginn',
+                                               'expected_ny': '17:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-07-04 18:00:01',
+                                               'kind': 'pause_ende',
+                                               'expected_ny': '18:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-07-05 16:59:58',
+                                               'kind': 'wochenschluss',
+                                               'expected_ny': '17:00',
+                                               'implied_offset_h': -4},
+                                              {'raw': '2024-07-07 18:00:01',
+                                               'kind': 'wochenstart',
+                                               'expected_ny': '18:00',
+                                               'implied_offset_h': -4}],
+                       'status': 'failed',
+                       'ok': False,
+                       'reason': '12 Anker am Monatsrand (erste/letzte 72 h) mit genau 1 h '
+                                 'Abweichung, z.B. 2024-07-01 16:59:58 pause_beginn -> -4 h '
+                                 '(Uhrumstellung am Monatsrand?); Median-Offset -4 h statt -5 h; '
+                                 'nur 0% der Anker bei -5 h; 46 aufeinanderfolgende Anker mit '
+                                 'gleichem abweichendem Offset (Wechsel mitten im Monat?)'},
+             'since': '2024-12-01T12:00:00+00:00',
+             'accepted': False}}
+
+
+def _old_marker(root, ym):
+    """Quarantaene-Marker der alten Pruefung (fest UTC-5, ohne Versionsfeld),
+    geschrieben wie damals dk.write_json_atomic (indent=2, ensure_ascii=False)."""
+    q = fh.Unit(SYM, "tick", *ym).qmarker(root, ym)
+    q.parent.mkdir(parents=True, exist_ok=True)
+    q.write_text(json.dumps(OLD_FORMAT_MARKERS[ym], indent=2, ensure_ascii=False) + "\n")
+    return q
+
+
+@pytest.mark.parametrize("with_marker", [False, True], ids=["plain", "old_tz_marker"])
+def test_store_file_with_old_source_timezone_is_rebuilt_from_cache(tmp_path, with_marker):
+    clock = Clock()
+    site = site_for(clock, [(2024, 6), (2024, 7)])
+    rep = do_run(tmp_path, site, clock, (2024, 7))
+    assert rep["exit_code"] == 0, rep
+    out = fh.store_path(tmp_path, SYM, 2024, 7)
+    ref = pd.read_parquet(out)
+    # Altlast simulieren: Inhalt alt (fest +5 h = 1 h spaeter), Metadatum alt
+    t = pq.read_table(out)
+    old = t.to_pandas()
+    old["ts"] = old["ts"] + pd.Timedelta(hours=1)
+    old = old[old["ts"] < pd.Timestamp("2024-08-01", tz="UTC")].reset_index(drop=True)
+    stale = pa.Table.from_pandas(old, preserve_index=False)
+    meta = dict(t.schema.metadata)
+    meta[b"source_timezone"] = OLD_TZ_META
+    pq.write_table(stale.replace_schema_metadata(meta), out)
+    if with_marker:
+        _old_marker(tmp_path, (2024, 7))
+        _old_marker(tmp_path, (2024, 6))
+
+    site2 = Site(clock)                                    # keine Dateien: Anfrage waere Fehler
+    rep = do_run(tmp_path, site2, clock, (2024, 7))
+    assert site2.requests == 0 and rep["summary"]["requests"] == 0
+    assert rep["exit_code"] == 0, rep
+    assert "2024-07" in _months(_rebuilt(rep))
+    saved = json.loads(fh.run_report_path(tmp_path, SYM).read_text())
+    assert "2024-07" in _months(_rebuilt(saved))
+    t = pq.read_table(out)
+    assert t.schema.metadata[b"source_timezone"] == _meta_value(fh.SOURCE_TZ_META["tick"])
+    assert t.schema.metadata[b"histdata_mode"] == b"histdata_tick"
+    pd.testing.assert_frame_equal(t.to_pandas(), ref)
+
+    # dritter Lauf: aktuelle Datei bleibt, nichts mehr neu gebaut
+    rep = do_run(tmp_path, Site(clock), clock, (2024, 7))
+    assert rep["exit_code"] == 0 and rep["summary"]["months_skipped_existing"] == 1
+    assert "2024-07" not in _months(_rebuilt(rep))
+
+
+# ============================== 8. Tick in nicht existenter Stunde: Quarantaene ---
+@pytest.mark.parametrize("bad_raw,raw_ym,utc_months", [
+    ("2024-03-10 02:30:00", (2024, 3), [(2024, 3), (2024, 4)]),     # Fruehjahr: nicht existent
+    ("2024-11-03 01:30:00", (2024, 11), [(2024, 11), (2024, 12)]),  # Herbst: mehrdeutig
+], ids=["nonexistent", "ambiguous"])
+def test_tick_in_dst_gap_quarantines_raw_month(tmp_path, bad_raw, raw_ym, utc_months):
+    df = raw_month(*raw_ym)
+    bad = pd.DataFrame({"raw": [pd.Timestamp(bad_raw)], "utc": [pd.NaT], "bid": [2050.0],
+                        "ask": [2050.3]})
+    df = pd.concat([df, bad], ignore_index=True).sort_values("raw", kind="mergesort")
+    prev, nxt = fh._ym_add(raw_ym, -1), fh._ym_add(raw_ym, 1)
+    clock = Clock()
+    site = site_for(clock, [prev, nxt], {("T", f"{raw_ym[0]}{raw_ym[1]:02d}"):
+                                         make_zip(*raw_ym, tick_csv(df))})
+    now = datetime(2025, 3, 1, 12, tzinfo=UTC)
+    rep = do_run(tmp_path, site, clock, utc_months[0], utc_months[-1], now=now)
+    assert rep["exit_code"] == 4, rep
+    assert rep["summary"]["months_written"] == []
+    for ym in utc_months:                                  # beide UTC-Monate brauchen raw_ym
+        assert not fh.store_path(tmp_path, SYM, *ym).exists(), ym
+    assert f"{utc_months[0][0]}-{utc_months[0][1]:02d}" in rep["summary"]["months_quarantine"]
+    q = fh.Unit(SYM, "tick", *raw_ym).qmarker(tmp_path, raw_ym)
+    assert q.exists()
+    assert {r["raw_month"] for r in rep["quarantine"]} == {f"{raw_ym[0]}-{raw_ym[1]:02d}"}
+    # Kontrolle: dieselben Monate ohne den einen Tick werden geschrieben
+    # (die Quarantaene kommt also wirklich von der nicht eindeutigen Ortszeit)
+    clean = site_for(clock, [prev, raw_ym, nxt])
+    rep = do_run(tmp_path / "clean", clean, clock, utc_months[0], utc_months[-1], now=now)
+    assert rep["exit_code"] == 0, rep
+    assert rep["summary"]["months_written"] == [f"{y}-{m:02d}" for y, m in utc_months]
+
+
+# ============== 9. Homelab-Zustand: alte TZ-Quarantaene, keine Store-Datei ---
+HOMELAB_RAW = [(2023, 12), (2024, 1), (2024, 6), (2024, 7)]
+
+
+def _seed_cache(root, months, stamping="ny"):
+    """Roh-ZIPs direkt in den Cache legen (wie nach frueheren Laeufen)."""
+    for y, m in months:
+        p = fh.Unit(SYM, "tick", y, m).path(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        blob = tick_zip(y, m) if stamping == "ny" else make_zip(y, m, tick_csv(raw_month(y, m, stamping)))
+        p.write_bytes(blob)
+
+
+def _verify(root, clock, site, ym, now=NOW):
+    return fh.verify_month(SYM, ym, root, now=lambda: now, pause=0.0, attempts=1, jitter=0.0,
+                           sleep=clock.sleep, clock=clock, wall=clock, session=site)
+
+
+def _expected_minutes(ym, raws):
+    lo = pd.Timestamp(datetime(*ym, 1, tzinfo=UTC))
+    hi = lo + pd.offsets.MonthBegin(1)
+    t = pd.concat([raw_month(*r) for r in raws], ignore_index=True)
+    t = t[(t["utc"] >= lo) & (t["utc"] < hi)]
+    return sorted(set(t["utc"].dt.floor("1min")))
+
+
+@pytest.mark.parametrize("entry", ["run", "verify_then_run"])
+def test_homelab_old_tz_quarantine_is_rechecked_without_requests(tmp_path, entry):
+    """Rohmonate gecached, Juni/Juli mit Quarantaene-Marker der alten
+    Fest-EST-Pruefung, KEINE Store-Datei: neu pruefen (New York), bestehen,
+    schreiben - 0 HTTP-Requests, alter Marker blockiert nicht mehr."""
+    _seed_cache(tmp_path, HOMELAB_RAW)
+    for ym in [(2024, 6), (2024, 7)]:
+        _old_marker(tmp_path, ym)
+    assert not fh.store_path(tmp_path, SYM, 2024, 7).exists()
+    clock = Clock()
+    site = Site(clock)                                     # leer: jede Anfrage waere ein Fehler
+
+    if entry == "verify_then_run":
+        v = _verify(tmp_path, clock, site, (2024, 7))
+        assert v["exit_code"] == 0 and v["ok"], v.get("reason")
+        assert site.requests == 0 and v["requests"] == 0
+        for r in ("2024-06", "2024-07"):
+            tz = v["raw_months"][r]["timezone"]
+            assert tz["ok"] is True and tz["median_offset_h"] == -4 and tz["median_deviation_h"] == 0
+        assert not fh.store_path(tmp_path, SYM, 2024, 7).exists()      # verify schreibt kein Parquet
+
+    rep = do_run(tmp_path, site, clock, (2024, 7))
+    assert rep["exit_code"] == 0, rep
+    assert site.requests == 0 and rep["summary"]["requests"] == 0
+    assert rep["summary"]["months_written"] == ["2024-07"]
+    assert rep["quarantined"] == [] and rep["summary"]["months_quarantine"] == []
+    out = fh.store_path(tmp_path, SYM, 2024, 7)
+    t = pq.read_table(out)
+    assert t.schema.metadata[b"source_timezone"] == _meta_value(fh.SOURCE_TZ_META["tick"])
+    assert t.schema.metadata[b"histdata_mode"] == b"histdata_tick"
+    assert list(t.to_pandas()["ts"]) == _expected_minutes((2024, 7), [(2024, 6), (2024, 7)])
+    mrep = json.loads(fh.report_path(tmp_path, SYM, 2024, 7).read_text())
+    for r in ("2024-06", "2024-07"):
+        assert mrep["raw_months"][r]["timezone"]["ok"] is True
+        assert mrep["raw_months"][r]["timezone"]["median_offset_h"] == -4
+
+    # Winter (Dez/Jan, unter der alten Pruefung ok) ebenfalls ohne Requests
+    rep = do_run(tmp_path, site, clock, (2024, 1))
+    assert rep["exit_code"] == 0 and rep["summary"]["months_written"] == ["2024-01"], rep
+    assert site.requests == 0
+    assert list(pd.read_parquet(fh.store_path(tmp_path, SYM, 2024, 1))["ts"]) == \
+        _expected_minutes((2024, 1), [(2023, 12), (2024, 1)])
+
+    # alter Marker blockiert auch spaeter nicht: Store-Datei weg -> erneut gebaut
+    out.unlink()
+    rep = do_run(tmp_path, site, clock, (2024, 7))
+    assert rep["exit_code"] == 0 and rep["summary"]["months_written"] == ["2024-07"], rep
+    assert site.requests == 0
+    v = _verify(tmp_path, clock, site, (2024, 7))
+    assert v["exit_code"] == 0 and v["ok"] and site.requests == 0
+
+
+def _markers(root) -> dict:
+    d = fh.raw_dir(root, SYM, "tick")
+    return {p.name: p.read_bytes() for p in sorted(d.glob("*.quarantine"))}
+
+
+@pytest.mark.parametrize("entry", ["run", "verify"])
+def test_new_format_quarantine_of_bad_month_keeps_blocking(tmp_path, entry):
+    """Ein wirklich falscher Monat (UTC-gestempelt) wird von der NEUEN Pruefung
+    quarantaeniert; deren Marker blockiert weiter: kein erneutes Pruefen/
+    Neuschreiben des Markers, keine Requests, nichts geschrieben."""
+    _seed_cache(tmp_path, [(2024, 6), (2024, 7)], stamping="utc")
+    clock = Clock()
+    site = Site(clock)
+    rep = do_run(tmp_path, site, clock, (2024, 7))
+    assert rep["exit_code"] == 4 and rep["status"] == "quarantine", rep
+    assert site.requests == 0
+    assert not fh.store_path(tmp_path, SYM, 2024, 7).exists()
+    before = _markers(tmp_path)
+    assert before, "kein Quarantaene-Marker geschrieben"
+    for blob in before.values():
+        info = json.loads(blob)
+        assert info["accepted"] is False and info["reason"]
+
+    for k in range(1, 3):                                  # spaeteres "now": ein neu
+        later = NOW + timedelta(days=k)                    # geschriebener Marker haette
+        if entry == "run":                                 # ein anderes "since"
+            rep = do_run(tmp_path, site, clock, (2024, 7), now=later)
+            assert rep["exit_code"] == 4 and rep["status"] == "quarantine", rep
+            assert rep["summary"]["months_written"] == []
+        else:
+            v = _verify(tmp_path, clock, site, (2024, 7), now=later)
+            assert v["exit_code"] == 4 and not v["ok"]
+        assert site.requests == 0
+        assert _markers(tmp_path) == before                # Marker unveraendert (kein Neupruefen)
+        assert not fh.store_path(tmp_path, SYM, 2024, 7).exists()

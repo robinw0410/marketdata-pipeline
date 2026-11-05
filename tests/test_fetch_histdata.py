@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -37,6 +38,8 @@ def market_utc(symbol, start, end, step_s=60, early_close=None):
 
 
 def raw_stamps(utc_idx, stamping):
+    """ny: New-York-Ortszeit mit Sommerzeit (so stempelt HistData Ticks, gemessen);
+    est: fest UTC-5 (Annahme fuer M1); utc: falsch fuer beide Modi."""
     if stamping == "est":
         return (utc_idx - pd.Timedelta(hours=5)).tz_localize(None)
     if stamping == "ny":
@@ -45,12 +48,17 @@ def raw_stamps(utc_idx, stamping):
     return utc_idx.tz_localize(None)
 
 
-def raw_month_ticks(symbol, y, m, stamping="est", step_s=60, price=None, early_close=None):
-    """Ticks eines ROH-Monats: DataFrame raw (naiv), utc, bid, ask (Dateireihenfolge)."""
+def raw_month_ticks(symbol, y, m, stamping="ny", step_s=60, price=None, early_close=None,
+                    switch=None):
+    """Ticks eines ROH-Monats: DataFrame raw (naiv), utc, bid, ask (Dateireihenfolge).
+    Default New-York-Ortszeit (Tick-Modus); M1-Tests stempeln explizit "est".
+    switch=(utc_zeitpunkt, stamping): ab dann anders gestempelt (Regimewechsel)."""
     lo = pd.Timestamp(y, m, 1, tz="UTC") - pd.Timedelta(days=1)
     hi = pd.Timestamp(y, m, 1, tz="UTC") + pd.offsets.MonthBegin(1) + pd.Timedelta(days=1)
     utc = market_utc(symbol, lo, hi, step_s, early_close)
     raw = raw_stamps(utc, stamping)
+    if switch is not None:
+        raw = raw.where(utc < pd.Timestamp(switch[0], tz="UTC"), raw_stamps(utc, switch[1]))
     keep = (raw >= pd.Timestamp(y, m, 1)) & (raw < pd.Timestamp(y, m, 1) + pd.offsets.MonthBegin(1))
     raw, utc = raw[keep], utc[keep]
     base = price if price is not None else BASE_PRICE[symbol]
@@ -213,6 +221,9 @@ def test_parse_tick_csv_with_milliseconds_and_utc_conversion():
     assert (b0.bid_open, b0.bid_high, b0.bid_low, b0.bid_close) == (2063.12, 2063.30, 2063.10, 2063.30)
     assert (b0.ask_open, b0.ask_close, b0.tick_count) == (2063.45, 2063.60, 3)
     assert (bars["source"] == "histdata").all()
+    # Sommer: Tick-Rohzeit ist New York mit Sommerzeit (EDT, UTC-4)
+    summer = hd.parse_csv(b"20240702 165958000,2330.1,2330.4,0\n", "tick")
+    assert hd.ticks_to_bars(summer)["ts"].iloc[0] == pd.Timestamp("2024-07-02 20:59", tz="UTC")
 
 
 @pytest.mark.parametrize("csv,mode", [
@@ -260,40 +271,73 @@ def _raw_ms(df):
 
 
 @pytest.mark.parametrize("sym", ["XAUUSD", "XAGUSD", "EURUSD"])
-@pytest.mark.parametrize("ym", [(2024, 1), (2024, 7)])
-def test_tz_fixed_est_passes_winter_and_summer(sym, ym):
-    rep = hd.check_timezone(_raw_ms(raw_month_ticks(sym, *ym, stamping="est")), sym)
+@pytest.mark.parametrize("ym,off", [((2024, 1), -5), ((2024, 7), -4)])
+def test_tz_tick_new_york_local_passes_winter_and_summer(sym, ym, off):
+    rep = hd.check_timezone(_raw_ms(raw_month_ticks(sym, *ym, stamping="ny")), sym)
     assert rep["ok"], rep
+    assert rep["raw_tz"] == "America/New_York"
+    assert rep["median_offset_h"] == off and rep["median_deviation_h"] == 0
+    assert rep["share_expected"] == 1.0 and set(rep["expected_offsets"]) == {off}
+    assert set(rep["deviations"]) == {0}
+
+
+def test_tz_tick_dst_change_inside_month_passes():
+    """Maerz/November: erwarteter Offset wechselt je Anker (-5 -> -4 bzw. -4 -> -5)."""
+    for ym, offs in (((2024, 3), {-5, -4}), ((2024, 11), {-4, -5})):
+        rep = hd.check_timezone(_raw_ms(raw_month_ticks("XAUUSD", *ym)), "XAUUSD",
+                                hd.raw_month_bounds_ms(ym))
+        assert rep["ok"], rep["reason"]
+        assert set(rep["expected_offsets"]) == offs and set(rep["deviations"]) == {0}
+
+
+@pytest.mark.parametrize("sym", ["XAUUSD", "EURUSD"])
+def test_tz_tick_fixed_est_fails_in_summer(sym):
+    """Alte Annahme (fest UTC-5) passt fuer Ticks im Sommer nicht mehr."""
+    rep = hd.check_timezone(_raw_ms(raw_month_ticks(sym, 2024, 7, stamping="est")), sym)
+    assert not rep["ok"] and rep["median_offset_h"] == -5 and rep["median_deviation_h"] == -1
+    assert set(rep["expected_offsets"]) == {-4}
+    # im Winter ist fest UTC-5 = New-York-Ortszeit, nicht unterscheidbar (und korrekt)
+    assert hd.check_timezone(_raw_ms(raw_month_ticks(sym, 2024, 1, stamping="est")), sym)["ok"]
+
+
+@pytest.mark.parametrize("sym", ["XAUUSD", "XAGUSD", "EURUSD"])
+@pytest.mark.parametrize("ym", [(2024, 1), (2024, 7)])
+def test_tz_m1_fixed_est_passes_winter_and_summer(sym, ym):
+    rep = hd.check_timezone(_raw_ms(raw_month_ticks(sym, *ym, stamping="est")), sym, mode="m1")
+    assert rep["ok"], rep
+    assert rep["raw_tz"] == "Etc/GMT+5" and set(rep["expected_offsets"]) == {-5}
     assert rep["median_offset_h"] == -5 and rep["share_expected"] == 1.0
 
 
 @pytest.mark.parametrize("sym", ["XAUUSD", "EURUSD"])
-def test_tz_new_york_local_with_dst_fails_in_summer(sym):
-    rep = hd.check_timezone(_raw_ms(raw_month_ticks(sym, 2024, 7, stamping="ny")), sym)
-    assert not rep["ok"] and rep["median_offset_h"] == -4
-    # im Winter ist NY-Ortszeit = EST, nicht unterscheidbar (und korrekt)
-    assert hd.check_timezone(_raw_ms(raw_month_ticks(sym, 2024, 1, stamping="ny")), sym)["ok"]
+def test_tz_m1_new_york_local_with_dst_fails_in_summer(sym):
+    rep = hd.check_timezone(_raw_ms(raw_month_ticks(sym, 2024, 7, stamping="ny")), sym, mode="m1")
+    assert not rep["ok"] and rep["median_offset_h"] == -4 and rep["median_deviation_h"] == 1
+    assert hd.check_timezone(_raw_ms(raw_month_ticks(sym, 2024, 1, stamping="ny")), sym,
+                             mode="m1")["ok"]
 
 
+@pytest.mark.parametrize("mode", ["tick", "m1"])
 @pytest.mark.parametrize("ym", [(2024, 1), (2024, 7)])
-def test_tz_utc_stamped_fails(ym):
-    rep = hd.check_timezone(_raw_ms(raw_month_ticks("XAUUSD", *ym, stamping="utc")), "XAUUSD")
+def test_tz_utc_stamped_fails(ym, mode):
+    rep = hd.check_timezone(_raw_ms(raw_month_ticks("XAUUSD", *ym, stamping="utc")), "XAUUSD",
+                            mode=mode)
     assert not rep["ok"] and rep["median_offset_h"] in (0, 0.0)
 
 
 def test_tz_shift_in_mid_month_fails():
-    """Erste Monatshaelfte EST, zweite NY-Ortszeit (Sommerzeit) -> Regimewechsel."""
-    est = raw_month_ticks("XAUUSD", 2024, 7, stamping="est")
+    """Erste Monatshaelfte New-York-Ortszeit, zweite fest UTC-5 -> Regimewechsel."""
     ny = raw_month_ticks("XAUUSD", 2024, 7, stamping="ny")
+    est = raw_month_ticks("XAUUSD", 2024, 7, stamping="est")
     cut = pd.Timestamp("2024-07-15", tz="UTC")
-    mixed = pd.concat([est[est["utc"] < cut], ny[ny["utc"] >= cut]])
+    mixed = pd.concat([ny[ny["utc"] < cut], est[est["utc"] >= cut]])
     rep = hd.check_timezone(_raw_ms(mixed), "XAUUSD")
     assert not rep["ok"] and rep["longest_deviating_run"] >= hd.TZ_MAX_RUN
 
 
 def test_tz_one_hour_regression_fails():
     """Wiederholte Stunde (Uhr zurueckgestellt) in Dateireihenfolge -> Quarantaene."""
-    df = raw_month_ticks("XAUUSD", 2024, 10, stamping="est")
+    df = raw_month_ticks("XAUUSD", 2024, 10)
     ms = _raw_ms(df)
     cut = int(np.searchsorted(ms, ms[0] + 20 * 86_400_000))
     shifted = np.concatenate([ms[:cut], ms[cut:] - 3_600_000])
@@ -302,7 +346,7 @@ def test_tz_one_hour_regression_fails():
 
 
 def test_tz_tolerates_holiday_early_close_and_small_reversals():
-    df = raw_month_ticks("XAUUSD", 2024, 7, stamping="est", early_close={date(2024, 7, 5): 13})
+    df = raw_month_ticks("XAUUSD", 2024, 7, early_close={date(2024, 7, 5): 13})
     ms = _raw_ms(df)
     ms[100], ms[101] = ms[101], ms[100]                 # kleine Vertauschung (Sekunden)
     rep = hd.check_timezone(ms, "XAUUSD")
@@ -311,7 +355,7 @@ def test_tz_tolerates_holiday_early_close_and_small_reversals():
 
 
 def test_tz_needs_enough_anchors():
-    df = raw_month_ticks("EURUSD", 2024, 7, stamping="est")
+    df = raw_month_ticks("EURUSD", 2024, 7)
     few = df[df["utc"] < pd.Timestamp("2024-07-04", tz="UTC")]
     rep = hd.check_timezone(_raw_ms(few), "EURUSD")
     assert not rep["ok"] and "Ankerpunkte" in rep["reason"]
@@ -382,8 +426,8 @@ def test_output_schema_identical_to_dukascopy(tmp_path, clock):
 
 # ------------------------------------------------------------------ m1 ---
 def test_m1_mode_bid_only_yearly_zip(tmp_path, clock):
-    jun = raw_month_ticks("XAUUSD", 2024, 6)
-    jul = raw_month_ticks("XAUUSD", 2024, 7)
+    jun = raw_month_ticks("XAUUSD", 2024, 6, stamping="est")      # M1: fest UTC-5
+    jul = raw_month_ticks("XAUUSD", 2024, 7, stamping="est")
     csv = m1_csv(pd.concat([jun, jul]))
     lines = csv.decode().splitlines()
     dup_exact = lines[10]                                   # Juni: exaktes Duplikat
@@ -582,12 +626,17 @@ def test_validation_error_exit_2(tmp_path, clock):
 
 
 def test_timezone_mismatch_quarantine_exit_4(tmp_path, clock):
-    site = Site(clock, {("T", "202406"): tick_zip("XAUUSD", 2024, 6, stamping="ny"),
-                        ("T", "202407"): tick_zip("XAUUSD", 2024, 7, stamping="ny")})
+    """Ticks fest UTC-5 gestempelt (alte Annahme) -> im Sommer Quarantaene."""
+    site = Site(clock, {("T", "202406"): tick_zip("XAUUSD", 2024, 6, stamping="est"),
+                        ("T", "202407"): tick_zip("XAUUSD", 2024, 7, stamping="est")})
     rep = run(tmp_path, clock, site, start=(2024, 7))
     assert rep["exit_code"] == 4 and rep["status"] == "quarantine"
     q = rep["quarantine"][0]
-    assert "Zeitzone" in q["reason"] and q["check"]["median_offset_h"] == -4
+    assert "Zeitzone" in q["reason"] and q["check"]["median_offset_h"] == -5
+    assert q["check"]["median_deviation_h"] == -1
+    marker = json.loads(hd.Unit("XAUUSD", "tick", 2024, 6).qmarker(tmp_path, (2024, 6)).read_text())
+    assert marker["tz_check_version"] == hd.TZ_CHECK_VERSION
+    assert marker["raw_tz"] == "America/New_York"
     assert hd.Unit("XAUUSD", "tick", 2024, 6).qmarker(tmp_path, (2024, 6)).exists()
     assert not hd.store_path(tmp_path, "XAUUSD", 2024, 7).exists()
     n = site.requests
@@ -684,38 +733,39 @@ def _zip_from(df, sym, y, m, status="HistData.com status report\n"):
     return make_zip(sym, "T", f"{y}{m:02d}", tick_csv(df), status)
 
 
-def eu_dst_march(sym="XAUUSD"):
-    """Rohmonat 2024-03: UTC-5, ab EU-Umstellung 31.3. 01:00 UTC aber UTC-4 (Hypothese)."""
-    utc = market_utc(sym, pd.Timestamp("2024-02-29", tz="UTC"), pd.Timestamp("2024-04-02", tz="UTC"))
-    off = np.where(utc >= pd.Timestamp("2024-03-31 01:00", tz="UTC"), 4, 5)
-    raw = (utc - pd.to_timedelta(off, unit="h")).tz_localize(None)
-    keep = (raw >= pd.Timestamp("2024-03-01")) & (raw < pd.Timestamp("2024-04-01"))
-    i = (utc[keep].as_unit("ms").asi8 // 60_000).astype(float)
-    bid = np.round(BASE_PRICE[sym] * (1 + 0.002 * np.sin(i / 97.0)), 5)
-    return pd.DataFrame({"raw": raw[keep], "utc": utc[keep], "bid": bid, "ask": bid + SPREAD[sym]})
+# Regimewechsel kurz vor Monatsende (Hypothese: Quelle stellt wie die EU um):
+# tick: New York (EDT) bis 27.10. 01:00 UTC, danach fest UTC-5;
+# m1: fest UTC-5 bis 31.3. 01:00 UTC, danach New York (EDT).
+SWITCH = {"tick": ((2024, 10), "ny", ("2024-10-27 01:00", "est")),
+          "m1": ((2024, 3), "est", ("2024-03-31 01:00", "ny"))}
 
 
-def test_review1_dst_switch_at_month_end_is_caught():
-    df = eu_dst_march()
-    ms = _raw_ms(df)
-    rep = hd.check_timezone(ms, "XAUUSD", hd.raw_month_bounds_ms((2024, 3)))
-    assert hd.check_timezone(ms, "XAUUSD")["edge_violations"]     # Rand auch ohne bounds
+@pytest.mark.parametrize("mode", ["tick", "m1"])
+def test_review1_dst_switch_at_month_end_is_caught(mode):
+    ym, stamping, switch = SWITCH[mode]
+    ms = _raw_ms(raw_month_ticks("XAUUSD", *ym, stamping=stamping, switch=switch))
+    rep = hd.check_timezone(ms, "XAUUSD", hd.raw_month_bounds_ms(ym), mode=mode)
+    assert hd.check_timezone(ms, "XAUUSD", mode=mode)["edge_violations"]   # Rand auch ohne bounds
     assert not rep["ok"] and rep["edge_violations"] and "Monatsrand" in rep["reason"]
+    assert {e["deviation_h"] for e in rep["edge_violations"]} == {-1 if mode == "tick" else 1}
     # Feiertag am Monatsrand (frueher Schluss, >= 2 h) bleibt erlaubt
-    hol = raw_month_ticks("XAUUSD", 2024, 7, early_close={date(2024, 7, 3): 13})
-    assert hd.check_timezone(_raw_ms(hol), "XAUUSD", hd.raw_month_bounds_ms((2024, 7)))["ok"]
+    hol = raw_month_ticks("XAUUSD", 2024, 7, stamping="ny" if mode == "tick" else "est",
+                          early_close={date(2024, 7, 3): 13})
+    assert hd.check_timezone(_raw_ms(hol), "XAUUSD", hd.raw_month_bounds_ms((2024, 7)), mode=mode)["ok"]
 
 
 def test_review1_dst_switch_at_month_end_not_written(tmp_path, clock):
-    site = Site(clock, {("T", "202402"): tick_zip("XAUUSD", 2024, 2),
-                        ("T", "202403"): _zip_from(eu_dst_march(), "XAUUSD", 2024, 3)})
-    rep = run(tmp_path, clock, site, start=(2024, 3))
-    assert rep["exit_code"] == 4 and not hd.store_path(tmp_path, "XAUUSD", 2024, 3).exists()
+    ym, stamping, switch = SWITCH["tick"]
+    oct_ = raw_month_ticks("XAUUSD", *ym, stamping=stamping, switch=switch)
+    site = Site(clock, {("T", "202409"): tick_zip("XAUUSD", 2024, 9),
+                        ("T", "202410"): _zip_from(oct_, "XAUUSD", 2024, 10)})
+    rep = run(tmp_path, clock, site, start=(2024, 10))
+    assert rep["exit_code"] == 4 and not hd.store_path(tmp_path, "XAUUSD", 2024, 10).exists()
 
 
 def test_review1_following_month_starting_shifted_blocks_month(tmp_path, clock):
     files = {("T", "202402"): tick_zip("XAUUSD", 2024, 2), ("T", "202403"): tick_zip("XAUUSD", 2024, 3),
-             ("T", "202404"): tick_zip("XAUUSD", 2024, 4, stamping="ny")}
+             ("T", "202404"): tick_zip("XAUUSD", 2024, 4, stamping="est")}
     site = Site(clock, files)
     rep = run(tmp_path, clock, site, start=(2024, 3), end=(2024, 4))
     assert rep["exit_code"] == 4 and rep["summary"]["months_written"] == []
@@ -727,16 +777,16 @@ def test_review1_following_month_starting_shifted_blocks_month(tmp_path, clock):
 
 
 def test_review6_thin_market_night_gaps_are_no_break_anchors():
-    df = raw_month_ticks("XAGUSD", 2024, 1, stamping="est")
+    df = raw_month_ticks("XAGUSD", 2024, 1)
     raw = pd.DatetimeIndex(df["raw"])
     thin = df[~((raw.hour == 2) & (raw.dayofweek <= 3))]     # 02-03 Uhr roh ohne Ticks
     rep = hd.check_timezone(_raw_ms(thin), "XAGUSD", hd.raw_month_bounds_ms((2024, 1)))
     assert rep["ok"], rep["reason"]
     assert rep["ignored_break_gaps"] > 0 and rep["share_expected"] == 1.0
-    ny = raw_month_ticks("XAGUSD", 2024, 7, stamping="ny")
-    raw = pd.DatetimeIndex(ny["raw"])
-    thin_ny = ny[~((raw.hour == 2) & (raw.dayofweek <= 3))]
-    assert not hd.check_timezone(_raw_ms(thin_ny), "XAGUSD", hd.raw_month_bounds_ms((2024, 7)))["ok"]
+    est = raw_month_ticks("XAGUSD", 2024, 7, stamping="est")      # Ticks fest UTC-5: falsch
+    raw = pd.DatetimeIndex(est["raw"])
+    thin_est = est[~((raw.hour == 2) & (raw.dayofweek <= 3))]
+    assert not hd.check_timezone(_raw_ms(thin_est), "XAGUSD", hd.raw_month_bounds_ms((2024, 7)))["ok"]
 
 
 def test_review2_429_on_post_restarts_with_fresh_token(tmp_path, clock):
@@ -876,8 +926,8 @@ def test_review_low_short_first_month_checked_jointly(tmp_path, clock):
 
 
 def test_review_low_new_download_clears_quarantine(tmp_path, clock):
-    bad = {("T", "202406"): tick_zip("XAUUSD", 2024, 6, stamping="ny"),
-           ("T", "202407"): tick_zip("XAUUSD", 2024, 7, stamping="ny")}
+    bad = {("T", "202406"): tick_zip("XAUUSD", 2024, 6, stamping="est"),
+           ("T", "202407"): tick_zip("XAUUSD", 2024, 7, stamping="est")}
     assert run(tmp_path, clock, Site(clock, bad), start=(2024, 7))["exit_code"] == 4
     for m in (6, 7):                                                # ZIP loeschen = neu laden
         hd.Unit("XAUUSD", "tick", 2024, m).path(tmp_path).unlink()
@@ -894,3 +944,181 @@ def test_review4_no_data_ever_is_not_silently_unavailable(tmp_path, clock):
     rep = run(tmp_path, clock, site, now=NOW + timedelta(hours=25))
     assert rep["exit_code"] == 4 and rep["summary"]["months_unavailable"] == {}
     assert rep["quarantined"][0]["kind"] == "missing_in_history"
+
+
+# ================================== Zeitzone: New York mit Sommerzeit (Ticks) ---
+def _ms(s):
+    return int(pd.Timestamp(s).value // 1_000_000)
+
+
+def test_raw_to_utc_ms_new_york_edges_and_m1_fixed():
+    ok = {"2024-03-10 01:59:59.999": "2024-03-10 06:59:59.999",   # letzte EST-ms
+          "2024-03-10 03:00:00": "2024-03-10 07:00:00",            # erste EDT-ms
+          "2024-11-03 00:59:59.999": "2024-11-03 04:59:59.999",
+          "2024-11-03 02:00:00": "2024-11-03 07:00:00",
+          "2024-07-15 12:00": "2024-07-15 16:00", "2024-01-15 12:00": "2024-01-15 17:00"}
+    raw = np.array([_ms(k) for k in ok], dtype=np.int64)
+    assert list(hd.raw_to_utc_ms(raw, "tick")) == [_ms(v) for v in ok.values()]
+    assert list(hd.raw_to_utc_ms(raw, "m1")) == list(raw + 5 * 3_600_000)      # fest UTC-5
+    assert hd.raw_to_utc_ms(np.array([], dtype=np.int64), "tick").dtype == np.int64
+    for bad, word in (("2024-03-10 02:00:00", "nicht existierender"),
+                      ("2024-03-10 02:59:59.999", "nicht existierender"),
+                      ("2024-11-03 01:00:00", "mehrdeutiger"),
+                      ("2024-11-03 01:59:59.999", "mehrdeutiger"),
+                      ("2006-04-02 02:30:00", "nicht existierender")):     # alte US-Regel
+        with pytest.raises(hd.TimezoneError, match=word) as e:
+            hd.raw_to_utc_ms(np.array([_ms("2024-07-01"), _ms(bad)]), "tick")
+        assert bad[:19] in str(e.value) and isinstance(e.value, hd.FormatError)
+    # m1 (fest UTC-5) kennt keine Luecken/Doppelstunden
+    assert hd.raw_to_utc_ms(np.array([_ms("2024-11-03 01:30")]), "m1")[0] == _ms("2024-11-03 06:30")
+
+
+def test_month_boundary_stitching_summer(tmp_path, clock):
+    site = Site(clock, {("T", "202406"): tick_zip("XAUUSD", 2024, 6),
+                        ("T", "202407"): tick_zip("XAUUSD", 2024, 7)})
+    rep = run(tmp_path, clock, site, start=(2024, 7))
+    assert rep["exit_code"] == 0, rep
+    t = pq.read_table(hd.store_path(tmp_path, "XAUUSD", 2024, 7))
+    assert t.schema.metadata[b"source_timezone"] == hd.SOURCE_TZ_META["tick"].encode()
+    df = t.to_pandas()
+    utc = pd.concat([raw_month_ticks("XAUUSD", 2024, k)["utc"] for k in (6, 7)])
+    utc = utc[(utc >= pd.Timestamp("2024-07-01", tz="UTC")) & (utc < pd.Timestamp("2024-08-01", tz="UTC"))]
+    assert list(df["ts"]) == sorted(set(utc.dt.floor("1min")))
+    # 1.7. 00:00-04:00 UTC stammt aus Rohmonat Juni (30.6. 20:00-24:00 EDT), nur 4 h
+    jun = raw_month_ticks("XAUUSD", 2024, 6)
+    first = jun[jun["utc"] >= pd.Timestamp("2024-07-01", tz="UTC")].iloc[0]
+    assert first["raw"] == pd.Timestamp("2024-06-30 20:00:00.137")
+    assert df["ts"].iloc[0] == pd.Timestamp("2024-07-01 00:00", tz="UTC")
+    assert df["bid_open"].iloc[0] == first["bid"]
+    assert df["ts"].iloc[-1] == pd.Timestamp("2024-07-31 23:59", tz="UTC")
+    mrep = json.loads(hd.report_path(tmp_path, "XAUUSD", 2024, 7).read_text())
+    assert set(mrep["raw_months"]["2024-07"]["timezone"]["expected_offsets"]) == {"-4"}
+    assert mrep["raw_months"]["2024-07"]["timezone"]["median_offset_h"] == -4
+
+
+def test_needed_raw_months_and_month_end_follow_dst():
+    assert hd.needed("XAUUSD", (2024, 7)) == [(2024, 6), (2024, 7)]
+    assert hd.needed("XAUUSD", (2024, 1), "m1") == [(2023, 12), (2024, 1)]
+    # Rohmonat Juli endet (EDT) am 1.8. 04:00 UTC, M1 (fest UTC-5) um 05:00; + 6 h Settle
+    assert hd.raw_month_end_utc((2024, 7)) == datetime(2024, 8, 1, 4, tzinfo=UTC)
+    assert hd.Unit("XAUUSD", "tick", 2024, 7).end_utc == datetime(2024, 8, 1, 4, tzinfo=UTC)
+    assert hd.Unit("XAUUSD", "m1", 2024, 7).end_utc == datetime(2024, 8, 1, 5, tzinfo=UTC)
+    assert hd._month_closed(datetime(2024, 8, 1, 10, tzinfo=UTC), (2024, 7), "tick")
+    assert not hd._month_closed(datetime(2024, 8, 1, 9, 59, tzinfo=UTC), (2024, 7), "tick")
+    assert not hd._month_closed(datetime(2024, 8, 1, 10, 59, tzinfo=UTC), (2024, 7), "m1")
+
+
+def test_tick_at_ambiguous_local_time_quarantines_month(tmp_path, clock):
+    """Tick in der doppelten Stunde (3.11. 01:30 New York): nie raten -> Exit 4."""
+    nov = raw_month_ticks("XAUUSD", 2024, 11)
+    extra = nov.iloc[[0]].assign(raw=pd.Timestamp("2024-11-03 01:30:00"))
+    nov = pd.concat([nov, extra]).sort_values("raw", kind="stable")
+    site = Site(clock, {("T", "202410"): tick_zip("XAUUSD", 2024, 10),
+                        ("T", "202411"): _zip_from(nov, "XAUUSD", 2024, 11)})
+    rep = run(tmp_path, clock, site, start=(2024, 11), now=datetime(2025, 1, 15, tzinfo=UTC))
+    assert rep["exit_code"] == 4, rep
+    q = rep["quarantine"][0]
+    assert q["raw_month"] == "2024-11" and "mehrdeutiger Ortszeit" in q["reason"]
+    assert "2024-11-03 01:30:00.000" in q["reason"]
+    assert not hd.store_path(tmp_path, "XAUUSD", 2024, 11).exists()
+    assert hd.Unit("XAUUSD", "tick", 2024, 11).qmarker(tmp_path, (2024, 11)).exists()
+
+
+OLD_TZ_META = b"EST fixed UTC-5, converted to UTC, checked per month"
+
+
+def _make_old_store_file(path, shift_h):
+    """Monatsdatei wie von der alten Version (fest UTC-5) geschrieben."""
+    t = pq.read_table(path)
+    df = t.to_pandas()
+    df["ts"] = df["ts"] + pd.Timedelta(hours=shift_h)
+    meta = dict(t.schema.metadata)
+    meta[b"source_timezone"] = OLD_TZ_META
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False).replace_schema_metadata(meta), path)
+
+
+def test_stale_timezone_store_files_rebuilt_from_cache(tmp_path, clock, caplog):
+    files = {("T", f"{y}{m:02d}"): tick_zip("XAUUSD", y, m)
+             for y, m in ((2023, 12), (2024, 1), (2024, 6), (2024, 7))}
+    site = Site(clock, files)
+    for ym in ((2024, 1), (2024, 7)):
+        assert run(tmp_path, clock, site, start=ym)["exit_code"] == 0
+    good = {ym: pd.read_parquet(hd.store_path(tmp_path, "XAUUSD", *ym)) for ym in ((2024, 1), (2024, 7))}
+    # Winter war zufaellig richtig, Sommer um 1 h verschoben - beide neu bauen
+    _make_old_store_file(hd.store_path(tmp_path, "XAUUSD", 2024, 1), 0)
+    _make_old_store_file(hd.store_path(tmp_path, "XAUUSD", 2024, 7), -1)
+    empty = Site(clock)
+    for ym, df in good.items():
+        with caplog.at_level("WARNING", logger="histdata"):
+            rep = run(tmp_path, clock, empty, start=ym)
+        assert rep["exit_code"] == 0, rep
+        assert empty.requests == 0                                  # nur Roh-Cache
+        assert rep["rebuilt_timezone"] == [f"{ym[0]}-{ym[1]:02d}"]
+        assert rep["summary"]["months_rebuilt_timezone"] == rep["rebuilt_timezone"]
+        out = hd.store_path(tmp_path, "XAUUSD", *ym)
+        assert hd.stored_timezone(out) == hd.SOURCE_TZ_META["tick"]
+        pd.testing.assert_frame_equal(pd.read_parquet(out), df)
+        # danach nichts mehr zu tun
+        rep = run(tmp_path, clock, empty, start=ym)
+        assert rep["rebuilt_timezone"] == [] and rep["summary"]["months_skipped_existing"] == 1
+    assert any("source_timezone" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+    # m1-Datei mit altem Metadatum wird ebenso neu gebaut (Inhalt gleich, fest UTC-5)
+    m1 = make_zip("XAUUSD", "M1", "2024", m1_csv(pd.concat(
+        [raw_month_ticks("XAUUSD", 2024, k, stamping="est") for k in (6, 7)])))
+    assert run(tmp_path, clock, Site(clock, {("M1", "2024"): m1}), start=(2024, 7), mode="m1",
+               now=datetime(2025, 3, 1, tzinfo=UTC))["exit_code"] == 0
+    out = hd.store_path(tmp_path, "XAUUSD", 2024, 7, "m1")
+    _make_old_store_file(out, 0)
+    rep = run(tmp_path, clock, Site(clock), start=(2024, 7), mode="m1", now=datetime(2025, 3, 1, tzinfo=UTC))
+    assert rep["exit_code"] == 0 and rep["rebuilt_timezone"] == ["2024-07"]
+    assert hd.stored_timezone(out) == hd.SOURCE_TZ_META["m1"]
+
+
+def test_old_hypothesis_quarantine_marker_is_rechecked(tmp_path, clock, caplog):
+    files = {("T", "202406"): tick_zip("XAUUSD", 2024, 6), ("T", "202407"): tick_zip("XAUUSD", 2024, 7)}
+    assert run(tmp_path, clock, Site(clock, files), start=(2024, 7))["exit_code"] == 0
+    hd.store_path(tmp_path, "XAUUSD", 2024, 7).unlink()
+    # Marker wie von der alten Pruefung (v1, fest UTC-5) geschrieben
+    old = {"reason": "Zeitzone passt nicht zu fest UTC-5: Median-Offset -4 h statt -5 h; "
+                     "nur 0% der Anker bei -5 h",
+           "check": {"expected_offset_h": -5, "median_offset_h": -4.0, "first_offset_h": -4},
+           "since": "2025-11-01T00:00:00+00:00", "accepted": False}
+    markers = [hd.Unit("XAUUSD", "tick", 2024, m).qmarker(tmp_path, (2024, m)) for m in (6, 7)]
+    for q in markers:
+        q.write_text(json.dumps(old))
+    empty = Site(clock)
+    with caplog.at_level("WARNING", logger="histdata"):
+        rep = run(tmp_path, clock, empty, start=(2024, 7))
+    assert rep["exit_code"] == 0, rep["quarantined"]
+    assert empty.requests == 0 and rep["summary"]["months_written"] == ["2024-07"]
+    assert not any(q.exists() for q in markers)                    # neu geprueft: ok
+    assert any("aelterer Zeitzonen-Hypothese" in r.getMessage() for r in caplog.records)
+    # Marker der aktuellen Version blockiert weiterhin (ohne Neupruefung)
+    hd.store_path(tmp_path, "XAUUSD", 2024, 7).unlink()
+    cur = {**old, "reason": "Zeitzone passt nicht zu America/New_York: test",
+           "raw_tz": "America/New_York", "tz_check_version": hd.TZ_CHECK_VERSION}
+    markers[1].write_text(json.dumps(cur))
+    rep = run(tmp_path, clock, empty, start=(2024, 7))
+    assert rep["exit_code"] == 4 and rep["quarantine"][0]["reason"].endswith("test")
+    # alter, aber manuell freigegebener Marker gilt weiter (Entscheidung des Menschen)
+    markers[1].write_text(json.dumps({**old, "accepted": True}))
+    rep = run(tmp_path, clock, empty, start=(2024, 7))
+    assert rep["exit_code"] == 0 and markers[1].exists()
+
+
+def test_stale_store_file_leaves_store_even_if_rebuild_fails(tmp_path, clock):
+    """Scheitert der Neubau, sieht der Bot eine Luecke statt eines verschobenen Monats."""
+    files = {("T", "202406"): tick_zip("XAUUSD", 2024, 6), ("T", "202407"): tick_zip("XAUUSD", 2024, 7)}
+    assert run(tmp_path, clock, Site(clock, files), start=(2024, 7))["exit_code"] == 0
+    out = hd.store_path(tmp_path, "XAUUSD", 2024, 7)
+    _make_old_store_file(out, -1)
+    for z in hd.raw_dir(tmp_path, "XAUUSD", "tick").rglob("*.zip"):      # kein Roh-Cache mehr
+        z.unlink()
+    rep = run(tmp_path, clock, Site(clock), start=(2024, 7))           # Server liefert nichts
+    assert rep["exit_code"] != 0 and rep["rebuilt_timezone"] == ["2024-07"]
+    assert not out.exists()
+    assert rep["summary"]["months_stale_timezone_not_rebuilt"] == {"2024-07": OLD_TZ_META.decode()}
+    stale = list((tmp_path / "metals" / "stale").rglob("XAUUSD-1m-2024-07.parquet.*.stale"))
+    assert len(stale) == 1 and hd.stored_timezone(stale[0]) == OLD_TZ_META.decode()
+    # ParquetSource des Bots liest nur metals/source=*/... -> die alte Datei ist unsichtbar
+    assert not list((tmp_path / "metals").glob("source=*/**/*.stale"))

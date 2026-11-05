@@ -235,13 +235,29 @@ Two modes (`--mode`):
 
 Time zone:
 
-- HistData documents its timestamps as **EST without daylight saving
-  (fixed UTC-5)**, so `ts_utc = raw + 5 h`, with no DST logic.
-- A UTC month M therefore needs raw months M-1 (its last 5 hours) and M. It
-  is written only when both are present, or when M-1 is before the symbol's
+- **Tick timestamps are New York local time with daylight saving**
+  (`America/New_York`: UTC-5 in winter, UTC-4 in summer), although HistData
+  documents "EST without daylight saving". This was measured in the homelab
+  on real XAUUSD ticks: in 2024-07 every one of the 38 anchors sat at -4 h
+  (daily break 16:59:58 -> 18:00:01, weekly close Friday 16:59:58, weekly
+  open Sunday 18:00:01, which are exactly the New York session times);
+  2024-01 sat at -5 h.
+- **M1 keeps the documented fixed UTC-5** (`Etc/GMT+5`). This is **not
+  verified** for M1. Check it with
+  `--mode m1 --verify-month 2024-07` before relying on M1 summer months.
+- The zones live in `RAW_TZ = {"tick": "America/New_York", "m1": "Etc/GMT+5"}`.
+  `raw_to_utc_ms` reads the raw digits as wall-clock time in that zone and
+  converts them exactly to UTC (vectorized). A local time that does not
+  exist (spring-forward gap, e.g. 2024-03-10 02:00–02:59:59.999) or is
+  ambiguous (fall-back hour, e.g. 2024-11-03 01:00–01:59:59.999) is never
+  guessed. The market is closed then, so such a tick raises `TimezoneError`
+  and the raw month goes to quarantine (exit 4).
+- A UTC month M therefore needs raw months M-1 (its last 4 hours in EDT, 5
+  hours in EST) and M; the raw months are computed from `RAW_TZ`. M is
+  written only when both are present, or when M-1 is before the symbol's
   history or confirmed empty.
-- The claim is **checked in code for every raw month**. Anchor points are
-  taken from the data:
+- The time zone is **checked in code for every raw month**. Anchor points
+  are taken from the data:
   - weekly close (expected Friday 17:00 New York);
   - weekly open (expected Sunday 18:00 New York for metals, 17:00 for
     EURUSD);
@@ -249,17 +265,20 @@ Time zone:
     starting within 3 h of the expected break count; thin markets such as
     silver have other night-time gaps, and those are ignored.
 
-  Expected times come from `zoneinfo` `America/New_York`, so they include
-  DST. Each anchor gives an implied UTC offset.
+  Expected market times come from `zoneinfo` `America/New_York`. Each
+  anchor gives an implied offset (raw minus UTC). The expected offset is
+  taken per anchor from `RAW_TZ[mode]` at that moment (tick: -4 h in EDT,
+  -5 h in EST; m1: always -5 h). Decisions use the **deviation** = implied
+  minus expected.
 - The month passes only if all of these hold:
   - at least 3 anchors
-  - median offset -5 h
-  - at least 60 % of anchors at -5 h
-  - no run of 3 consecutive anchors with the same other offset (that means a
-    shift in mid-month)
-  - **no anchor off by exactly 1 h in the first or last 72 h** of the raw
-    month (a clock change at the month edge; holiday early closes are off by
-    2 h or more and stay allowed)
+  - median deviation 0
+  - at least 60 % of anchors with deviation 0
+  - no run of 3 consecutive anchors with the same non-zero deviation (that
+    means a shift in mid-month)
+  - **no anchor with a deviation of exactly 1 h in the first or last 72 h**
+    of the raw month (a clock change at the month edge; holiday early
+    closes are off by 2 h or more and stay allowed)
   - no timestamp jumps back by 30 minutes or more in file order (that means
     a clock change)
 - If the following raw month M+1 is cached and starts 1 h off, month M is
@@ -276,15 +295,25 @@ Time zone:
     marker and the month is checked again.
   - Setting `"accepted": true` in the marker releases the month after a
     manual check.
-- **Third-party data suggests the claim may not hold in summer**: one-hour
-  regressions in late October and an August archive whose Sunday open is one
-  hour late (see the research doc). Run `--verify-month` on a winter and a
-  summer month before the first full run.
+  - Markers carry `raw_tz` and `tz_check_version`. A marker from an older
+    check version (the previous fixed-UTC-5 check for ticks) is removed
+    with a WARNING and the raw month is re-checked without a download,
+    unless it says `"accepted": true`.
+- Monthly files carry the parquet metadata `source_timezone`
+  (`America/New_York (mit Sommerzeit) -> UTC, je Monat geprueft` for tick,
+  `Etc/GMT+5 (fest UTC-5) -> UTC, je Monat geprueft` for m1). A file of the
+  same mode with a different value (written by the previous fixed-UTC-5
+  code; its summer months are shifted by 1 h) is **rebuilt automatically
+  from the raw cache on the next run**, with no new requests. The run logs
+  a WARNING and lists the months under `rebuilt_timezone` in the run
+  report; `summary.months_rebuilt_timezone` holds the ones written and
+  `summary.months_stale_timezone_not_rebuilt` the ones that failed (the old
+  file stays and the next run retries).
 
 Unpublished and missing data:
 
 - A month is requested only after its raw month has ended (UTC month end
-  + 5 h + 6 h settle time).
+  + 4 h in EDT or + 5 h in EST/m1, plus 6 h settle time).
 - An empty answer within 45 days of month end is **pending** (exit 3). It is
   checked again at most every 24 h.
 - An older empty answer is "no data". It is unconfirmed (exit 3) until a
@@ -389,6 +418,9 @@ runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
 runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
   /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
   --symbol XAUUSD --verify-month 2024-07          # summer month: DST check
+runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
+  /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
+  --symbol XAUUSD --mode m1 --verify-month 2024-07   # M1 time zone (unverified)
 # full history (default start = history start of the symbol)
 runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
   /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
