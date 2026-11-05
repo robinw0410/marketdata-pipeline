@@ -86,11 +86,14 @@ The candle format is taken from `dukascopy-node` 1.46.4 (the last version that
 used the bi5 datafeed; line references in `DATA.md` and the script docstring)
 and was **not verified live**. The order of the four price fields is
 disputed (`dukascopy-node`: open, close, low, high; another source: open, high,
-low, close), so it is **determined per file from the data**: exactly one of
-the two orders must satisfy `high >= max(open, close)` and
-`low <= min(open, close)` for every non-flat candle, otherwise the file
-counts as a failed download ("field order unclear") and its month is not
-written. Check the format against ticks on the target machine with:
+low, close), so it is **determined per file from the data**: an order fits
+if `high >= max(open, close)` and `low <= min(open, close)` for every non-flat
+candle. Exactly one fits: used. Both fit (only possible if `close == high` in
+every active candle, where both readings give identical values): used,
+reported as `ambiguous`. **None fits: the file goes to quarantine**
+(`<name>.quarantine`, not cached, not retried), the month is not written, the
+run report lists it under `quarantine`, and the exit code is **4** (manual
+check needed). Check the format against ticks on the target machine with:
 
 ```bash
 python scripts/fetch_dukascopy.py --symbol XAUUSD --verify-day 2024-03-06
@@ -99,28 +102,44 @@ python scripts/fetch_dukascopy.py --symbol XAUUSD --verify-day 2024-03-06
 It loads the day's 24 tick files and both candle files, aggregates the ticks to
 minutes and compares OHLC per side (detected field order, minutes only in one
 source, max deviation in points, volumes). Exit 0 = match, 4 = deviation above
-`--verify-tol` (points, default 0.5) / `--verify-max-share` (default 0), 3 =
-download failed. Report: `metals/reports/SYM-verify-YYYY-MM-DD.json`.
+`--verify-tol` (points, default 0.5) / `--verify-max-share` (default 0) or a
+quarantined file, 3 = download failed. Report:
+`metals/reports/SYM-verify-YYYY-MM-DD.json`. Delete a `.quarantine` file to
+have it downloaded again.
 
 Fault tolerance and throttling:
 
 - A file that still fails after `--attempts` (5) does **not** stop the run:
   it is collected, the run continues, and all failures are retried at the end
   in `--final-retries` rounds (2), each after `--final-wait` seconds (300).
-- A monthly file is written **only if the month has no unresolved failures**
-  (404 = no data is not a failure), so a month with gaps is never mistaken for
-  a finished one. The next run fetches only the missing files (raw cache,
-  404 markers) and then writes the month.
+- A monthly file is written **only if the month is complete**: no unresolved
+  failures, no unconfirmed "no data" answers, no quarantined files. The next
+  run fetches only the missing files and then writes the month.
+- "No data" (404 or an empty 200 response) is cached as a marker
+  (`<name>.404` / `<name>.empty`, JSON with `first_seen` and `confirmed`),
+  never as a 0-byte raw file. On weekends, Dec 25 and Jan 1 it is final at
+  once. **On weekdays it is unconfirmed** (a gap, exit 3) until a request at
+  least 24 h later again returns no data (in tick mode this applies to 404
+  only; empty weekday hours are normal). A candle day with data on one side
+  only is treated the same way. Candle files are requested only 6 h after the
+  end of the day, months only 6 h after month end.
+- Corrupt cache files (LZMA error, 0 bytes) are moved aside as `<name>.corrupt`
+  and downloaded again. Validation errors are collected per month; the other
+  months continue and the run exits 2 at the end.
 - The run report `metals/reports/SYM-dukascopy-run.json` is **always** written
-  (also on gaps, SIGTERM or validation errors): summary plus a gap list
-  (symbol, month, file, day/hour/side, URL, HTTP status, last error, attempts).
-  The next run reads it and tries those files first.
-- `--workers` (default 1), `--pause` (1.0 s between requests per worker),
-  exponential backoff with jitter on 403/408/425/429/5xx, timeouts and
-  connection errors (`--backoff-base` 2 s, factor 2, cap `--max-backoff`
-  600 s), `Retry-After` honoured (up to the cap), separate
-  `--connect-timeout` (10 s) / `--read-timeout` (60 s). After a 503 (also 429
-  and 403) **all** workers pause until a shared "not before" time.
+  (also on gaps, SIGTERM or validation errors): summary, `gaps` (symbol, month,
+  file, day/hour/side, URL, HTTP status, last error, attempts),
+  `unconfirmed`, `quarantine` and `validation_errors`. The next run reads it
+  and tries the gap files first.
+- `--workers` (default 1), `--pause` (1.0 s between requests per worker), one
+  `requests.Session` (keep-alive) per worker, separate `--connect-timeout`
+  (10 s) / `--read-timeout` (60 s). Every throttling or error response
+  (403/408/425/429/5xx, timeouts, connection errors) increments a counter `k`
+  shared by **all** workers and across files and sets a global cooldown of
+  `--backoff-base` (2 s) x 2^k with jitter, capped at `--max-backoff` (600 s);
+  `Retry-After` is honoured up to the cap; the counter resets only on 200/404.
+  After `--max-consecutive-failures` (20) failures in a row the run stops
+  cleanly (report, exit 3) and leaves the restart to systemd.
 - HTTP 403 is most likely the datafeed's WAF/bot protection (newer
   `dukascopy-node` versions moved to a different API for that reason). It is
   retried like 503, never treated as "no data", counted separately in the
@@ -128,18 +147,26 @@ Fault tolerance and throttling:
   (raise `--pause`, try later).
 - Progress (files done/total, rate, ETA) every `--progress-every` (50)
   downloaded files; cache hits do not count as requests.
+- A per-symbol lock (`flock` on `metals/.lock-SYM`) prevents two processes
+  (e.g. a history service and a monthly timer) from working on the same
+  symbol; the second one exits 3 at once without touching reports.
 - SIGTERM/SIGINT: no new downloads, running ones finish, the report is
-  written, exit 3 if anything is left. A restart (e.g. systemd
-  `Restart=on-failure`) continues without duplicate work; finished months
-  are skipped. Use `TimeoutStopSec` above the read timeout (e.g. 120 s).
-- Exit codes: **0** complete, **2** validation error, **3** gaps (failed
-  downloads after all retries, or interrupted), **4** `--verify-day` mismatch.
+  written, exit 3 if anything is left. A restart continues without duplicate
+  work; finished months are skipped. Use `TimeoutStopSec` above the read
+  timeout (e.g. 120 s).
+- Exit codes (in this order of precedence): **2** validation error (no
+  restart), **3** gaps: failed downloads, unconfirmed "no data", interrupted,
+  circuit breaker or lock busy (restart later is fine), **4** manual check
+  needed: quarantined file or `--verify-day` mismatch (no restart), **0**
+  complete.
 
 Store and validation:
 
 - Raw files are cached (month 1-based in the cache path), so the store can be
-  rebuilt (`--rebuild`) without downloading again. 404s are cached as
-  `<name>.404` marker files; delete a marker to request that file again.
+  rebuilt (`--rebuild`) without downloading again; delete a marker to request
+  that file again. All files are written atomically (hidden
+  `.name.pid.thread.part` temp file, which pyarrow ignores, fsync of file and
+  directory, `os.replace`); orphaned temp files are removed at start.
 - Bars cover `[t, t+1min)`, labelled left, and exist only for minutes with
   trading (no filling). Only **completed UTC months** are written (so no
   candle file of the running day is ever requested); existing monthly files
@@ -150,7 +177,7 @@ Store and validation:
   by powers of ten, so every bar is checked against a coarse plausible range
   (XAUUSD 200–20000, XAGUSD 3–500, EURUSD 0.5–2.0) and a yearly price anchor,
   and the run aborts hard instead of writing wrong prices.
-- Hard validation before writing: duplicates, monotonic time, bid and ask OHLC
+- Hard validation before writing (the month is not written): duplicates, monotonic time, bid and ask OHLC
   consistency, prices > 0, NaNs, plausible range, crossed quotes
   (`ask_close < bid_close`, abort above 0.1 % of bars). Soft checks are only
   reported (log + JSON under `metals/reports/`): spread outliers (> 20x the

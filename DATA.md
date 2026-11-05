@@ -41,9 +41,15 @@ Store:
     data/raw/dukascopy/{SYM}/{YYYY}/{MM}/{DD}/{HH}h_ticks.bi5           Roh-Cache Ticks
     data/raw/dukascopy/{SYM}/{YYYY}/{MM}/{DD}/{BID|ASK}_candles_min_1.bi5  Roh-Cache Kerzen
         (Monat hier 1-basiert; in der Dukascopy-URL ist er 0-basiert,
-        Januar = 00. 404 als Marker <name>.404 gecached. Kerzendatei mit
-        unklarer Feldreihenfolge: <name>.unclear, gilt NICHT als Cache.)
+        Januar = 00.) Nebendateien je Rohdatei (Marker-Logik s. u.):
+          <name>.404 / <name>.empty  "keine Daten" (JSON: first_seen, confirmed)
+          <name>.quarantine          Feldreihenfolge passt nicht (Rohinhalt)
+          <name>.corrupt             beiseitegelegte kaputte Cache-Datei
+    data/metals/.lock-{SYM}          Prozess-Lock je Symbol (flock)
     Wurzel per MARKETDATA_DATA_ROOT ueberschreibbar (nur fetch_dukascopy.py).
+    Temporaerdateien: .{name}.{pid}.{thread}.part (Punkt vorn -> von
+    pyarrow/hive ignoriert), fsync auf Datei und Verzeichnis, verwaiste
+    werden beim Start aus Partition und Reports entfernt.
 
 Spalten: ts (UTC, ms, Label links [t, t+1min)), bid_open/high/low/close,
 ask_open/high/low/close (float64), tick_count, bid_volume, ask_volume
@@ -56,7 +62,7 @@ nichts aufgefuellt. Parquet-Schema-Metadatum dukascopy_mode = candles|ticks.
 Formate (nicht offiziell dokumentiert):
 - Ticks  {SYM}/{YYYY}/{MM0}/{DD}/{HH}h_ticks.bi5: LZMA, Records a 20 Byte
   big-endian '>3I2f' (ms seit Stundenbeginn, ask, bid, ask_volume,
-  bid_volume). 0 Bytes = keine Ticks.
+  bid_volume). 0 Bytes = keine Ticks (gecached als Marker .empty).
 - Kerzen {SYM}/{YYYY}/{MM0}/{DD}/{BID|ASK}_candles_min_1.bi5: LZMA, Records
   a 24 Byte big-endian: uint32 Sekunden seit Tagesbeginn UTC, 4x uint32
   Preise, float32 volume. Preis = int / POINT_DIVISOR (wie Ticks).
@@ -85,23 +91,41 @@ Unsicher / Absicherung:
 - Feldreihenfolge: dukascopy-node sagt open, close, low, high (OCLH); eine
   StackOverflow-Quelle sagt OHLC. Der Decoder prueft je Datei, welche der
   beiden Reihenfolgen in ALLEN nicht flachen Kerzen high >= max(open, close)
-  und low <= min(open, close) erfuellt. Genau eine -> verwendet (im
-  Monatsreport field_order gezaehlt). Keine oder beide (z.B. close == high in
-  allen aktiven Kerzen) -> Datei = Fehlschlag "Feldreihenfolge unklar"
-  (Lueckenliste, Monat nicht geschrieben), es wird nicht geraten. Nur flache
-  Kerzen -> Reihenfolge egal (alle Felder gleich). Zusaetzlich im Report:
-  continuity = |open[t+1] - close[t]| in Punkten (Median, Anteil <= 1 Punkt).
+  und low <= min(open, close) erfuellt (Monatsreport field_order zaehlt):
+    genau eine  -> verwendet
+    beide       -> "ambiguous": geht nur, wenn in jeder aktiven Kerze
+                   close == high; beide Lesarten liefern identische Werte,
+                   Datei wird normal verwendet
+    nur flache  -> "flat", Reihenfolge egal
+    keine       -> QUARANTAENE: Datei als <name>.quarantine abgelegt (nicht
+                   Cache, kein erneuter Download, kein Endlos-Retry), Monat
+                   NICHT geschrieben, Laufreport "quarantine" mit Grund,
+                   Exit 4 (manuelle Pruefung). Freigeben: --verify-day fuer
+                   den Tag, dann <name>.quarantine loeschen -> neu laden.
+  Zusaetzlich im Report: continuity = |open[t+1] - close[t]| in Punkten
+  (Median, Anteil <= 1 Punkt).
 - Zeitbasis Sekunden: hart geprueft (Offset < 86400 und Vielfaches von 60;
   Millisekunden wuerden sofort auffallen).
 - Fuellkerzen: Annahme flache Kerzen mit volume 0. Verworfen wird eine
   Minute nur, wenn BEIDE Seiten volume == 0 UND flache Preise haben;
   volume 0 mit Preisbewegung bleibt (zero_volume_nonflat_minutes im Report).
   Minuten nur auf einer Seite werden verworfen und gezaehlt.
-- Wochenende/Pausen: Datei fehlt (404) oder nur Fuellkerzen - beides ok.
-  Tag mit Daten nur auf einer Seite: verworfen, days_one_side_only.
-- Laufender Tag: Tagesdatei erst nach Tagesende; es werden nur
-  abgeschlossene Monate geladen, und der Fetcher verweigert Kerzendateien
-  des laufenden UTC-Tages grundsaetzlich.
+- "Keine Daten" (404 oder leere 200-Antwort) = Marker, nie 0-Byte-Rohdatei:
+    Sa/So, 25.12., 1.1. -> sofort endgueltig (confirmed "auto")
+    Mo-Fr               -> UNBESTAETIGT: Luecke (Laufreport "unconfirmed"),
+                           Monat nicht geschrieben, Exit 3; endgueltig erst,
+                           wenn ein Request >= 24 h spaeter wieder keine Daten
+                           liefert (confirmed "repeat"); kommen dann Daten,
+                           verschwindet der Marker
+    Tickmodus: nur Werktags-404 braucht Bestaetigung (leere Stunden sind
+    werktags normal, Tagespause). Alte 0-Byte-.404-Marker gelten als bestaetigt.
+- Tag mit Daten nur auf einer Seite: ist die fehlende Seite nur "auto"
+  bestaetigt (Wochenende), wird sie auf unbestaetigt gesetzt (Luecke);
+  nach Wiederholungsbestaetigung wird der Tag verworfen (days_one_side_only).
+- Laufender Tag: Kerzendateien erst 6 h nach Tagesende; Monate erst 6 h nach
+  Monatsende. Der Fetcher verweigert fruehere Kerzendateien grundsaetzlich.
+- Kaputte Cache-Datei (LZMA-Fehler, 0 Byte): als <name>.corrupt beiseite-
+  gelegt, als Luecke gefuehrt und neu geladen (kein Validierungsabbruch).
 - Volumen-Einheit nicht verifiziert; Werte unveraendert uebernommen.
 - Preis = int / POINT_DIVISOR, XAUUSD 1000, XAGUSD 1000, EURUSD 100000.
   Abgesichert durch Plausibilitaetsbereich (XAUUSD 200..20000, XAGUSD
@@ -112,7 +136,7 @@ Unsicher / Absicherung:
   erkannte Feldreihenfolge, Minuten nur in Ticks/nur in Kerzen, max.
   Abweichung in Punkten, Volumenabweichung und continuity aus. Exit 0 =
   Uebereinstimmung (Toleranz --verify-tol 0.5 Punkte, --verify-max-share 0),
-  4 = Abweichung, 3 = Download gescheitert.
+  4 = Abweichung/Quarantaene, 3 = Download gescheitert.
 
 Fehlertoleranz / Fortsetzen:
 - Eine endgueltig gescheiterte Datei bricht den Lauf nicht ab: sie wird
@@ -122,17 +146,33 @@ Fehlertoleranz / Fortsetzen:
 - Laufreport immer (auch bei Luecken/SIGTERM/Validierungsfehler): Zusammen-
   fassung + gaps (Symbol, Monat, Datei, Tag/Stunde/Seite, URL, HTTP-Status,
   letzter Fehler, Versuche). Beim Start werden diese Dateien zuerst versucht.
-- Rohdateien, Parquet und Reports atomar (.part + os.replace). Folgelauf
-  laedt nur fehlende Dateien; Cache-Treffer sind keine Requests.
+- Rohdateien, Parquet und Reports atomar (versteckte Temp-Datei + fsync +
+  os.replace + fsync Verzeichnis). Folgelauf laedt nur fehlende Dateien;
+  Cache-Treffer sind keine Requests.
+- Validierungsfehler werden je Monat gesammelt (validation_errors), die
+  uebrigen Monate laufen weiter; Exit 2 erst am Ende.
 - Drosselung: --workers 1, --pause 1.0 s je Worker, --attempts 5,
-  Backoff --backoff-base 2 s x 2^n mit Jitter, Deckel --max-backoff 600 s,
-  Retry-After respektiert (bis Deckel); 403/429/503 -> globale Abkuehlung
-  aller Worker. 403 = vermutlich WAF, wird wiederholt, im Report gezaehlt
-  (http_403_waf_suspected), bei >= 50 % 403 deutlicher Hinweis (hint).
-- Exit: 0 vollstaendig, 2 Validierungsfehler, 3 Luecken/unterbrochen,
-  4 verify-day-Abweichung.
+  requests.Session (Keep-Alive) je Worker. Jede Drossel-/Fehlerantwort
+  (403/408/425/429/5xx, Timeout, Verbindungsfehler) erhoeht einen gemeinsamen
+  Zaehler k (ueber Dateigrenzen hinweg) und setzt eine globale Abkuehlung
+  fuer ALLE Worker: --backoff-base 2 s x 2^k mit Jitter, Deckel
+  --max-backoff 600 s, Retry-After respektiert (bis Deckel); Reset erst bei
+  200/404. Schutzschalter: nach --max-consecutive-failures (20) Fehlant-
+  worten in Folge endet der Lauf sauber (Report, Exit 3, status
+  circuit_breaker); den Neustart uebernimmt systemd. 403 = vermutlich WAF,
+  im Report gezaehlt (http_403_waf_suspected), bei >= 50 % 403 Hinweis.
+- Lock: je Symbol flock auf metals/.lock-{SYM}; ist er belegt (z.B.
+  History-Service und Monats-Timer gleichzeitig), endet der zweite Lauf
+  sofort mit Exit 3, ohne Reports zu schreiben.
+- Exit-Codes (Vorrang in dieser Reihenfolge):
+    2  Validierungsfehler in mindestens einem Monat (kein Neustart)
+    3  Luecken: Download-Fehlschlaege, unbestaetigte "keine Daten",
+       SIGTERM, Schutzschalter, Lock belegt -> spaeter erneut (Neustart ok)
+    4  manuelle Pruefung noetig: Quarantaene (bzw. --verify-day-Abweichung)
+       -> kein Neustart (Units behandeln 4 wie 2)
+    0  vollstaendig
 
-Validierung: hart (Abbruch, nichts geschrieben) bei Duplikaten, nicht
+Validierung: hart (Monat wird nicht geschrieben) bei Duplikaten, nicht
 monotoner Zeit, inkonsistentem Bid-/Ask-OHLC, Preisen <= 0, NaN,
 Plausibilitaetsbereich, Jahresanker, > 0,1 % Bars mit ask_close <
 bid_close, kaputtem bi5 (Laenge, Offsets). Weich (nur Report): Spread > 20x

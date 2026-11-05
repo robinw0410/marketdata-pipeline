@@ -35,11 +35,38 @@ def hour_ms(*args) -> int:
     return int(datetime(*args, tzinfo=UTC).timestamp() * 1000)
 
 
+NOW = datetime(2026, 11, 5, 12, 0, tzinfo=UTC)
+
+
 @pytest.fixture(autouse=True)
 def no_sleep(monkeypatch):
     slept: list[float] = []
     monkeypatch.setattr(fd, "_sleep", slept.append)
     return slept
+
+
+@pytest.fixture(autouse=True)
+def fixed_now(monkeypatch):
+    """Feste Wanduhr (unabhaengig von der Systemzeit); Zeitreisen per now=."""
+    monkeypatch.setattr(fd, "utc_now", lambda: NOW)
+
+
+class FakeSession:
+    """requests.Session-Ersatz: delegiert an (das ggf. gepatchte) fd.requests.get."""
+
+    def __init__(self):
+        self.headers = {}
+
+    def get(self, *a, **kw):
+        return fd.requests.get(*a, **kw)
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    def offline(*a, **kw):
+        raise AssertionError("Netzwerkzugriff im Test")
+    monkeypatch.setattr(fd.requests, "get", offline)
+    monkeypatch.setattr(fd.requests, "Session", FakeSession)
 
 
 # ------------------------------------------------------------------- pfade ---
@@ -188,9 +215,10 @@ def test_rebuild_uses_raw_cache_without_download(tmp_path, fake_net, monkeypatch
 
 def test_wrong_divisor_aborts_before_writing(tmp_path, fake_net, monkeypatch):
     monkeypatch.setitem(fd.POINT_DIVISOR, SYM, 100)          # Faktor 10 daneben
-    with pytest.raises(fd.ValidationError, match="Plausibilitaetsbereich"):
-        fd.run(SYM, date(2026, 7, 1), date(2026, 7, 1), data_root=tmp_path,
-               today=date(2026, 8, 1), pause=0, mode="ticks")
+    rep = fd.run(SYM, date(2026, 7, 1), date(2026, 7, 1), data_root=tmp_path,
+                 today=date(2026, 8, 1), pause=0, mode="ticks")
+    assert rep["exit_code"] == 2 and rep["status"] == "validation_error"
+    assert "Plausibilitaetsbereich" in rep["validation_errors"][0]["error"]
     assert parquet_names(tmp_path) == []
 
 
@@ -336,7 +364,7 @@ def test_download_other_http_error_no_retry(fake_get):
 def test_get_hour_caches_blob_and_404(tmp_path, fake_get):
     calls, answers = fake_get
     h_ok = datetime(2024, 1, 5, 13, tzinfo=UTC)
-    h_404 = datetime(2024, 1, 5, 14, tzinfo=UTC)
+    h_404 = datetime(2024, 1, 6, 14, tzinfo=UTC)         # Samstag: 404 sofort endgueltig
     blob = make_bi5([(0, 2000500, 2000000, 1.0, 1.0)])
     answers += [FakeResp(200, blob), FakeResp(404)]
 
@@ -423,6 +451,8 @@ def candle_net(monkeypatch):
 
 def run_c(tmp_path, clock=None, **kw):
     kw.setdefault("today", date(2026, 8, 20))
+    kw.setdefault("now", lambda: datetime.combine(kw["today"], datetime.min.time(), UTC)
+                  + timedelta(hours=12))
     kw.setdefault("pause", 0)
     clock = clock or FakeClock()
     return fd.run(SYM, kw.pop("start", date(2026, 7, 1)), kw.pop("end", date(2026, 7, 1)),
@@ -449,20 +479,6 @@ def test_decode_candles_both_field_orders(order):
     assert df["ts"].iloc[2] == pd.Timestamp("2024-03-06 10:02", tz="UTC")
     r = df.iloc[0]
     assert (r.open, r.high, r.low, r.close, r.volume) == pytest.approx((2150.0, 2151.0, 2149.5, 2150.5, 1.5))
-
-
-def test_field_order_unclear_or_flat():
-    # close == high in allen aktiven Kerzen -> OCLH und OHLC gleich moeglich
-    amb = [(0, 100, 110, 90, 110, 1.0), (60, 105, 120, 100, 120, 1.0)]
-    with pytest.raises(fd.FieldOrderError, match="unklar"):
-        fd.decode_candles(pack_candles(amb), 0, 1000)
-    # Widerspruch: keine Reihenfolge passt (Feld 2 < Feld 1, Feld 4 < Feld 1)
-    raw = struct.pack(">5If", 0, 100, 90, 95, 80, 1.0)
-    with pytest.raises(fd.FieldOrderError, match="unklar"):
-        fd.decode_candles(lzma.compress(raw, format=lzma.FORMAT_ALONE), 0, 1000)
-    # nur Fuellkerzen: Reihenfolge egal
-    _, order = fd.decode_candles(pack_candles([(0, 5, 5, 5, 5, 0.0)]), 0, 1000)
-    assert order == "flat"
 
 
 def test_decode_candles_rejects_bad_offsets_and_length():
@@ -527,36 +543,18 @@ def test_day_incomplete_if_one_side_fails(tmp_path, candle_net):
     assert fd.candle_raw_path(tmp_path, SYM, datetime(2026, 7, 15, tzinfo=UTC), "BID").exists()
 
 
-def test_day_with_one_side_404_is_dropped_and_reported(tmp_path, candle_net, monkeypatch):
+def test_day_with_one_side_404_needs_confirmation_then_dropped(tmp_path, candle_net, monkeypatch):
     inner = fd.download_bi5
     monkeypatch.setattr(fd, "download_bi5",
                         lambda url, **kw: None if "/2026/06/15/ASK" in url else inner(url, **kw))
-    rep = run_c(tmp_path)
+    rep = run_c(tmp_path)                                     # Mi 15.07.: Werktag
+    assert rep["exit_code"] == 3 and parquet_names(tmp_path) == []
+    assert [u["file"] for u in rep["unconfirmed"]] == ["XAUUSD 2026-07-15 ASK candles"]
+    t2 = datetime(2026, 8, 21, 13, tzinfo=UTC)                # > 24 h spaeter: erneut 404
+    rep = run_c(tmp_path, today=date(2026, 8, 21), now=lambda: t2)
     assert rep["exit_code"] == 0
     mrep = json.loads(fd.report_path(tmp_path, SYM, 2026, 7).read_text())
     assert mrep["days_one_side_only"] == ["2026-07-15 nur BID"] and mrep["rows"] == 30 * 2
-
-
-def test_unclear_field_order_is_a_gap_not_written(tmp_path, candle_net):
-    amb = pack_candles([(600 * 60, 4_200_000, 4_201_000, 4_199_000, 4_201_000, 1.0)])
-    candle_net["special"]["/2026/06/03/BID"] = amb
-    rep = run_c(tmp_path, final_retries=1)
-    assert rep["exit_code"] == 3 and parquet_names(tmp_path) == []
-    (g,) = rep["gaps"]
-    assert g["file"] == "XAUUSD 2026-07-03 BID candles" and "Feldreihenfolge unklar" in g["last_error"]
-    assert g["attempts"] == 2                                  # erster Durchgang + 1 Runde
-    p = fd.candle_raw_path(tmp_path, SYM, datetime(2026, 7, 3, tzinfo=UTC), "BID")
-    assert not p.exists() and p.with_name("BID_candles_min_1.unclear").exists()
-
-
-def test_unclear_file_already_in_cache_is_moved_aside(tmp_path, candle_net):
-    p = fd.candle_raw_path(tmp_path, SYM, datetime(2026, 7, 3, tzinfo=UTC), "BID")
-    fd._atomic_write(p, pack_candles([(0, 4_200_000, 4_201_000, 4_199_000, 4_201_000, 1.0)]))
-    rep = run_c(tmp_path, final_retries=0)
-    assert rep["exit_code"] == 3 and not p.exists()
-    assert "Feldreihenfolge unklar" in rep["gaps"][0]["last_error"]
-    rep = run_c(tmp_path)                                      # Folgelauf laedt neu -> fertig
-    assert rep["exit_code"] == 0 and parquet_names(tmp_path) == ["XAUUSD-1m-2026-07.parquet"]
 
 
 def test_running_day_candle_file_never_requested(tmp_path, fake_get):
@@ -648,10 +646,10 @@ def test_corrupt_run_report_is_ignored(tmp_path, candle_net):
 
 def test_validation_error_still_writes_run_report(tmp_path, candle_net, monkeypatch):
     monkeypatch.setitem(fd.POINT_DIVISOR, SYM, 100)
-    with pytest.raises(fd.ValidationError):
-        run_c(tmp_path)
+    assert run_c(tmp_path)["exit_code"] == 2
     rep = json.loads(fd.run_report_path(tmp_path, SYM).read_text())
-    assert rep["status"] == "validation_error" and rep["exit_code"] == 2 and rep["error"]
+    assert rep["status"] == "validation_error" and rep["exit_code"] == 2
+    assert rep["validation_errors"][0]["month"] == "2026-07"
 
 
 # ------------------------------------------------------- backoff/drossel ---
@@ -697,7 +695,7 @@ def test_503_sets_global_cooldown_for_all_workers(fake_get):
 def test_403_is_retried_with_cooldown_not_404(fake_get):
     calls, answers = fake_get
     clock = FakeClock()
-    th = fd.Throttle(clock, clock.sleep)
+    th = fd.Throttle(clock, clock.sleep, jitter=0)
     good = make_bi5([(0, 2000500, 2000000, 1.0, 1.0)])
     answers += [FakeResp(403), FakeResp(403), FakeResp(200, good)]
     assert fd.download_bi5("u", backoff_base=2, jitter=0, throttle=th, sleep=clock.sleep) == good
@@ -709,7 +707,7 @@ def test_mostly_403_run_reports_waf_hint(tmp_path, fake_get, monkeypatch):
     monkeypatch.setattr(fd.requests, "get", lambda url, headers=None, timeout=None:
                         (calls.append(url), FakeResp(403))[1])
     clock = FakeClock()
-    rep = run_c(tmp_path, clock, attempts=2, final_retries=0)
+    rep = run_c(tmp_path, clock, attempts=2, final_retries=0, max_consecutive_failures=0)
     assert rep["exit_code"] == 3 and len(rep["gaps"]) == 62
     s = rep["summary"]
     assert s["http_403_waf_suspected"] == 124 == s["requests"] and s["http_status_counts"] == {"403": 124}
@@ -753,9 +751,9 @@ def test_cli_defaults(monkeypatch):
     assert seen["mode"] == "candles" and seen["workers"] == 1 and seen["pause"] == 1.0
     assert seen["attempts"] == 5 and seen["backoff_base"] == 2.0 and seen["max_backoff"] == 600.0
     assert seen["final_retries"] == 2 and seen["final_wait"] == 300.0
-    assert seen["timeout"] == (10.0, 60.0)
+    assert seen["timeout"] == (10.0, 60.0) and seen["max_consecutive_failures"] == 20
     monkeypatch.setattr(fd, "run", lambda *a, **kw: {"exit_code": 3, "summary": {
-        "failed_files": 1, "months_incomplete": ["2024-01"]}})
+        "failed_files": 1, "unconfirmed_files": 0, "months_incomplete": ["2024-01"]}})
     assert fd.main(["--symbol", "XAUUSD", "--start", "2024-01", "--mode", "ticks"]) == 3
 
 
@@ -848,3 +846,286 @@ def test_verify_day_mismatch(tmp_path, fake_get):
 def test_verify_day_refuses_running_day(tmp_path):
     with pytest.raises(ValueError):
         fd.verify_day(SYM, VDAY, data_root=tmp_path, today=VDAY)
+    with pytest.raises(ValueError):                         # Tagesende erst 3 h her
+        fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7),
+                      now=lambda: datetime(2024, 3, 7, 3, tzinfo=UTC))
+
+
+# ========================================================== review-funde ===
+def none_fit_rows():
+    # weder OCLH noch OHLC: Feld 2 und Feld 4 jeweils unter open
+    return [(600 * 60, 4_200_000, 4_190_000, 4_195_000, 4_180_000, 1.0)]
+
+
+def amb_rows():
+    # close == high in jeder aktiven Kerze -> beide Reihenfolgen passen
+    return [(600 * 60, 4_199_000, 4_200_000, 4_198_500, 4_200_000, 1.0)]
+
+
+def raw_none_fit() -> bytes:
+    raw = b"".join(struct.pack(">5If", *r) for r in none_fit_rows())
+    return lzma.compress(raw, format=lzma.FORMAT_ALONE)
+
+
+# H1 ---------------------------------------------------------------------
+def test_field_order_ambiguous_flat_and_none():
+    rec = fd.candle_records(pack_candles(amb_rows(), "OCLH"))
+    assert fd.detect_field_order(rec) == "ambiguous"
+    b = pack_candles(amb_rows(), "OCLH")
+    d_amb, order = fd.decode_candles(b, 0, 1000)
+    assert order == "ambiguous"
+    for o in ("OCLH", "OHLC"):                               # beide Lesarten identisch
+        pd.testing.assert_frame_equal(d_amb, fd.decode_candles(b, 0, 1000, o)[0])
+    assert fd.detect_field_order(fd.candle_records(pack_candles([(0, 5, 5, 5, 5, 0.0)]))) == "flat"
+    with pytest.raises(fd.FieldOrderError, match="unklar"):
+        fd.detect_field_order(fd.candle_records(raw_none_fit()))
+
+
+def test_ambiguous_day_is_written(tmp_path, candle_net):
+    candle_net["special"]["/2026/06/03/BID"] = pack_candles(amb_rows())
+    rep = run_c(tmp_path)
+    assert rep["exit_code"] == 0 and rep["quarantine"] == []
+    mrep = json.loads(fd.report_path(tmp_path, SYM, 2026, 7).read_text())
+    assert mrep["field_order"] == {"OCLH": 61, "ambiguous": 1}
+
+
+def test_no_fitting_order_goes_to_quarantine_exit_4(tmp_path, candle_net):
+    url = f"{fd.BASE}/XAUUSD/2026/06/03/BID_candles_min_1.bi5"
+    candle_net["special"]["/2026/06/03/BID"] = raw_none_fit()
+    rep = run_c(tmp_path, final_retries=2)
+    assert rep["exit_code"] == 4 and rep["status"] == "quarantine"
+    assert rep["gaps"] == [] and rep["summary"]["final_retry_rounds"] == 0   # kein Endlos-Retry
+    (q,) = rep["quarantine"]
+    assert q["file"] == "XAUUSD 2026-07-03 BID candles" and "unklar" in q["reason"]
+    assert rep["summary"]["months_quarantine"] == ["2026-07"] and parquet_names(tmp_path) == []
+    f = fd.RawFile(SYM, "candles", datetime(2026, 7, 3, tzinfo=UTC), "BID")
+    assert not f.path(tmp_path).exists() and f.marker(tmp_path, "quarantine").exists()
+    assert candle_net["requested"].count(url) == 1
+    # Folgelauf: Quarantaene ist klebrig, kein erneuter Request, weiter Exit 4
+    candle_net["requested"].clear()
+    rep = run_c(tmp_path)
+    assert candle_net["requested"] == [] and rep["exit_code"] == 4
+    # manuell freigeben (Quarantaene loeschen) -> neu laden -> fertig
+    del candle_net["special"]["/2026/06/03/BID"]
+    f.marker(tmp_path, "quarantine").unlink()
+    assert run_c(tmp_path)["exit_code"] == 0
+
+
+def test_cached_file_without_fitting_order_moved_to_quarantine(tmp_path, candle_net):
+    f = fd.RawFile(SYM, "candles", datetime(2026, 7, 3, tzinfo=UTC), "BID")
+    fd._atomic_write(f.path(tmp_path), raw_none_fit())
+    rep = run_c(tmp_path)
+    assert rep["exit_code"] == 4 and not f.path(tmp_path).exists()
+    assert f.marker(tmp_path, "quarantine").exists()
+    assert f.url() not in candle_net["requested"]
+
+
+# H2 / N4 ----------------------------------------------------------------
+def test_throttle_escalates_across_files_and_resets_on_success():
+    clock = FakeClock()
+    th = fd.Throttle(clock, clock.sleep, base=2, cap=600, jitter=0, breaker=0)
+    assert [th.failure("x") for _ in range(4)] == [2, 4, 8, 16]
+    th.success()
+    assert th.failure("x") == 2
+    for _ in range(20):
+        th.failure("x")
+    assert th.failure("x") == 600 and not th.tripped.is_set()
+
+
+def test_persistent_503_escalates_to_minutes_and_breaker_stops(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(fd.requests, "get", lambda url, headers=None, timeout=None:
+                        (calls.append(url), FakeResp(503))[1])
+    clock = FakeClock()
+    rep = run_c(tmp_path, clock, jitter=0, final_retries=2)
+    assert len(calls) == 20                                   # Schutzschalter nach 20
+    assert rep["status"] == "circuit_breaker" and rep["exit_code"] == 3
+    assert rep["summary"]["circuit_breaker"] and rep["summary"]["final_retry_rounds"] == 0
+    assert "Schutzschalter" in rep["hint"]
+    # globale Abkuehlung eskaliert ueber Dateigrenzen (5 Versuche je Datei) bis 600 s
+    assert clock.slept[:10] == [2, 4, 8, 16, 32, 64, 128, 256, 512, 600]
+    assert max(clock.slept) == 600 and 300 not in clock.slept   # keine Endrunde
+    assert len(rep["gaps"]) == 4
+
+
+def test_connect_timeout_and_5xx_trigger_global_cooldown(fake_get):
+    calls, answers = fake_get
+    clock = FakeClock()
+    th = fd.Throttle(clock, clock.sleep, jitter=0)
+    good = make_bi5([(0, 2000500, 2000000, 1.0, 1.0)])
+    answers += [requests.ConnectTimeout("weg"), FakeResp(502), FakeResp(200, good)]
+    assert fd.download_bi5("u", throttle=th, sleep=clock.sleep) == good
+    assert th.cooldowns == 2 and clock.slept == [2, 4] and th.consecutive == 0
+
+
+def test_session_per_worker_thread(tmp_path):
+    fe = fd.Fetcher(tmp_path)
+    s1 = fe.session()
+    assert fe.session() is s1 and s1.headers["User-Agent"] == fd.USER_AGENT
+    other = []
+    t = threading.Thread(target=lambda: other.append(fe.session()))
+    t.start()
+    t.join()
+    assert other[0] is not s1
+
+
+# M1 ---------------------------------------------------------------------
+def test_needs_confirmation_rules():
+    def f(kind, d):
+        return fd.RawFile(SYM, kind, datetime(*d, tzinfo=UTC), "BID" if kind == "candles" else "")
+    assert fd.needs_confirmation(f("candles", (2026, 7, 8)), "404")          # Mittwoch
+    assert fd.needs_confirmation(f("candles", (2026, 7, 8)), "empty")
+    assert not fd.needs_confirmation(f("candles", (2026, 7, 4)), "404")      # Samstag
+    assert not fd.needs_confirmation(f("candles", (2025, 12, 25)), "empty")  # Weihnachten (Do)
+    assert not fd.needs_confirmation(f("candles", (2026, 1, 1)), "404")      # Neujahr (Do)
+    assert fd.needs_confirmation(f("ticks", (2026, 7, 8, 21)), "404")
+    assert not fd.needs_confirmation(f("ticks", (2026, 7, 8, 21)), "empty")  # Tagespause normal
+
+
+def test_weekday_404_confirmed_only_after_24h(tmp_path, candle_net):
+    for s in ("BID", "ASK"):
+        candle_net["special"][f"/2026/06/08/{s}"] = None       # Mittwoch: beide 404
+    rep = run_c(tmp_path)
+    assert rep["exit_code"] == 3 and parquet_names(tmp_path) == []
+    assert len(rep["unconfirmed"]) == 2 and rep["summary"]["unconfirmed_files"] == 2
+    f = fd.RawFile(SYM, "candles", datetime(2026, 7, 8, tzinfo=UTC), "BID")
+    assert json.loads(f.marker(tmp_path, "404").read_text())["confirmed"] is None
+    # < 24 h spaeter: kein Request, weiter Luecke
+    candle_net["requested"].clear()
+    rep = run_c(tmp_path, today=date(2026, 8, 21), now=lambda: datetime(2026, 8, 21, 6, tzinfo=UTC))
+    assert candle_net["requested"] == [] and rep["exit_code"] == 3
+    # > 24 h spaeter: erneut 404 -> endgueltig, Monat wird geschrieben
+    rep = run_c(tmp_path, today=date(2026, 8, 21), now=lambda: datetime(2026, 8, 21, 13, tzinfo=UTC))
+    assert len(candle_net["requested"]) == 2 and rep["exit_code"] == 0
+    assert json.loads(f.marker(tmp_path, "404").read_text())["confirmed"] == "repeat"
+    assert json.loads(fd.report_path(tmp_path, SYM, 2026, 7).read_text())["days_404"] == 1
+
+
+def test_weekday_no_data_then_data_clears_marker(tmp_path, candle_net):
+    candle_net["special"]["/2026/06/08/BID"] = b""             # leere 200 an Werktag
+    assert run_c(tmp_path)["exit_code"] == 3
+    f = fd.RawFile(SYM, "candles", datetime(2026, 7, 8, tzinfo=UTC), "BID")
+    assert f.marker(tmp_path, "empty").exists() and not f.path(tmp_path).exists()
+    del candle_net["special"]["/2026/06/08/BID"]
+    rep = run_c(tmp_path, today=date(2026, 8, 22), now=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC))
+    assert rep["exit_code"] == 0 and f.path(tmp_path).exists()
+    assert not f.marker(tmp_path, "empty").exists()
+
+
+def test_empty_weekend_response_is_marker_not_raw_file(tmp_path, candle_net):
+    for s in ("BID", "ASK"):
+        candle_net["special"][f"/2026/06/04/{s}"] = b""        # Samstag
+    rep = run_c(tmp_path)
+    assert rep["exit_code"] == 0
+    f = fd.RawFile(SYM, "candles", datetime(2026, 7, 4, tzinfo=UTC), "BID")
+    assert not f.path(tmp_path).exists()
+    assert json.loads(f.marker(tmp_path, "empty").read_text())["confirmed"] == "auto"
+    assert not [p for p in (tmp_path / "raw").rglob("*.bi5") if p.stat().st_size == 0]
+
+
+def test_one_sided_weekend_day_becomes_gap_until_confirmed(tmp_path, candle_net):
+    candle_net["special"]["/2026/06/05/ASK"] = b""            # Sonntag: nur BID
+    rep = run_c(tmp_path)
+    assert rep["exit_code"] == 3 and parquet_names(tmp_path) == []
+    assert rep["unconfirmed"][0]["file"] == "XAUUSD 2026-07-05 ASK candles"
+    assert "einseitig" in rep["unconfirmed"][0]["reason"]
+    rep = run_c(tmp_path, today=date(2026, 8, 22), now=lambda: datetime(2026, 8, 22, 12, tzinfo=UTC))
+    assert rep["exit_code"] == 0
+    mrep = json.loads(fd.report_path(tmp_path, SYM, 2026, 7).read_text())
+    assert mrep["days_one_side_only"] == ["2026-07-05 nur BID"]
+
+
+def test_legacy_zero_byte_marker_counts_as_confirmed(tmp_path):
+    f = fd.RawFile(SYM, "candles", datetime(2026, 7, 8, tzinfo=UTC), "BID")
+    fd._atomic_write(f.marker(tmp_path, "404"), b"")
+    assert fd.Fetcher(tmp_path).state(f)[0] == "404"
+
+
+def test_month_end_less_than_6h_ago_not_requested(tmp_path, candle_net, fake_get):
+    rep = run_c(tmp_path, today=date(2026, 8, 1), now=lambda: datetime(2026, 8, 1, 3, tzinfo=UTC))
+    assert candle_net["requested"] == [] and rep["summary"]["months_considered"] == 0
+    f = fd.RawFile(SYM, "candles", datetime(2026, 7, 31, tzinfo=UTC), "BID")
+    with pytest.raises(ValueError, match="6 h"):
+        fd.Fetcher(tmp_path, today=date(2026, 8, 2),
+                   now=lambda: datetime(2026, 8, 1, 5, tzinfo=UTC)).get(f)
+    assert fake_get[0] == []
+
+
+# M2 ---------------------------------------------------------------------
+def test_corrupt_cache_files_moved_aside_and_redownloaded(tmp_path, candle_net):
+    f1 = fd.RawFile(SYM, "candles", datetime(2026, 7, 15, tzinfo=UTC), "BID")
+    f2 = fd.RawFile(SYM, "candles", datetime(2026, 7, 16, tzinfo=UTC), "ASK")
+    fd._atomic_write(f1.path(tmp_path), pack_candles(day_rows("BID"))[:30])   # abgeschnitten
+    fd._atomic_write(f2.path(tmp_path), b"")                                  # 0 Byte
+    rep = run_c(tmp_path, final_retries=1)
+    assert rep["exit_code"] == 0 and parquet_names(tmp_path) == ["XAUUSD-1m-2026-07.parquet"]
+    assert f1.marker(tmp_path, "corrupt").exists() and f2.marker(tmp_path, "corrupt").exists()
+    assert candle_net["requested"].count(f1.url()) == 1 and candle_net["requested"].count(f2.url()) == 1
+    assert rep["summary"]["recovered_in_final_retries"] == 2
+
+
+def test_validation_errors_collected_per_month(tmp_path, candle_net, monkeypatch):
+    inner = fd.download_bi5
+
+    def july_x10(url, **kw):
+        if "/2026/06/" in url:                                 # Juli: Gold bei 15000 -> Jahresanker
+            candle_net["requested"].append(url)
+            return pack_candles(day_rows(candle_url_side(url), 15_000_000))
+        return inner(url, **kw)
+
+    monkeypatch.setattr(fd, "download_bi5", july_x10)
+    rep = run_c(tmp_path, end=date(2026, 8, 1), today=date(2026, 9, 2))
+    assert rep["exit_code"] == 2 and rep["status"] == "validation_error"
+    assert rep["summary"]["months_validation_error"] == ["2026-07"]
+    assert "Jahresanker" in rep["validation_errors"][0]["error"]
+    assert parquet_names(tmp_path) == ["XAUUSD-1m-2026-08.parquet"]    # August trotzdem
+
+
+# M3 / N3 ----------------------------------------------------------------
+def test_temp_names_hidden_and_orphans_removed(tmp_path, candle_net):
+    t = fd._tmp_name(Path("x/XAUUSD-1m-2026-07.parquet"))
+    assert t.name.startswith(".XAUUSD-1m-2026-07.parquet.") and t.name.endswith(".part")
+    assert f".{os.getpid()}." in t.name
+    part = fd.store_path(tmp_path, SYM, 2026, 7).parent
+    part.mkdir(parents=True)
+    orphans = [part / ".XAUUSD-1m-2026-06.parquet.999.1.part", part / "XAUUSD-1m-2026-06.parquet.part",
+               fd.reports_dir(tmp_path) / ".XAUUSD-dukascopy-run.json.9.9.part"]
+    orphans[2].parent.mkdir(parents=True)
+    for p in orphans:
+        p.write_bytes(b"x")
+    run_c(tmp_path)
+    assert not any(p.exists() for p in orphans)
+    assert sorted(p.name for p in part.iterdir()) == ["XAUUSD-1m-2026-07.parquet"]
+
+
+def test_atomic_writes_fsync_file_and_dir(tmp_path, monkeypatch):
+    synced = []
+    real = os.fsync
+    monkeypatch.setattr(fd.os, "fsync", lambda fd_: (synced.append(fd_), real(fd_))[1])
+    fd._atomic_write(tmp_path / "a" / "b.bi5", b"x")
+    assert len(synced) == 2
+    fd.write_parquet(tmp_path / "p" / "x.parquet", make_bars(5), "candles")
+    assert len(synced) == 4
+
+
+# N1 ---------------------------------------------------------------------
+def test_retry_after_http_date_without_zone_and_garbage():
+    now = datetime(2015, 10, 21, 7, 28, 0, tzinfo=UTC)
+    assert fd.parse_retry_after("Wed, 21 Oct 2015 07:28:10 -0000", now=now) == 10.0
+    for bad in ("nan", "inf", "Wed, 99 Foo", "", None):
+        assert fd.parse_retry_after(bad, now=now) is None
+
+
+# N2 ---------------------------------------------------------------------
+def test_symbol_lock_blocks_second_process(tmp_path, candle_net):
+    held = fd.acquire_lock(tmp_path, SYM)
+    try:
+        rep = run_c(tmp_path)
+        assert rep["status"] == "locked" and rep["exit_code"] == 3
+        assert candle_net["requested"] == [] and not fd.run_report_path(tmp_path, SYM).exists()
+        other = fd.acquire_lock(tmp_path, "EURUSD")                      # anderes Symbol frei
+        assert other is not None
+        other.close()
+    finally:
+        held.close()
+    assert run_c(tmp_path)["exit_code"] == 0
