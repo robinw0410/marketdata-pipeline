@@ -1,5 +1,6 @@
 """fetch_dukascopy: bi5-Parsing, 1m-Aggregation, Monatsregel, Validierung, Download,
-Kerzenmodus, Fehlertoleranz/Lueckenliste, Drosselung, verify-day, SIGTERM.
+Kerzenmodus, Fehlertoleranz/Lueckenliste, Drosselung, 429-Sperre, verify-day
+(auch --candles-only mit Stichprobe), SIGTERM.
 
 Alles mit synthetischen bi5-Dateien, kein Netzwerk, keine echten Wartezeiten
 (Sleep/Uhr injiziert). Bestehende Tick-Tests laufen explizit mit mode="ticks".
@@ -455,6 +456,7 @@ def run_c(tmp_path, clock=None, **kw):
                   + timedelta(hours=12))
     kw.setdefault("pause", 0)
     clock = clock or FakeClock()
+    kw.setdefault("wall", clock)              # Wanduhr der 429-Sperre laeuft mit dem Schlaf
     return fd.run(SYM, kw.pop("start", date(2026, 7, 1)), kw.pop("end", date(2026, 7, 1)),
                   data_root=tmp_path, sleep=clock.sleep, clock=clock, **kw)
 
@@ -752,6 +754,7 @@ def test_cli_defaults(monkeypatch):
     assert seen["attempts"] == 5 and seen["backoff_base"] == 2.0 and seen["max_backoff"] == 600.0
     assert seen["final_retries"] == 2 and seen["final_wait"] == 300.0
     assert seen["timeout"] == (10.0, 60.0) and seen["max_consecutive_failures"] == 20
+    assert seen["rate_limit_pause"] == 900.0 and seen["max_rate_limit_wait"] == 21600.0
     monkeypatch.setattr(fd, "run", lambda *a, **kw: {"exit_code": 3, "summary": {
         "failed_files": 1, "unconfirmed_files": 0, "months_incomplete": ["2024-01"]}})
     assert fd.main(["--symbol", "XAUUSD", "--start", "2024-01", "--mode", "ticks"]) == 3
@@ -832,6 +835,10 @@ def test_verify_day_match(tmp_path, fake_get):
     assert max(rep["max_abs_dev_points"].values()) == pytest.approx(0, abs=1e-6)
     assert rep["fill_minutes_dropped"] == 1438
     assert fd.verify_report_path(tmp_path, SYM, VDAY).exists()
+    # auch der Tickvergleich schreibt die Kerzen-Minuten als Stichprobe
+    sp = fd.sample_path(tmp_path, SYM, VDAY)
+    assert rep["sample_path"] == str(sp) and len(pd.read_parquet(sp)) == 2
+    assert rep["rate_limit"]["hits_429"] == 0 and rep["variant"] == "ticks_vs_candles"
 
 
 def test_verify_day_mismatch(tmp_path, fake_get):
@@ -1129,3 +1136,301 @@ def test_symbol_lock_blocks_second_process(tmp_path, candle_net):
     finally:
         held.close()
     assert run_c(tmp_path)["exit_code"] == 0
+
+
+# ===================================================== 429 (Rate-Limit/IP) ===
+GOOD = make_bi5([(0, 2000500, 2000000, 1.0, 1.0)])
+
+
+def gate_for(clock, **kw):
+    kw.setdefault("min_pause", 900)
+    return fd.RateLimitGate(kw.pop("state_path", None), wall=clock, sleep=clock.sleep, **kw)
+
+
+def test_429_does_not_consume_attempt_nor_escalate(fake_get):
+    calls, answers = fake_get
+    clock = FakeClock()
+    th = fd.Throttle(clock, clock.sleep, jitter=0, breaker=1)   # 1 Fehlschlag wuerde ausloesen
+    gate = gate_for(clock)
+    answers += [FakeResp(429), FakeResp(429, headers={"Retry-After": "60"}), FakeResp(200, GOOD)]
+    assert fd.download_bi5("u", attempts=1, throttle=th, gate=gate, sleep=clock.sleep) == GOOD
+    assert len(calls) == 3 and gate.hits == 2
+    assert sum(clock.slept) == pytest.approx(2 * 900)        # kurzer Retry-After -> trotzdem 15 min
+    assert th.consecutive == 0 and th.cooldowns == 0 and not th.tripped.is_set()
+
+
+def test_429_long_retry_after_respected(fake_get, monkeypatch):
+    calls, answers = fake_get
+    clock = FakeClock()
+    gate = gate_for(clock)
+    t_req = []
+    answers += [FakeResp(429, headers={"Retry-After": "3600"}), FakeResp(200, GOOD)]
+    inner = fd.requests.get
+    monkeypatch.setattr(fd.requests, "get",
+                        lambda *a, **kw: (t_req.append(clock.t), inner(*a, **kw))[1])
+    assert fd.download_bi5("u", attempts=1, gate=gate, sleep=clock.sleep) == GOOD
+    assert t_req == [0, 3600] and max(clock.slept) <= 30      # in Scheiben (Stop-Signal)
+
+
+def test_429_block_shared_by_other_worker(fake_get, monkeypatch):
+    """Sperre eines Workers gilt sofort fuer alle: der naechste wartet VOR dem Request."""
+    calls, answers = fake_get
+    clock = FakeClock()
+    gate = gate_for(clock)
+    answers += [FakeResp(200, GOOD)]
+    t_req = []
+    inner = fd.requests.get
+    monkeypatch.setattr(fd.requests, "get",
+                        lambda *a, **kw: (t_req.append(clock.t), inner(*a, **kw))[1])
+    gate.hit(None, "a")                       # Worker A bekommt 429
+    assert fd.download_bi5("b", gate=gate, sleep=clock.sleep) == GOOD   # Worker B
+    assert t_req == [900]
+
+
+def answer_429_once(calls, clock=None):
+    """Jede URL: erst 429, dann gueltige Kerzendatei."""
+    seen = set()
+    lock = threading.Lock()
+
+    def get(url, headers=None, timeout=None):
+        with lock:
+            calls.append((url, clock.t if clock else None))
+            first = url not in seen
+            seen.add(url)
+        if first:
+            return FakeResp(429)
+        return FakeResp(200, pack_candles(day_rows(candle_url_side(url))))
+    return get
+
+
+def test_many_429_never_trip_breaker_or_escalate(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(fd.requests, "get", answer_429_once(calls))
+    clock = FakeClock()
+    rep = run_c(tmp_path, clock, attempts=1, max_rate_limit_wait=1e9, final_retries=0)
+    assert rep["exit_code"] == 0 and rep["gaps"] == [] and rep["pending"] == []
+    s = rep["summary"]
+    assert s["http_status_counts"] == {"200": 62, "429": 62}  # 62 x 429 > Schutzschalter (20)
+    assert not s["circuit_breaker"] and s["global_cooldowns"] == 0
+    assert s["rate_limit"]["hits_429"] == 62 and not s["rate_limited"]
+    assert sum(clock.slept) == pytest.approx(62 * 900)
+    assert parquet_names(tmp_path) == ["XAUUSD-1m-2026-07.parquet"]
+
+
+def test_many_429_with_workers_same_result(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(fd.requests, "get", answer_429_once(calls))
+    rep = run_c(tmp_path, workers=4, attempts=1, max_rate_limit_wait=1e9, final_retries=0)
+    assert rep["exit_code"] == 0 and rep["summary"]["rate_limit"]["hits_429"] == 62
+    assert rep["summary"]["global_cooldowns"] == 0 and not rep["summary"]["circuit_breaker"]
+
+
+def test_429_budget_exhausted_exit_3_pending_and_persisted(tmp_path, monkeypatch, caplog):
+    calls = []
+    clock = FakeClock()
+    monkeypatch.setattr(fd.requests, "get", answer_429_once(calls, clock))
+    rep = run_c(tmp_path, clock, max_rate_limit_wait=600)    # 15-min-Pause passt nicht
+    assert rep["exit_code"] == 3 and rep["status"] == "rate_limited"
+    assert len(calls) == 1                                    # danach KEIN Request mehr
+    assert rep["gaps"] == [] and len(rep["pending"]) == 62
+    assert {p["reason"] for p in rep["pending"]} == {"rate_limit"}
+    assert "XAUUSD 2026-07-01 BID candles" in {p["file"] for p in rep["pending"]}
+    s = rep["summary"]
+    assert s["rate_limited"] and s["pending_files"] == 62 and s["final_retry_rounds"] == 0
+    assert s["rate_limit"]["hits_429"] == 1 and s["rate_limit"]["exhausted"]
+    assert "429" in rep["hint"] and parquet_names(tmp_path) == []
+    assert json.loads(fd.run_report_path(tmp_path, SYM).read_text())["status"] == "rate_limited"
+    state = json.loads(fd.ratelimit_state_path(tmp_path).read_text())
+    assert state["blocked_until"] == pytest.approx(900)
+
+    # neuer Lauf (z.B. systemd-Neustart): wartet ZUERST die persistierte Sperre ab
+    calls.clear()
+    with caplog.at_level("WARNING", logger="dukascopy"):
+        rep = run_c(tmp_path, clock, max_rate_limit_wait=1e9)
+    assert any("429-Sperre aktiv" in r.getMessage() for r in caplog.records)
+    assert calls[0][1] >= 900                                 # erster Request erst nach Ablauf
+    assert rep["exit_code"] == 0
+
+
+def test_429_persisted_block_seen_by_other_process(tmp_path, fake_get, monkeypatch):
+    """Parallele Prozesse (anderes Symbol, Cross-Check) teilen die Sperre ueber die Datei."""
+    calls, answers = fake_get
+    clock = FakeClock()
+    other = gate_for(clock, state_path=fd.ratelimit_state_path(tmp_path))
+    fe = fd.Fetcher(tmp_path, today=date(2024, 3, 7), pause=0, sleep=clock.sleep, wall=clock)
+    other.hit(1200, "anderer Prozess")        # nach Start des Fetchers
+    answers.append(FakeResp(200, GOOD))
+    t_req = []
+    inner = fd.requests.get
+    monkeypatch.setattr(fd.requests, "get",
+                        lambda *a, **kw: (t_req.append(clock.t), inner(*a, **kw))[1])
+    o = fe.get(fd.RawFile(SYM, "ticks", datetime(2024, 3, 6, 10, tzinfo=UTC)))
+    assert o.status == "ok" and t_req == [1200]
+
+
+def test_cli_rate_limit_options(monkeypatch, capsys):
+    monkeypatch.setattr(fd, "install_stop_handler", lambda stop: None)
+    with pytest.raises(SystemExit) as e:
+        fd.main(["--symbol", "XAUUSD", "--start", "2024-01", "--rate-limit-pause", "60"])
+    assert e.value.code == 2 and "--rate-limit-pause" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        fd.main(["--symbol", "XAUUSD", "--start", "2024-01", "--candles-only"])
+    seen = {}
+    monkeypatch.setattr(fd, "verify_day", lambda *a, **kw: seen.update(kw) or {"exit_code": 0})
+    assert fd.main(["--symbol", "XAUUSD", "--verify-day", "2024-03-06", "--candles-only",
+                    "--rate-limit-pause", "1800", "--max-rate-limit-wait", "3600"]) == 0
+    assert seen["candles_only"] and seen["rate_limit_pause"] == 1800
+    assert seen["max_rate_limit_wait"] == 3600
+    with pytest.raises(ValueError):
+        fd.Fetcher(Path("/nonexistent"), rate_limit_pause=60)
+
+
+def test_429_not_in_escalating_status():
+    assert 429 not in fd.RETRY_STATUS and {403, 408, 425} <= fd.RETRY_STATUS
+
+
+# ========================================= verify-day --candles-only ===
+def full_day(side: str, base: int = 2_150_000, minutes: int = 1380) -> bytes:
+    """Werktag mit `minutes` aktiven Minuten ab 00:00, Spread 0.3 (ASK = BID + 300)."""
+    b = base + (300 if side == "ASK" else 0)
+    rows = []
+    for m in range(minutes):
+        o, c = b + (m % 7) * 10, b + ((m + 3) % 7) * 10
+        rows.append((m * 60, o, max(o, c) + 20, min(o, c) - 20, c, 1.0))
+    return pack_candles(rows)
+
+
+def test_verify_candles_only_two_requests_and_sample(tmp_path, fake_get, caplog):
+    calls, answers = fake_get
+    answers += [FakeResp(200, full_day("BID")), FakeResp(200, full_day("ASK"))]
+    with caplog.at_level("WARNING", logger="dukascopy"):
+        rep = fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7), pause=0,
+                            candles_only=True)
+    assert len(calls) == 2 and rep["requests"] == 2
+    assert [c["url"].rsplit("/", 1)[1] for c in calls] == ["BID_candles_min_1.bi5",
+                                                           "ASK_candles_min_1.bi5"]
+    assert not any("26 Requests" in r.getMessage() for r in caplog.records)
+    assert rep["ok"] and rep["exit_code"] == 0 and rep["status"] == "ok"
+    assert rep["variant"] == "candles_only" and rep["field_order"] == {"BID": "OCLH", "ASK": "OCLH"}
+    pl = rep["plausibility"]
+    assert pl["minutes"] == 1380 and pl["crossed"] == 0
+    assert pl["spread_median"] == pytest.approx(0.3) and rep["plausibility_problems"] == []
+    assert "minutes_ticks" not in rep                       # kein Tickvergleich
+    # Stichprobe: ausserhalb des Monatsstores, Store-Schema
+    sp = fd.sample_path(tmp_path, SYM, VDAY)
+    assert sp == (tmp_path / "metals" / "samples" / "source=dukascopy" / "symbol=XAUUSD"
+                  / "XAUUSD-1m-2024-03-06.parquet")
+    assert rep["sample_path"] == str(sp)
+    assert not list((tmp_path / "metals" / "source=dukascopy").rglob("*.parquet"))
+    df = pd.read_parquet(sp)
+    assert list(df.columns) == fd.COLUMNS and len(df) == 1380
+    assert df["ts"].dtype == "datetime64[ms, UTC]" and df["tick_count"].dtype == "int64"
+    assert df["source"].eq("dukascopy").all()
+    assert df["ask_close"].iloc[0] - df["bid_close"].iloc[0] == pytest.approx(0.3)
+    saved = json.loads(fd.verify_report_path(tmp_path, SYM, VDAY).read_text())
+    assert saved["sample_path"] == str(sp) and saved["rate_limit"]["hits_429"] == 0
+    # erneut: alles aus dem Cache, 0 Requests
+    rep = fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7), pause=0,
+                        candles_only=True)
+    assert len(calls) == 2 and rep["requests"] == 0 and rep["exit_code"] == 0
+
+
+def test_verify_tick_variant_warns_26_requests(tmp_path, fake_get, caplog):
+    verify_files(tmp_path)
+    with caplog.at_level("WARNING", logger="dukascopy"):
+        fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7), pause=0)
+    assert any("26 Requests" in r.getMessage() for r in caplog.records)
+
+
+def test_verify_candles_only_implausible_writes_no_sample(tmp_path, candle_net):
+    run_c(tmp_path)
+    day = date(2026, 7, 15)
+    rep = fd.verify_day(SYM, day, data_root=tmp_path, today=date(2026, 8, 20), pause=0,
+                        candles_only=True)
+    # nur 2 aktive Minuten an einem Werktag -> unplausibel -> KEINE Stichprobe
+    # (der Cross-Check liest Stichproben ohne Report)
+    assert rep["exit_code"] == 4 and rep["status"] == "implausible"
+    assert "Minuten an einem Werktag" in rep["plausibility_problems"][0]
+    assert rep["sample_path"] is None and not fd.sample_path(tmp_path, SYM, day).exists()
+
+
+def test_verify_candles_only_sample_has_store_schema(tmp_path, fake_get):
+    import pyarrow.parquet as pq
+    _, answers = fake_get
+    answers += [FakeResp(200, full_day("BID")), FakeResp(200, full_day("ASK"))]
+    rep = fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7), pause=0,
+                        candles_only=True)
+    assert rep["exit_code"] == 0 and rep["ok"]
+    sp = fd.sample_path(tmp_path, SYM, VDAY)
+    assert rep["sample_path"] == str(sp)
+    ref = tmp_path / "ref.parquet"
+    fd.write_parquet(ref, make_bars(3), "candles")              # wie ein Monats-Store
+    assert pq.read_schema(sp).remove_metadata() == pq.read_schema(ref).remove_metadata()
+    assert pq.read_schema(sp).metadata[b"dukascopy_mode"] == b"candles"
+    got = pd.read_parquet(sp)
+    assert len(got) > 600 and (got["source"] == "dukascopy").all()
+
+
+def test_verify_candles_only_implausible_exit_4_no_sample(tmp_path, fake_get, monkeypatch):
+    _, answers = fake_get
+    sp = fd.sample_path(tmp_path, SYM, VDAY)
+    fd.write_parquet(sp, make_bars(3), "candles")             # veraltete Stichprobe
+    monkeypatch.setitem(fd.POINT_DIVISOR, SYM, 100)          # Faktor 10 -> ausserhalb PLAUSIBLE
+    answers += [FakeResp(200, full_day("BID")), FakeResp(200, full_day("ASK"))]
+    rep = fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7), pause=0,
+                        candles_only=True)
+    assert rep["exit_code"] == 4 and not rep["ok"]
+    assert "Plausibilitaetsbereich" in rep["plausibility_problems"][0]
+    assert rep["sample_path"] is None and not sp.exists()
+
+
+def test_verify_candles_only_crossed_and_wide_spread(tmp_path, fake_get):
+    _, answers = fake_get
+    # ASK unter BID -> gekreuzt
+    answers += [FakeResp(200, full_day("BID")), FakeResp(200, full_day("BID", 2_149_000))]
+    rep = fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7), pause=0,
+                        candles_only=True)
+    assert rep["exit_code"] == 4 and "ask_close < bid_close" in rep["plausibility_problems"][0]
+    d2 = date(2024, 3, 5)
+    answers += [FakeResp(200, full_day("BID")), FakeResp(200, full_day("BID", 2_200_000))]
+    rep = fd.verify_day(SYM, d2, data_root=tmp_path, today=date(2024, 3, 7), pause=0,
+                        candles_only=True)                     # Spread 50 = 2.3 %
+    assert rep["exit_code"] == 4 and "Median-Spread" in rep["plausibility_problems"][0]
+
+
+def test_verify_candles_only_weekend_no_data_exit_4(tmp_path, fake_get):
+    _, answers = fake_get
+    answers += [FakeResp(404), FakeResp(404)]
+    rep = fd.verify_day(SYM, date(2024, 3, 9), data_root=tmp_path, today=date(2024, 3, 11),
+                        pause=0, candles_only=True)           # Samstag
+    assert rep["exit_code"] == 4 and rep["status"] == "no_data" and "Werktag" in rep["note"]
+
+
+def test_verify_candles_only_rate_limited_exit_3(tmp_path, monkeypatch):
+    calls = []
+    clock = FakeClock()
+    monkeypatch.setattr(fd.requests, "get", answer_429_once(calls, clock))
+    rep = fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7), pause=0,
+                        candles_only=True, sleep=clock.sleep, wall=clock, max_rate_limit_wait=0)
+    assert rep["exit_code"] == 3 and rep["status"] == "rate_limited" and len(calls) == 1
+    assert [p["reason"] for p in rep["pending"]] == ["rate_limit", "rate_limit"]
+    assert rep["rate_limit"]["hits_429"] == 1 and rep["sample_path"] is None
+    # neuer Aufruf mit Budget: wartet erst die persistierte Sperre ab; BID 200, ASK 429
+    # (kein Versuch verbraucht, attempts=1) -> Pause -> ASK 200. Tag hat nur 3 Minuten -> 4
+    calls.clear()
+    rep = fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7), pause=0,
+                        candles_only=True, sleep=clock.sleep, wall=clock, attempts=1)
+    assert [u.rsplit("/", 1)[1][:3] for u, _ in calls] == ["BID", "ASK", "ASK"]
+    assert calls[0][1] >= 900 and calls[2][1] - calls[1][1] >= 900
+    assert rep["exit_code"] == 4 and rep["status"] == "implausible"
+    assert rep["rate_limit"]["hits_429"] == 1
+
+
+def test_verify_candles_only_lock_held_exit_3(tmp_path, fake_get):
+    held = fd.acquire_lock(tmp_path, SYM)
+    try:
+        rep = fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7),
+                            candles_only=True)
+        assert rep["exit_code"] == 3 and rep["status"] == "locked" and fake_get[0] == []
+    finally:
+        held.close()

@@ -96,3 +96,56 @@ def test_stop_signal_interrupts_wait():
     g.hit()
     assert g.wait() is False
     assert sum(c.slept) <= rl.CHUNK_S
+
+
+def test_nonfinite_retry_after_never_blocks_forever(tmp_path):
+    assert rl.parse_retry_after("inf") is None and rl.parse_retry_after("nan") is None
+    c = Clock()
+    p = tmp_path / "s.json"
+    g = rl.RateLimitGate(p, min_pause=900, wall=c, sleep=c.sleep)
+    assert g.hit(float("inf")) == 900                       # wie fehlend
+    assert g.hit(1e12) == rl.MAX_RETRY_AFTER_S              # Muell-Header gedeckelt
+    assert g.summary()["blocked_until_utc"] is not None
+    p.write_text('{"blocked_until": Infinity}')             # kaputter Zustand
+    assert rl.RateLimitGate(p, wall=c, sleep=c.sleep).remaining() == 0
+
+
+def test_budget_counts_wall_time_not_sum_over_workers():
+    """4 gleichzeitig wartende Worker verbrauchen das Budget nicht 4x so schnell."""
+    import time
+    scale = 30_000.0                          # 900 s Sperre = 30 ms echte Zeit
+    t0 = time.monotonic()
+    g = rl.RateLimitGate(min_pause=900, max_total_wait=1200, chunk=30,
+                         wall=lambda: (time.monotonic() - t0) * scale,
+                         sleep=lambda s: time.sleep(s / scale))
+    g.hit()
+    barrier = threading.Barrier(4)
+    results = []
+
+    def waiter():
+        barrier.wait()
+        try:
+            results.append(g.wait())
+        except rl.RateLimitExhausted as e:
+            results.append(e)
+
+    ts = [threading.Thread(target=waiter) for _ in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(10)
+    # vorher: 4 x ~900 s = 3600 s > 1200 s Budget -> RateLimitExhausted
+    assert results == [True] * 4
+    assert g.waited <= 900 + 30 + 1e-6
+
+
+def test_exhausted_is_sticky():
+    c = Clock()
+    g = rl.RateLimitGate(min_pause=900, max_total_wait=0, wall=c, sleep=c.sleep)
+    g.hit()
+    with pytest.raises(rl.RateLimitExhausted):
+        g.wait()
+    c.t += 10_000                             # Sperre laengst abgelaufen
+    with pytest.raises(rl.RateLimitExhausted):
+        g.wait()                              # trotzdem: keine weiteren Requests im Lauf
+    assert g.summary()["exhausted"]

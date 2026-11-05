@@ -15,7 +15,15 @@ Bid- UND Ask-OHLC laden.
   Lueckenliste wird IMMER geschrieben; Validierungsfehler werden je Monat
   gesammelt (uebrige Monate laufen weiter)
 - Drosselung: Pause je Worker, eskalierende globale Abkuehlung bei Drossel-/
-  Fehlerantworten, Schutzschalter nach N Fehlschlaegen in Folge
+  Fehlerantworten (403/408/425/5xx, Timeouts), Schutzschalter nach N
+  Fehlschlaegen in Folge
+- HTTP 429 (Rate-Limit pro Client-IP) gesondert (ratelimit.py): KEIN
+  Fehlversuch, keine Eskalation, zaehlt nicht fuer den Schutzschalter.
+  Stattdessen Pause max(Retry-After, --rate-limit-pause >= 15 min) fuer ALLE
+  Worker, persistiert in metals/state/dukascopy-ratelimit.json (gilt auch
+  nach Neustart und fuer parallele Prozesse); danach dieselbe Datei erneut.
+  Wartebudget je Lauf --max-rate-limit-wait (default 6 h): danach keine
+  weiteren Requests, offene Dateien als "pending" im Laufreport, Exit 3
 - validiert hart, bevor irgendetwas geschrieben wird; weiche Auffaelligkeiten
   (Spread-Ausreisser, Preisspruenge, Minuten ohne Ticks) nur als Report
 - schreibt hive-partitioniertes Parquet (zstd), alle Zeiten UTC
@@ -51,7 +59,11 @@ Belege Kerzenformat (nur gelesen, nichts ausgefuehrt; Details DATA.md):
     - keine passt -> Datei in QUARANTAENE (<name>.quarantine), Monat wird
       nicht geschrieben, Exit 4 ("manuelle Pruefung noetig"); die Datei wird
       nicht erneut geladen, bis die Quarantaenedatei geloescht ist
-  Pruefen gegen Ticks: --verify-day YYYY-MM-DD.
+  Pruefen gegen Ticks: --verify-day YYYY-MM-DD (26 Requests: 24 Tick-
+  Stunden + 2 Kerzendateien). Unter Rate-Limit: --verify-day YYYY-MM-DD
+  --candles-only (nur BID+ASK-Kerzen = 2 Requests, Plausibilitaetspruefung
+  statt Tickvergleich). Beide schreiben die Tagesbars zusaetzlich als
+  Stichprobe (metals/samples/..., s. Ablage).
 
 Fuellkerzen (Annahme): Minuten ohne Ticks sind flache Kerzen mit volume 0.
 Eine Minute wird verworfen, wenn BEIDE Seiten volume == 0 UND flache Preise
@@ -82,6 +94,11 @@ Ablage (DATA_ROOT = $MARKETDATA_DATA_ROOT, sonst <repo>/data):
     metals/reports/{SYM}-dukascopy-run.json      Laufreport inkl. Lueckenliste
                                                  (wird beim Start gelesen)
     metals/reports/{SYM}-verify-{YYYY-MM-DD}.json  Ergebnis --verify-day
+    metals/samples/source=dukascopy/symbol={SYM}/{SYM}-1m-{YYYY-MM-DD}.parquet
+        Tagesbars aus --verify-day (Store-Schema), bewusst AUSSERHALB von
+        metals/source=dukascopy/..., damit der Loader des Bots sie nie mit
+        dem Monatsstore mischt (Cross-Check-Stichproben)
+    metals/state/dukascopy-ratelimit.json        429-Sperre (blocked_until), flock
     metals/.lock-{SYM}                           Prozess-Lock je Symbol (flock)
   Temporaerdateien heissen .{name}.{pid}.{thread}.part (Punkt vorn: werden
   von pyarrow/hive ignoriert); verwaiste werden beim Start entfernt. Jede
@@ -90,10 +107,12 @@ Ablage (DATA_ROOT = $MARKETDATA_DATA_ROOT, sonst <repo>/data):
 Exit-Codes (Vorrang in dieser Reihenfolge):
   2  Validierungsfehler (mindestens ein Monat; uebrige Monate liefen weiter)
   3  Luecken: Downloads gescheitert, unbestaetigte "keine Daten", Lauf
-     unterbrochen (SIGTERM), Schutzschalter ausgeloest oder Symbol-Lock
-     belegt -> spaeter erneut (systemd-Neustart sinnvoll)
+     unterbrochen (SIGTERM), Schutzschalter ausgeloest, 429-Wartebudget
+     erschoepft oder Symbol-Lock belegt -> spaeter erneut (systemd-Neustart
+     sinnvoll)
   4  manuelle Pruefung noetig: Datei(en) in Quarantaene (Feldreihenfolge);
-     bei --verify-day: Abweichung Kerzen vs. Ticks ueber Toleranz
+     bei --verify-day: Abweichung Kerzen vs. Ticks ueber Toleranz bzw.
+     (--candles-only) Kerzen unplausibel
   0  vollstaendig
 
 Lizenz: Dukascopy-Nutzungsbedingungen selbst pruefen. Daten (roh wie
@@ -104,6 +123,7 @@ Usage:
     python fetch_dukascopy.py --symbol EURUSD --start 2024-01 --end 2024-06 --mode ticks
     python fetch_dukascopy.py --symbol XAUUSD --start 2024-01 --end 2024-01 --rebuild
     python fetch_dukascopy.py --symbol XAUUSD --verify-day 2024-03-06
+    python fetch_dukascopy.py --symbol XAUUSD --verify-day 2024-03-06 --candles-only
 """
 from __future__ import annotations
 
@@ -129,6 +149,9 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
+
+import ratelimit as rl
+from ratelimit import RateLimitExhausted, RateLimitGate
 
 BASE = "https://datafeed.dukascopy.com/datafeed"
 ROOT = Path(__file__).resolve().parents[1]
@@ -200,8 +223,12 @@ CONFIRM_AFTER_S = 24 * 3600     # Werktags-"keine Daten" erst danach endgueltig
 SETTLE_S = 6 * 3600             # Tagesende muss mindestens so lange her sein
 # Wiederholbare HTTP-Status: zusaetzlich alle 5xx. 403 ist beim Datafeed
 # vermutlich WAF/Bot-Schutz (neuere Pakete sind deshalb auf eine andere API
-# umgestiegen) -> wie 429/503 behandeln, nie als "keine Daten".
-RETRY_STATUS = {403, 408, 425, 429}
+# umgestiegen) -> wie 503 behandeln, nie als "keine Daten".
+# 429 ist NICHT dabei: eigener Pfad ueber RateLimitGate (kein Fehlversuch).
+RETRY_STATUS = {403, 408, 425}
+RATE_LIMIT_STATUS = 429
+RATE_LIMIT_PAUSE_S = rl.MIN_PAUSE_S          # >= 15 min Pause nach 429 (CLI: nicht kleiner)
+MAX_RATE_LIMIT_WAIT_S = rl.MAX_TOTAL_WAIT_S  # 429-Wartebudget je Lauf, danach Exit 3
 WAF_SHARE = 0.5            # >= 50 % der Requests mit 403 -> deutlicher Hinweis
 
 EXIT_OK, EXIT_VALIDATION, EXIT_GAPS, EXIT_MANUAL = 0, 2, 3, 4
@@ -211,6 +238,9 @@ MAX_CROSSED_SHARE = 0.001  # > 0.1 % gekreuzte Bars (ask_close < bid_close) -> A
 SPREAD_OUTLIER_X = 20.0    # weich: Spread > 20x Monatsmedian
 JUMP_THRESHOLD = 0.02      # weich: |Mid-Rendite 1m| > 2 %
 N_EXAMPLES = 10
+# --verify-day --candles-only (grobe Plausibilitaet eines Tages)
+MIN_WEEKDAY_MINUTES = 600  # Werktag mit weniger Minuten -> unplausibel (Handel ~23 h/Tag)
+MAX_SPREAD_REL = 0.01      # Median-Spread > 1 % vom Mid -> unplausibel
 
 BID = ["bid_open", "bid_high", "bid_low", "bid_close"]
 ASK = ["ask_open", "ask_high", "ask_low", "ask_close"]
@@ -300,6 +330,17 @@ def verify_report_path(data_root: Path, symbol: str, day: date) -> Path:
 
 def lock_path(data_root: Path, symbol: str) -> Path:
     return data_root / "metals" / f".lock-{symbol}"
+
+
+def ratelimit_state_path(data_root: Path) -> Path:
+    """429-Sperre, geteilt von allen Dukascopy-Prozessen (alle Symbole: Limit gilt je IP)."""
+    return data_root / "metals" / "state" / "dukascopy-ratelimit.json"
+
+
+def sample_path(data_root: Path, symbol: str, day: date) -> Path:
+    """Stichprobe eines Tages (--verify-day); bewusst ausserhalb des Monatsstores."""
+    return (data_root / "metals" / "samples" / f"source={SOURCE}" / f"symbol={symbol}"
+            / f"{symbol}-1m-{day:%Y-%m-%d}.parquet")
 
 
 @dataclass(frozen=True)
@@ -485,8 +526,9 @@ class Throttle:
     """
     Gemeinsamer Zustand ALLER Worker:
     - "nicht vor t": vor jedem Request wird darauf gewartet
-    - Zaehler aufeinanderfolgender Drossel-/Fehlerantworten (403/429/5xx,
-      Timeouts, Verbindungsfehler), ueber Dateigrenzen hinweg; jede setzt
+    - Zaehler aufeinanderfolgender Drossel-/Fehlerantworten (403/408/425/5xx,
+      Timeouts, Verbindungsfehler; NICHT 429, s. RateLimitGate), ueber
+      Dateigrenzen hinweg; jede setzt
       eine globale Abkuehlung base * 2**k (bis cap); Reset erst bei 200/404
     - Schutzschalter: nach `breaker` Fehlschlaegen in Folge wird `tripped`
       gesetzt -> keine neuen Requests, Lauf endet sauber (Exit 3)
@@ -553,15 +595,21 @@ def download_bi5(url: str, *, attempts: int = ATTEMPTS, backoff_base: float = BA
                  timeout: tuple[float, float] = (CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
                  sleep=None, throttle: Throttle | None = None, rng=None,
                  stop: threading.Event | None = None, on_response=None,
-                 session=None) -> bytes | None:
+                 session=None, gate: RateLimitGate | None = None) -> bytes | None:
     """
     Laedt eine .bi5-Datei. None bei 404, b"" bei leerer Antwort.
-    Bis zu `attempts` Versuche bei Netzfehlern/Timeouts, 403/408/425/429/5xx
+    Bis zu `attempts` Versuche bei Netzfehlern/Timeouts, 403/408/425/5xx
     und nicht dekomprimierbarem Inhalt (abgeschnittene Uebertragung).
     Mit `throttle`: jede Drossel-/Fehlerantwort setzt eine eskalierende
     globale Abkuehlung (s. Throttle), 200/404 setzt sie zurueck; ohne
     `throttle`: lokaler Backoff base * 2**n. Andere HTTP-Fehler: kein Retry.
-    Wirft DownloadError (mit .status, .attempts) bzw. Interrupted.
+
+    HTTP 429: KEIN Versuch verbraucht, kein Throttle-Fehlschlag. `gate.hit`
+    setzt die gemeinsame Sperre (max(Retry-After, min_pause)), danach wird
+    dieselbe Datei erneut angefragt. Vor JEDEM Request `gate.wait()`. Ohne
+    `gate` wird bei Bedarf eine lokale Sperre (ohne Persistenz) angelegt.
+    Wirft DownloadError (mit .status, .attempts), Interrupted bzw.
+    RateLimitExhausted (429-Wartebudget erschoepft).
     """
     sleep = sleep if sleep is not None else _sleep
     get = session.get if session is not None else requests.get
@@ -571,13 +619,17 @@ def download_bi5(url: str, *, attempts: int = ATTEMPTS, backoff_base: float = BA
         return ((stop is not None and stop.is_set())
                 or (throttle is not None and throttle.tripped.is_set()))
 
-    for n in range(attempts):
+    n = 0                                   # verbrauchte Versuche (429 zaehlt nicht)
+    while n < attempts:
         if halted():
             raise Interrupted(url)
         if throttle is not None:
             throttle.wait()
             if halted():
                 raise Interrupted(url)
+        # direkt vor dem Request: 429-Sperre (auch eines anderen Workers/Prozesses)
+        if gate is not None and not gate.wait():
+            raise Interrupted(url)
         retry_after, overload = None, False
         try:
             r = get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
@@ -589,6 +641,14 @@ def download_bi5(url: str, *, attempts: int = ATTEMPTS, backoff_base: float = BA
             status = r.status_code
             if on_response:
                 on_response(status)
+            if status == RATE_LIMIT_STATUS:
+                ra = parse_retry_after((getattr(r, "headers", None) or {}).get("Retry-After"))
+                if gate is None:
+                    gate = RateLimitGate(None, sleep=sleep, stop=stop)
+                pause = gate.hit(ra, url)
+                log.info("429 %s: gleiche Datei nach %.0f min Pause erneut (Versuch %d/%d "
+                         "nicht verbraucht)", url, pause / 60, n + 1, attempts)
+                continue
             if status == 404:
                 if throttle is not None:
                     throttle.success()
@@ -610,16 +670,17 @@ def download_bi5(url: str, *, attempts: int = ATTEMPTS, backoff_base: float = BA
                 retry_after = parse_retry_after((getattr(r, "headers", None) or {}).get("Retry-After"))
             else:
                 raise DownloadError(f"HTTP {status}: {url}", status=status, attempts=n + 1)
+        n += 1
         if overload and throttle is not None:
             # auch nach dem letzten Versuch: die anderen Worker sollen abkuehlen
             wait = throttle.failure(err, retry_after)
-            if n + 1 < attempts:
+            if n < attempts:
                 log.info("retry %d/%d nach globaler Abkuehlung %.1fs %s (%s)",
-                         n + 1, attempts - 1, wait, url, err)
+                         n, attempts - 1, wait, url, err)
                 throttle.wait()
-        elif n + 1 < attempts:
-            wait = backoff_delay(n, backoff_base, max_backoff, jitter, rng, retry_after)
-            log.info("retry %d/%d in %.1fs %s (%s)", n + 1, attempts - 1, wait, url, err)
+        elif n < attempts:
+            wait = backoff_delay(n - 1, backoff_base, max_backoff, jitter, rng, retry_after)
+            log.info("retry %d/%d in %.1fs %s (%s)", n, attempts - 1, wait, url, err)
             sleep(wait)
     raise DownloadError(f"{url}: {attempts} Versuche fehlgeschlagen ({err})",
                         status=status, attempts=attempts)
@@ -628,7 +689,7 @@ def download_bi5(url: str, *, attempts: int = ATTEMPTS, backoff_base: float = BA
 @dataclass
 class Outcome:
     # cached | cached_404 | cached_empty | ok | 404 | empty | unconfirmed |
-    # quarantined | failed | skipped
+    # quarantined | failed | skipped | rate_limited
     status: str
     error: str | None = None
     attempts: int = 0
@@ -662,6 +723,10 @@ class Fetcher:
     Worker, eskalierende globale Abkuehlung, Schutzschalter). Cache-Treffer
     sind keine Requests. Kerzendateien werden erst SETTLE_S nach Tagesende
     angefordert. Eine requests.Session (Keep-Alive) je Worker-Thread.
+    Eine RateLimitGate (429) fuer alle Worker, persistiert unter
+    ratelimit_state_path(data_root); `wall` = Wanduhr der Sperre (Tests).
+    429-Wartebudget erschoepft -> `rate_limited` gesetzt, keine weiteren
+    Requests (wie Schutzschalter, aber eigener Status).
     """
 
     def __init__(self, data_root: Path, *, workers: int = WORKERS, pause: float = PAUSE_S,
@@ -670,7 +735,12 @@ class Fetcher:
                  timeout: tuple[float, float] = (CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
                  sleep=None, clock=None, rng=None, stop: threading.Event | None = None,
                  today: date | None = None, now=None,
-                 max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES):
+                 max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
+                 rate_limit_pause: float = RATE_LIMIT_PAUSE_S,
+                 max_rate_limit_wait: float = MAX_RATE_LIMIT_WAIT_S,
+                 wall=None, gate: RateLimitGate | None = None):
+        if gate is None and rate_limit_pause < rl.MIN_PAUSE_S:
+            raise ValueError(f"rate_limit_pause {rate_limit_pause:g}s < {rl.MIN_PAUSE_S:g}s")
         self.data_root = data_root
         self.workers, self.pause, self.attempts = max(1, workers), pause, attempts
         self.backoff_base, self.max_backoff, self.jitter = backoff_base, max_backoff, jitter
@@ -681,14 +751,29 @@ class Fetcher:
         self.now = now or utc_now
         self.throttle = Throttle(clock or time.monotonic, sleep, backoff_base, max_backoff,
                                  jitter, rng, max_consecutive_failures)
+        # Schlaf der Sperre ueber self.sleep: per CLI durch SIGTERM unterbrechbar,
+        # in Tests injiziert (Wanduhr `wall` muss dann mitlaufen)
+        self.gate = gate or RateLimitGate(
+            ratelimit_state_path(data_root), min_pause=rate_limit_pause,
+            max_total_wait=max_rate_limit_wait, wall=wall or time.time,
+            sleep=self.sleep, stop=self.stop)
+        self.rate_limited = threading.Event()
+        self.rate_limit_error: str | None = None
         self.lock = threading.Lock()
         self.local = threading.local()
         self.requests = 0
         self.status_counts: dict[str, int] = {}
+        rem = self.gate.remaining()
+        if rem > 0:
+            log.warning("429-Sperre aktiv (persistiert in %s): noch %.0f min bis %s UTC - "
+                        "erster Request wartet so lange (Wartebudget %.1f h)",
+                        self.gate.state_path, rem / 60,
+                        self.gate.summary()["blocked_until_utc"], self.gate.max_total_wait / 3600)
 
     @property
     def halted(self) -> bool:
-        return self.stop.is_set() or self.throttle.tripped.is_set()
+        return (self.stop.is_set() or self.throttle.tripped.is_set()
+                or self.rate_limited.is_set())
 
     def sleep(self, s: float) -> None:
         (self._sleep or _sleep)(s)
@@ -752,9 +837,18 @@ class Fetcher:
                 f.url(), attempts=self.attempts, backoff_base=self.backoff_base,
                 max_backoff=self.max_backoff, jitter=self.jitter, timeout=self.timeout,
                 sleep=self.sleep, throttle=self.throttle, rng=self.rng, stop=self.stop,
-                on_response=self._count, session=self.session())
+                on_response=self._count, session=self.session(), gate=self.gate)
         except Interrupted:
             return Outcome("skipped")
+        except RateLimitExhausted as e:
+            with self.lock:
+                first = not self.rate_limited.is_set()
+                self.rate_limited.set()
+                self.rate_limit_error = self.rate_limit_error or str(e)
+            if first:
+                log.error("429-WARTEBUDGET ERSCHOEPFT bei %s: %s - keine weiteren Requests, "
+                          "Lauf endet mit Luecken (Exit 3)", f.key, e)
+            return Outcome("rate_limited", str(e))
         except DownloadError as e:
             log.warning("FEHLSCHLAG %s: %s (%d Versuche, spaeter erneut)", f.key, e, e.attempts)
             out = Outcome("failed", str(e), e.attempts, e.status)
@@ -1310,7 +1404,9 @@ def run(symbol: str, start: date, end: date, data_root: Path | None = None,
         timeout: tuple[float, float] = (CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
         progress_every: int = PROGRESS_EVERY,
         max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
-        sleep=None, clock=None, rng=None, now=None,
+        rate_limit_pause: float = RATE_LIMIT_PAUSE_S,
+        max_rate_limit_wait: float = MAX_RATE_LIMIT_WAIT_S,
+        sleep=None, clock=None, rng=None, now=None, wall=None,
         stop: threading.Event | None = None) -> dict:
     """
     Laedt alle abgeschlossenen Monate [start, end] und gibt den Laufreport
@@ -1340,20 +1436,24 @@ def run(symbol: str, start: date, end: date, data_root: Path | None = None,
                            final_retries=final_retries, final_wait=final_wait, timeout=timeout,
                            progress_every=progress_every,
                            max_consecutive_failures=max_consecutive_failures,
-                           sleep=sleep, rng=rng)
+                           rate_limit_pause=rate_limit_pause,
+                           max_rate_limit_wait=max_rate_limit_wait,
+                           sleep=sleep, rng=rng, wall=wall)
     finally:
         lock.close()
 
 
 def _run_locked(symbol, start, end, data_root, today, now, stop, clock, *, mode, workers,
                 rebuild, pause, attempts, backoff_base, max_backoff, jitter, final_retries,
-                final_wait, timeout, progress_every, max_consecutive_failures, sleep,
-                rng) -> dict:
+                final_wait, timeout, progress_every, max_consecutive_failures,
+                rate_limit_pause, max_rate_limit_wait, sleep, rng, wall) -> dict:
     cleanup_orphans(data_root, symbol)
     fetcher = Fetcher(data_root, workers=workers, pause=pause, attempts=attempts,
                       backoff_base=backoff_base, max_backoff=max_backoff, jitter=jitter,
                       timeout=timeout, sleep=sleep, clock=clock, rng=rng, stop=stop,
-                      today=today, now=now, max_consecutive_failures=max_consecutive_failures)
+                      today=today, now=now, max_consecutive_failures=max_consecutive_failures,
+                      rate_limit_pause=rate_limit_pause,
+                      max_rate_limit_wait=max_rate_limit_wait, wall=wall)
     build = build_month_candles if mode == "candles" else build_month_ticks
 
     started = utc_now()
@@ -1398,7 +1498,7 @@ def _run_locked(symbol, start, end, data_root, today, now, stop, clock, *, mode,
                 gaps[f] = {"error": o.error, "http_status": o.http_status,
                            "attempts": (prev["attempts"] if prev else 0) + o.attempts}
                 continue
-            if o.status == "skipped":
+            if o.status in ("skipped", "rate_limited"):
                 continue
             if o.status in ("ok", "404", "empty"):
                 counts["downloaded" if o.status == "ok" else o.status] += 1
@@ -1517,13 +1617,16 @@ def _run_locked(symbol, start, end, data_root, today, now, stop, clock, *, mode,
                               final_retries=final_retries, final_wait=final_wait,
                               connect_timeout=timeout[0], read_timeout=timeout[1],
                               max_consecutive_failures=max_consecutive_failures,
-                              rebuild=rebuild))
+                              rate_limit_pause=rate_limit_pause,
+                              max_rate_limit_wait=max_rate_limit_wait, rebuild=rebuild))
         write_json_atomic(run_report_path(data_root, symbol), rep)
+        rls = rep["summary"]["rate_limit"]
         log.info("FERTIG %s: status=%s exit=%d, %d Monate geschrieben, %d Luecken, "
-                 "%d unbestaetigt, %d Quarantaene, %d Requests (Report %s)", symbol,
-                 rep["status"], rep["exit_code"], len(rep["summary"]["months_written"]),
-                 len(gaps), len(unconfirmed), len(quarantine), fetcher.requests,
-                 run_report_path(data_root, symbol))
+                 "%d unbestaetigt, %d Quarantaene, %d offen, %d Requests, 429: %d (%.0f min "
+                 "gewartet) (Report %s)", symbol, rep["status"], rep["exit_code"],
+                 len(rep["summary"]["months_written"]), len(gaps), len(unconfirmed),
+                 len(quarantine), len(rep["pending"]), fetcher.requests, rls["hits_429"],
+                 rls["waited_s"] / 60, run_report_path(data_root, symbol))
     return rep
 
 
@@ -1541,13 +1644,21 @@ def _run_report(symbol, mode, start, end, started, data_root, fetcher, months_to
     incomplete = [ym for ym in months_todo
                   if ym not in finished and ym not in validation_errors and ym not in blocked_q]
     tripped = fetcher.throttle.tripped.is_set()
+    rate_limited = fetcher.rate_limited.is_set()
+    halt_reason = ("circuit_breaker" if tripped else "rate_limit" if rate_limited
+                   else "interrupted" if fetcher.stop.is_set() else None)
+    # nicht mehr angefragte Dateien (Lauf vorzeitig beendet): fuer den Report
+    pending = [] if halt_reason is None else [
+        f for ym in months_todo for f in files_by_month[ym]
+        if f not in gaps and f not in unconfirmed
+        and fetcher.state(f)[0] in ("missing", "recheck")]
     if state["status"] == "error":
         status, code = "error", 1
     elif validation_errors:
         status, code = "validation_error", EXIT_VALIDATION
     elif gaps or unconfirmed or incomplete:
-        status = ("circuit_breaker" if tripped else "interrupted" if fetcher.stop.is_set()
-                  else "gaps")
+        status = ("circuit_breaker" if tripped else "rate_limited" if rate_limited
+                  else "interrupted" if fetcher.stop.is_set() else "gaps")
         code = EXIT_GAPS
     elif blocked_q:
         status, code = "quarantine", EXIT_MANUAL
@@ -1563,6 +1674,11 @@ def _run_report(symbol, mode, start, end, started, data_root, fetcher, months_to
     if tripped:
         hints.append(f"Schutzschalter: {fetcher.throttle.consecutive} Fehlschlaege in Folge - "
                      "Lauf beendet, Neustart spaeter (systemd) setzt fort.")
+    if rate_limited:
+        hints.append(f"HTTP 429 (Rate-Limit pro IP), Wartebudget erschoepft "
+                     f"({fetcher.rate_limit_error}): {len(pending)} Dateien offen (pending). "
+                     f"Sperre persistiert in {fetcher.gate.state_path}; Neustart spaeter "
+                     "(systemd) wartet sie ab und setzt fort.")
     if quarantine:
         hints.append("Dateien in Quarantaene (Feldreihenfolge): manuell pruefen, z.B. "
                      "--verify-day; Quarantaenedatei loeschen = erneut laden.")
@@ -1592,6 +1708,9 @@ def _run_report(symbol, mode, start, end, started, data_root, fetcher, months_to
             "http_403_waf_suspected": n403,
             "global_cooldowns": fetcher.throttle.cooldowns,
             "circuit_breaker": tripped,
+            "rate_limited": rate_limited,
+            "rate_limit": fetcher.gate.summary(),
+            "pending_files": len(pending),
             "final_retry_rounds": state["final_rounds"],
             "recovered_in_final_retries": counts["recovered_in_final_retries"],
             "failed_files": len(gaps),
@@ -1616,6 +1735,11 @@ def _run_report(symbol, mode, start, end, started, data_root, fetcher, months_to
             {"symbol": symbol, "mode": mode, "month": f"{f.t:%Y-%m}", "file": f.key,
              **f.to_json(), "path": str(f.marker(data_root, "quarantine")), "reason": r}
             for f, r in sorted(quarantine.items(), key=lambda kv: (kv[0].t, kv[0].side))],
+        # vorzeitig beendet (429-Budget, Schutzschalter, SIGTERM): nicht angefragt
+        "pending": [
+            {"symbol": symbol, "mode": mode, "month": f"{f.t:%Y-%m}", "file": f.key,
+             **f.to_json(), "url": f.url(), "reason": halt_reason}
+            for f in sorted(pending, key=lambda f: (f.t, f.side))],
     }
 
 
@@ -1658,12 +1782,26 @@ def compare_bars(ticks: pd.DataFrame, candles: pd.DataFrame, divisor: int,
 
 
 def verify_day(symbol: str, day: date, data_root: Path | None = None, today: date | None = None,
-               *, tol_points: float = 0.5, max_share: float = 0.0, now=None, **fetch_kw) -> dict:
+               *, tol_points: float = 0.5, max_share: float = 0.0, candles_only: bool = False,
+               now=None, **fetch_kw) -> dict:
     """
-    Laedt fuer einen abgeschlossenen Tag 24 Tick-Stunden und BID/ASK-Kerzen
-    (ueber den Cache), aggregiert die Ticks zu Minuten und vergleicht OHLC je
-    Seite. exit_code: 0 ok, 3 Download gescheitert/Lock belegt,
+    Prueft einen abgeschlossenen Tag und schreibt den Verify-Report.
+
+    Standard: laedt 24 Tick-Stunden und BID/ASK-Kerzen (ueber den Cache, bis
+    zu 26 Requests), aggregiert die Ticks zu Minuten und vergleicht OHLC je
+    Seite. exit_code: 0 ok, 3 Download gescheitert/429-Budget/Lock belegt,
     4 Abweichung, keine Daten oder Kerzendatei in Quarantaene.
+
+    candles_only: NUR BID- und ASK-Kerzen (2 Requests, wenn nicht im Cache),
+    Feldreihenfolge bestimmen, decodieren, Plausibilitaet pruefen (harte
+    Monatschecks aus validate() inkl. PLAUSIBLE/Jahresanker/gekreuzte Anteile,
+    Median-Spread, genug Minuten an Werktagen). exit_code: 0 ok, 3 Download
+    gescheitert/429-Budget/Lock belegt/"keine Daten" unbestaetigt, 4
+    Quarantaene oder unplausibel.
+
+    Beide Varianten schreiben die zusammengefuehrten Kerzen-Minuten des Tages
+    (Store-Schema) nach sample_path(), NUR wenn die Pruefung bestanden ist
+    (ok, harte Store-Checks); Pfad im Report (sample_path, sonst None).
     """
     data_root = data_root or default_data_root()
     today = today or utc_today()
@@ -1679,38 +1817,86 @@ def verify_day(symbol: str, day: date, data_root: Path | None = None, today: dat
                 "exit_code": EXIT_GAPS}
     try:
         return _verify_locked(symbol, day, d0, data_root, today, now, tol_points, max_share,
-                              fetch_kw)
+                              candles_only, fetch_kw)
     finally:
         lock.close()
 
 
-def _verify_locked(symbol, day, d0, data_root, today, now, tol_points, max_share, fetch_kw):
+def _is_trading_weekday(d: datetime) -> bool:
+    return d.weekday() < 5 and (d.month, d.day) not in ((12, 25), (1, 1))
+
+
+def _day_checks(symbol: str, d0: datetime, bars: pd.DataFrame) -> tuple[dict, list[str], bool]:
+    """
+    Plausibilitaet der Kerzen-Minuten eines Tages -> (info, probleme, store_ok).
+    store_ok: harte Store-Checks (validate) bestanden -> als Stichprobe nutzbar.
+    """
+    info: dict = {"minutes": int(len(bars)), "trading_weekday": _is_trading_weekday(d0),
+                  "min_weekday_minutes": MIN_WEEKDAY_MINUTES, "max_spread_rel": MAX_SPREAD_REL,
+                  "plausible_range": list(PLAUSIBLE[symbol])}
+    if bars.empty:
+        return info, ["keine Minuten"], False
+    ds = pd.Timestamp(d0)
+    try:
+        v = validate(bars, symbol, f"{symbol} {d0:%Y-%m-%d}", ds, ds + pd.Timedelta(days=1))
+    except ValidationError as e:
+        return info, [str(e)], False
+    info.update({k: x for k, x in v.items() if k not in ("label", "symbol", "rows")})
+    info["price_min"] = float(bars[BID + ASK].min().min())
+    info["price_max"] = float(bars[BID + ASK].max().max())
+    info["crossed_share"] = v["crossed"] / len(bars)
+    mid = float(((bars["bid_close"] + bars["ask_close"]) / 2).median())
+    info["spread_median_rel"] = v["spread_median"] / mid if mid > 0 else None
+    problems = []
+    if v["spread_median"] <= 0:
+        problems.append(f"Median-Spread {v['spread_median']:g} <= 0")
+    elif info["spread_median_rel"] is None or info["spread_median_rel"] > MAX_SPREAD_REL:
+        problems.append(f"Median-Spread {v['spread_median']:g} = {info['spread_median_rel']:.2%} "
+                        f"vom Mid (> {MAX_SPREAD_REL:.0%})")
+    if info["trading_weekday"] and len(bars) < MIN_WEEKDAY_MINUTES:
+        problems.append(f"nur {len(bars)} Minuten an einem Werktag (< {MIN_WEEKDAY_MINUTES})")
+    return info, problems, True
+
+
+def _verify_locked(symbol, day, d0, data_root, today, now, tol_points, max_share, candles_only,
+                   fetch_kw):
     divisor = POINT_DIVISOR[symbol]
-    tick_files = [RawFile(symbol, "ticks", d0 + timedelta(hours=h)) for h in range(24)]
+    tick_files = [] if candles_only else [RawFile(symbol, "ticks", d0 + timedelta(hours=h))
+                                          for h in range(24)]
     candle_files = [RawFile(symbol, "candles", d0, s) for s in SIDES]
+    files = tick_files + candle_files
     fetcher = Fetcher(data_root, today=today, now=now, **fetch_kw)
-    outs = fetcher.fetch(tick_files + candle_files)
-    rep: dict = {"symbol": symbol, "day": f"{day}", "requests": fetcher.requests}
-    failed = {f.key: o.error for f, o in outs.items() if o.status in ("failed", "skipped")}
+    if not candles_only:
+        todo = sum(1 for f in files if fetcher.state(f)[0] in ("missing", "recheck"))
+        log.warning("--verify-day mit Tickvergleich kostet bis zu 26 Requests (24 Tick-Stunden + "
+                    "2 Kerzendateien), davon %d nicht im Cache. Unter Rate-Limit (429): "
+                    "--candles-only (2 Requests)", todo)
+    outs = fetcher.fetch(files)
+    rep: dict = {"symbol": symbol, "day": f"{day}",
+                 "variant": "candles_only" if candles_only else "ticks_vs_candles",
+                 "sample_path": None}
+    failed = {f.key: o.error for f, o in outs.items()
+              if o.status in ("failed", "skipped", "rate_limited")}
     quarantined = {f.key: o.error for f, o in outs.items() if o.status == "quarantined"}
+    sp = sample_path(data_root, symbol, day)
 
     def blob_of(f: RawFile) -> bytes | None:
         p = f.path(data_root)
         return p.read_bytes() if p.exists() else None    # 404/leer (auch unbestaetigt)
 
     if failed:
-        rep.update(ok=False, exit_code=EXIT_GAPS, failed=failed)
+        rate_limited = fetcher.rate_limited.is_set()
+        rep.update(ok=False, exit_code=EXIT_GAPS, status="rate_limited" if rate_limited else "failed",
+                   failed=failed,
+                   pending=[{"file": f.key, "url": f.url(),
+                             "reason": "rate_limit" if rate_limited else "failed"}
+                            for f in files if fetcher.state(f)[0] in ("missing", "recheck")])
     elif quarantined:
-        rep.update(ok=False, exit_code=EXIT_MANUAL, quarantine=quarantined,
+        rep.update(ok=False, exit_code=EXIT_MANUAL, status="quarantine", quarantine=quarantined,
                    field_order={f.side: "keine passt (Quarantaene)" for f in candle_files
                                 if f.key in quarantined})
+        sp.unlink(missing_ok=True)
     else:
-        frames = []
-        for f in tick_files:
-            blob = blob_of(f)
-            if blob:
-                frames.append(decode_bi5(blob, int(f.t.timestamp() * 1000), divisor))
-        tick_bars = aggregate_1m(pd.concat(frames, ignore_index=True) if frames else pd.DataFrame())
         sides, orders = {}, {}
         for f in candle_files:
             blob = blob_of(f)
@@ -1721,24 +1907,76 @@ def _verify_locked(symbol, day, d0, data_root, today, now, tol_points, max_share
         candle_bars, st = merge_candles(sides["BID"], sides["ASK"])
         rep["field_order"] = orders
         rep.update(st)
-        rep.update(compare_bars(tick_bars, candle_bars, divisor, tol_points))
-        if len(candle_bars):
-            rep["continuity_candles"] = continuity(candle_bars, divisor)
-        if len(tick_bars):
-            rep["continuity_ticks"] = continuity(tick_bars.reset_index(drop=True), divisor)
-        no_data = rep["minutes_ticks"] == 0 and rep["minutes_candles"] == 0
-        rep["ok"] = (not no_data) and rep["mismatch_share"] <= max_share
-        rep["max_share"] = max_share
-        if no_data:
-            rep["note"] = "keine Daten an diesem Tag (Wochenende/Feiertag?) - Werktag waehlen"
-        rep["exit_code"] = EXIT_OK if rep["ok"] else EXIT_VERIFY
+        info, problems, store_ok = _day_checks(symbol, d0, candle_bars)
+        present = [s for s in SIDES if not sides[s].empty]
+        if len(present) == 1:
+            problems.insert(0, f"Daten nur auf {present[0]}-Seite")
+            store_ok = False
+        rep["plausibility"] = info
+        rep["plausibility_problems"] = problems
+        if candles_only:
+            rep["minutes_candles"] = int(len(candle_bars))
+            if not present:
+                unconf = any(outs[f].status == "unconfirmed" for f in candle_files)
+                rep.update(ok=False, status="no_data",
+                           exit_code=EXIT_GAPS if unconf else EXIT_VERIFY,
+                           note=("keine Daten an einem Werktag, unbestaetigt - spaeter erneut"
+                                 if unconf else "keine Daten an diesem Tag (Wochenende/"
+                                 "Feiertag?) - Werktag waehlen"))
+            else:
+                rep["ok"] = not problems
+                rep["status"] = "ok" if rep["ok"] else "implausible"
+                rep["exit_code"] = EXIT_OK if rep["ok"] else EXIT_VERIFY
+        else:
+            frames = []
+            for f in tick_files:
+                blob = blob_of(f)
+                if blob:
+                    frames.append(decode_bi5(blob, int(f.t.timestamp() * 1000), divisor))
+            tick_bars = aggregate_1m(pd.concat(frames, ignore_index=True) if frames
+                                     else pd.DataFrame())
+            rep.update(compare_bars(tick_bars, candle_bars, divisor, tol_points))
+            if len(candle_bars):
+                rep["continuity_candles"] = continuity(candle_bars, divisor)
+            if len(tick_bars):
+                rep["continuity_ticks"] = continuity(tick_bars.reset_index(drop=True), divisor)
+            no_data = rep["minutes_ticks"] == 0 and rep["minutes_candles"] == 0
+            rep["ok"] = (not no_data) and rep["mismatch_share"] <= max_share
+            rep["max_share"] = max_share
+            rep["status"] = "ok" if rep["ok"] else "no_data" if no_data else "mismatch"
+            if no_data:
+                rep["note"] = "keine Daten an diesem Tag (Wochenende/Feiertag?) - Werktag waehlen"
+            rep["exit_code"] = EXIT_OK if rep["ok"] else EXIT_VERIFY
+        # Stichprobe NUR bei bestandener Pruefung (ok): der Cross-Check liest die
+        # Datei ohne den Report; eine Datei aus einem gescheiterten Lauf waere
+        # nicht von einer guten zu unterscheiden. Sonst keine veraltete stehen lassen.
+        if rep.get("ok") and store_ok:
+            write_parquet(sp, candle_bars, "candles")
+            rep["sample_path"] = str(sp)
+        else:
+            sp.unlink(missing_ok=True)
+    rep["requests"] = fetcher.requests
+    rep["http_status_counts"] = dict(sorted(fetcher.status_counts.items()))
+    rep["rate_limit"] = fetcher.gate.summary()
     write_json_atomic(verify_report_path(data_root, symbol, day), rep)
-    log.info("VERIFY %s %s: ok=%s Reihenfolge=%s Minuten ticks=%s kerzen=%s gemeinsam=%s "
-             "abweichend=%s nur-ticks=%s nur-kerzen=%s max-dev(Punkte)=%s",
-             symbol, day, rep.get("ok"), rep.get("field_order"), rep.get("minutes_ticks"),
-             rep.get("minutes_candles"), rep.get("minutes_common"), rep.get("minutes_deviating"),
-             rep.get("minutes_only_ticks"), rep.get("minutes_only_candles"),
-             rep.get("max_abs_dev_points"))
+    if candles_only:
+        pl = rep.get("plausibility") or {}
+        log.info("VERIFY %s %s (nur Kerzen): ok=%s status=%s Reihenfolge=%s Minuten=%s "
+                 "Spread-Median=%s Probleme=%s Requests=%d Stichprobe=%s", symbol, day,
+                 rep.get("ok"), rep.get("status"), rep.get("field_order"), pl.get("minutes"),
+                 pl.get("spread_median"), rep.get("plausibility_problems"), fetcher.requests,
+                 rep["sample_path"])
+    else:
+        log.info("VERIFY %s %s: ok=%s Reihenfolge=%s Minuten ticks=%s kerzen=%s gemeinsam=%s "
+                 "abweichend=%s nur-ticks=%s nur-kerzen=%s max-dev(Punkte)=%s Stichprobe=%s",
+                 symbol, day, rep.get("ok"), rep.get("field_order"), rep.get("minutes_ticks"),
+                 rep.get("minutes_candles"), rep.get("minutes_common"),
+                 rep.get("minutes_deviating"), rep.get("minutes_only_ticks"),
+                 rep.get("minutes_only_candles"), rep.get("max_abs_dev_points"),
+                 rep["sample_path"])
+    if rep["rate_limit"]["hits_429"]:
+        log.warning("429: %d Treffer, %.0f min gewartet", rep["rate_limit"]["hits_429"],
+                    rep["rate_limit"]["waited_s"] / 60)
     return rep
 
 
@@ -1771,6 +2009,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-consecutive-failures", type=int, default=MAX_CONSECUTIVE_FAILURES,
                    help="Schutzschalter: nach N Fehlantworten in Folge Lauf beenden, Exit 3 "
                         f"(default {MAX_CONSECUTIVE_FAILURES}, 0 = aus)")
+    p.add_argument("--rate-limit-pause", type=float, default=RATE_LIMIT_PAUSE_S,
+                   help="Pause nach HTTP 429 fuer alle Worker/Prozesse in s, mind. "
+                        f"{RATE_LIMIT_PAUSE_S:g} (default {RATE_LIMIT_PAUSE_S:g}); ein laengerer "
+                        "Retry-After gilt; 429 verbraucht keinen Versuch")
+    p.add_argument("--max-rate-limit-wait", type=float, default=MAX_RATE_LIMIT_WAIT_S,
+                   help="429-Wartebudget je Lauf in s; danach keine Requests mehr, offene "
+                        f"Dateien als pending, Exit 3 (default {MAX_RATE_LIMIT_WAIT_S:g})")
     p.add_argument("--final-retries", type=int, default=FINAL_RETRIES,
                    help=f"gesammelte Wiederholungsrunden am Ende (default {FINAL_RETRIES})")
     p.add_argument("--final-wait", type=float, default=FINAL_WAIT_S,
@@ -1782,7 +2027,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--rebuild", action="store_true",
                    help="vorhandene Monatsdateien neu bauen (aus dem Roh-Cache)")
     p.add_argument("--verify-day", metavar="YYYY-MM-DD",
-                   help="Kerzen gegen aus Ticks gebildete Minuten pruefen (ein Tag)")
+                   help="Kerzen gegen aus Ticks gebildete Minuten pruefen (ein Tag, bis zu "
+                        "26 Requests); schreibt zusaetzlich die Tagesbars als Stichprobe")
+    p.add_argument("--candles-only", action="store_true",
+                   help="mit --verify-day: nur BID+ASK-Kerzen laden (2 Requests) und auf "
+                        "Plausibilitaet pruefen statt gegen Ticks")
     p.add_argument("--verify-tol", type=float, default=0.5,
                    help="erlaubte Abweichung je OHLC-Wert in Punkten (default 0.5 = exakt)")
     p.add_argument("--verify-max-share", type=float, default=0.0,
@@ -1790,8 +2039,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-v", "--verbose", action="store_true")
     a = p.parse_args(argv)
     if a.workers < 1 or a.attempts < 1 or a.final_retries < 0 or a.max_consecutive_failures < 0 \
-            or min(a.pause, a.backoff_base, a.max_backoff, a.final_wait) < 0:
+            or min(a.pause, a.backoff_base, a.max_backoff, a.final_wait,
+                   a.max_rate_limit_wait) < 0:
         p.error("--workers/--attempts >= 1, uebrige Zahlen >= 0")
+    if not a.rate_limit_pause >= RATE_LIMIT_PAUSE_S:
+        p.error(f"--rate-limit-pause muss >= {RATE_LIMIT_PAUSE_S:g} s sein (Rate-Limit pro IP: "
+                "kuerzere Pausen verlaengern die Sperre nur)")
+    if a.candles_only and not a.verify_day:
+        p.error("--candles-only nur zusammen mit --verify-day")
 
     logging.basicConfig(
         level=logging.DEBUG if a.verbose else logging.INFO,
@@ -1802,6 +2057,7 @@ def main(argv: list[str] | None = None) -> int:
     kw = dict(workers=a.workers, pause=a.pause, attempts=a.attempts,
               backoff_base=a.backoff_base, max_backoff=a.max_backoff,
               max_consecutive_failures=a.max_consecutive_failures,
+              rate_limit_pause=a.rate_limit_pause, max_rate_limit_wait=a.max_rate_limit_wait,
               timeout=(a.connect_timeout, a.read_timeout), stop=stop,
               sleep=lambda s: stop.wait(s))       # Schlaf durch SIGTERM unterbrechbar
 
@@ -1809,7 +2065,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             day = date.fromisoformat(a.verify_day)
             return verify_day(a.symbol, day, tol_points=a.verify_tol,
-                              max_share=a.verify_max_share, **kw)["exit_code"]
+                              max_share=a.verify_max_share, candles_only=a.candles_only,
+                              **kw)["exit_code"]
         except ValueError as e:
             p.error(str(e))
         except ValidationError as e:
@@ -1827,9 +2084,10 @@ def main(argv: list[str] | None = None) -> int:
               final_retries=a.final_retries, final_wait=a.final_wait,
               progress_every=a.progress_every, **kw)
     if rep["exit_code"] == EXIT_GAPS and rep.get("summary"):
-        log.error("LUECKEN: %d fehlgeschlagen, %d unbestaetigt, %d Monate unvollstaendig - "
-                  "Folgelauf holt nur fehlende Dateien nach", rep["summary"]["failed_files"],
-                  rep["summary"]["unconfirmed_files"], len(rep["summary"]["months_incomplete"]))
+        log.error("LUECKEN: %d fehlgeschlagen, %d unbestaetigt, %d offen (pending), %d Monate "
+                  "unvollstaendig - Folgelauf holt nur fehlende Dateien nach",
+                  rep["summary"]["failed_files"], rep["summary"]["unconfirmed_files"],
+                  rep["summary"].get("pending_files", 0), len(rep["summary"]["months_incomplete"]))
     return rep["exit_code"]
 
 

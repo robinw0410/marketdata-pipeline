@@ -16,7 +16,13 @@ Regeln:
   nicht vor Ablauf erneut an.
 - Gesamtbudget je Lauf (max_total_wait, default 6 h): danach endet der Lauf
   sauber mit Luecken (Exit 3), systemd setzt spaeter fort. Ohne Budget
-  koennte ein dauerhaft gesperrter Client den Lauf ewig blockieren.
+  koennte ein dauerhaft gesperrter Client den Lauf ewig blockieren. Das
+  Budget zaehlt Wartezeit des Laufs (Wanduhr), nicht die Summe ueber Worker:
+  vier gleichzeitig wartende Worker verbrauchen es nicht viermal so schnell.
+  Ist es einmal erschoepft, wirft JEDES weitere wait() sofort (keine
+  weiteren Requests in diesem Lauf).
+- Unsinnige Retry-After-Werte (inf, nan, > MAX_RETRY_AFTER_S) sperren nicht
+  ewig: nicht endliche Werte gelten als fehlend, grosse werden gedeckelt.
 """
 from __future__ import annotations
 
@@ -24,6 +30,7 @@ import email.utils
 import fcntl
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -36,6 +43,7 @@ log = logging.getLogger(__name__)
 MIN_PAUSE_S = 900.0             # >= 15 min nach jedem 429
 MAX_TOTAL_WAIT_S = 6 * 3600.0   # Budget je Lauf, danach Exit 3
 CHUNK_S = 30.0                  # Schlafscheibe (Stop-Signal, fremde Sperren)
+MAX_RETRY_AFTER_S = 24 * 3600.0  # Deckel fuer Retry-After (Muell-Header sperrt nicht ewig)
 
 
 class RateLimitExhausted(Exception):
@@ -55,12 +63,12 @@ def parse_retry_after(value, now: datetime | None = None) -> float | None:
         return None
     try:
         v = float(s)
-        return v if v >= 0 else None
+        return v if math.isfinite(v) and v >= 0 else None     # nan/inf -> fehlend
     except ValueError:
         pass
     try:
         dt = email.utils.parsedate_to_datetime(s)
-    except (TypeError, ValueError, IndexError):
+    except (TypeError, ValueError, IndexError, OverflowError):
         return None
     if dt is None:
         return None
@@ -68,6 +76,13 @@ def parse_retry_after(value, now: datetime | None = None) -> float | None:
         dt = dt.replace(tzinfo=timezone.utc)
     now = now or datetime.now(timezone.utc)
     return max(0.0, (dt - now).total_seconds())
+
+
+def _iso(ts: float) -> str | None:
+    try:
+        return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 class RateLimitGate:
@@ -92,6 +107,8 @@ class RateLimitGate:
         self.hits = 0
         self.waited = 0.0
         self.last_retry_after: float | None = None
+        self.exhausted: str | None = None     # gesetzt -> jedes wait() wirft sofort
+        self._accountant: int | None = None   # Thread, der gerade Wartezeit zaehlt
         self._load()
 
     # ------------------------------------------------------------ state ---
@@ -113,9 +130,10 @@ class RateLimitGate:
         if self.state_path is None or not self.state_path.exists():
             return float("-inf")
         try:
-            return float(json.loads(self.state_path.read_text())["blocked_until"])
+            v = float(json.loads(self.state_path.read_text())["blocked_until"])
         except (OSError, ValueError, KeyError, TypeError):
             return float("-inf")          # kaputter Zustand blockiert nicht ewig
+        return v if math.isfinite(v) else float("-inf")
 
     def _load(self) -> None:
         with self._flock():
@@ -130,8 +148,8 @@ class RateLimitGate:
             tmp = self.state_path.with_name(f".{self.state_path.name}.{os.getpid()}.part")
             tmp.write_text(json.dumps({
                 "blocked_until": until,
-                "blocked_until_utc": datetime.fromtimestamp(until, timezone.utc).isoformat(),
-                "last_hit_utc": datetime.fromtimestamp(self.wall(), timezone.utc).isoformat(),
+                "blocked_until_utc": _iso(until),
+                "last_hit_utc": _iso(self.wall()),
                 "retry_after_s": retry_after, "url": url, "pid": os.getpid()}, indent=1))
             os.replace(tmp, self.state_path)
 
@@ -141,7 +159,9 @@ class RateLimitGate:
             return max(0.0, self.blocked_until - self.wall())
 
     def hit(self, retry_after: float | None = None, url: str = "") -> float:
-        pause = max(self.min_pause, float(retry_after or 0.0))
+        if retry_after is not None and not (math.isfinite(retry_after) and retry_after >= 0):
+            retry_after = None                       # nan/inf/negativ -> wie fehlend
+        pause = max(self.min_pause, min(float(retry_after or 0.0), MAX_RETRY_AFTER_S))
         with self.lock:
             until = self.wall() + pause
             if until > self.blocked_until:
@@ -164,26 +184,41 @@ class RateLimitGate:
         return True
 
     def wait(self) -> bool:
-        while True:
-            if self.stop is not None and self.stop.is_set():
-                return False
+        me = threading.get_ident()
+        try:
+            while True:
+                if self.stop is not None and self.stop.is_set():
+                    return False
+                with self.lock:
+                    if self.exhausted is not None:
+                        raise RateLimitExhausted(self.exhausted, self.blocked_until - self.wall())
+                    if self.state_path is not None:      # Sperre eines anderen Prozesses?
+                        self.blocked_until = max(self.blocked_until, self._read_state())
+                    rem = self.blocked_until - self.wall()
+                    if rem <= 0:
+                        return True
+                    if self.waited + rem > self.max_total_wait + 1e-9:
+                        self.exhausted = (
+                            f"429-Sperre noch {rem / 60:.0f} min, Wartebudget "
+                            f"{self.max_total_wait / 3600:.1f} h (bereits {self.waited / 60:.0f} min "
+                            "gewartet) reicht nicht")
+                        raise RateLimitExhausted(self.exhausted, rem)
+                    step = min(rem, self.chunk)
+                    # Budget = Wartezeit des Laufs: nur EIN wartender Thread zaehlt
+                    # (sonst verbrauchen N Worker das Budget N-mal so schnell)
+                    if self._accountant is None:
+                        self._accountant = me
+                    if self._accountant == me:
+                        self.waited += step
+                if not self._sleep_chunk(step):
+                    return False
+        finally:
             with self.lock:
-                if self.state_path is not None:      # Sperre eines anderen Prozesses?
-                    self.blocked_until = max(self.blocked_until, self._read_state())
-                rem = self.blocked_until - self.wall()
-            if rem <= 0:
-                return True
-            if self.waited + rem > self.max_total_wait + 1e-9:
-                raise RateLimitExhausted(
-                    f"429-Sperre noch {rem / 60:.0f} min, Wartebudget {self.max_total_wait / 3600:.1f} h "
-                    f"(bereits {self.waited / 60:.0f} min gewartet) reicht nicht", rem)
-            step = min(rem, self.chunk)
-            self.waited += step
-            if not self._sleep_chunk(step):
-                return False
+                if self._accountant == me:
+                    self._accountant = None
 
     def summary(self) -> dict:
         return {"hits_429": self.hits, "waited_s": round(self.waited, 1),
-                "blocked_until_utc": (datetime.fromtimestamp(self.blocked_until, timezone.utc).isoformat()
-                                      if self.blocked_until > 0 else None),
+                "blocked_until_utc": _iso(self.blocked_until) if self.blocked_until > 0 else None,
+                "exhausted": self.exhausted,
                 "min_pause_s": self.min_pause, "max_total_wait_s": self.max_total_wait}
