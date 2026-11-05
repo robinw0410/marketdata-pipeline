@@ -1,11 +1,17 @@
-"""fetch_dukascopy: bi5-Parsing, 1m-Aggregation, Monatsregel, Validierung, Download.
+"""fetch_dukascopy: bi5-Parsing, 1m-Aggregation, Monatsregel, Validierung, Download,
+Kerzenmodus, Fehlertoleranz/Lueckenliste, Drosselung, verify-day, SIGTERM.
 
-Alles mit synthetischen bi5-Dateien, kein Netzwerk.
+Alles mit synthetischen bi5-Dateien, kein Netzwerk, keine echten Wartezeiten
+(Sleep/Uhr injiziert). Bestehende Tick-Tests laufen explizit mit mode="ticks".
 """
 import json
 import lzma
+import os
+import random
+import signal
 import struct
-from datetime import date, datetime, timezone
+import threading
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -138,7 +144,7 @@ def parquet_names(root: Path) -> list[str]:
 
 def test_running_month_is_not_written_or_requested(tmp_path, fake_net):
     fd.run(SYM, date(2026, 7, 1), date(2026, 8, 1), data_root=tmp_path,
-           today=date(2026, 8, 20), pause=0)
+           today=date(2026, 8, 20), pause=0, mode="ticks")
     assert parquet_names(tmp_path) == ["XAUUSD-1m-2026-07.parquet"]
     # Juli = 06 in der URL (0-basiert), August = 07
     assert fake_net and all("/2026/06/" in u for u in fake_net)
@@ -153,17 +159,21 @@ def test_running_month_is_not_written_or_requested(tmp_path, fake_net):
 
 
 def test_month_written_once_complete_and_not_overwritten(tmp_path, fake_net):
-    fd.run(SYM, date(2026, 8, 1), date(2026, 8, 1), data_root=tmp_path, today=date(2026, 8, 31), pause=0)
+    fd.run(SYM, date(2026, 8, 1), date(2026, 8, 1), data_root=tmp_path, today=date(2026, 8, 31), pause=0,
+           mode="ticks")
     assert parquet_names(tmp_path) == [] and fake_net == []
-    fd.run(SYM, date(2026, 8, 1), date(2026, 8, 1), data_root=tmp_path, today=date(2026, 9, 1), pause=0)
+    fd.run(SYM, date(2026, 8, 1), date(2026, 8, 1), data_root=tmp_path, today=date(2026, 9, 1), pause=0,
+           mode="ticks")
     assert parquet_names(tmp_path) == ["XAUUSD-1m-2026-08.parquet"]
     n = len(fake_net)
-    fd.run(SYM, date(2026, 8, 1), date(2026, 8, 1), data_root=tmp_path, today=date(2026, 9, 2), pause=0)
+    fd.run(SYM, date(2026, 8, 1), date(2026, 8, 1), data_root=tmp_path, today=date(2026, 9, 2), pause=0,
+           mode="ticks")
     assert len(fake_net) == n                                # existiert -> nichts angefragt
 
 
 def test_rebuild_uses_raw_cache_without_download(tmp_path, fake_net, monkeypatch):
-    fd.run(SYM, date(2026, 7, 1), date(2026, 7, 1), data_root=tmp_path, today=date(2026, 8, 1), pause=0)
+    fd.run(SYM, date(2026, 7, 1), date(2026, 7, 1), data_root=tmp_path, today=date(2026, 8, 1), pause=0,
+           mode="ticks")
     out = fd.store_path(tmp_path, SYM, 2026, 7)
     before = pd.read_parquet(out)
 
@@ -172,7 +182,7 @@ def test_rebuild_uses_raw_cache_without_download(tmp_path, fake_net, monkeypatch
 
     monkeypatch.setattr(fd, "download_bi5", offline)
     fd.run(SYM, date(2026, 7, 1), date(2026, 7, 1), data_root=tmp_path, today=date(2026, 8, 1),
-           pause=0, rebuild=True)
+           pause=0, rebuild=True, mode="ticks")
     pd.testing.assert_frame_equal(pd.read_parquet(out), before)
 
 
@@ -180,7 +190,7 @@ def test_wrong_divisor_aborts_before_writing(tmp_path, fake_net, monkeypatch):
     monkeypatch.setitem(fd.POINT_DIVISOR, SYM, 100)          # Faktor 10 daneben
     with pytest.raises(fd.ValidationError, match="Plausibilitaetsbereich"):
         fd.run(SYM, date(2026, 7, 1), date(2026, 7, 1), data_root=tmp_path,
-               today=date(2026, 8, 1), pause=0)
+               today=date(2026, 8, 1), pause=0, mode="ticks")
     assert parquet_names(tmp_path) == []
 
 
@@ -262,8 +272,8 @@ def test_soft_checks_only_report():
 
 # ----------------------------------------------------------------- download ---
 class FakeResp:
-    def __init__(self, status: int, content: bytes = b""):
-        self.status_code, self.content = status, content
+    def __init__(self, status: int, content: bytes = b"", headers: dict | None = None):
+        self.status_code, self.content, self.headers = status, content, headers or {}
 
 
 @pytest.fixture
@@ -302,7 +312,7 @@ def test_download_retries_with_backoff(fake_get, no_sleep):
     good = make_bi5([(0, 2000500, 2000000, 1.0, 1.0)])
     answers += [FakeResp(503), requests.ConnectionError("weg"), FakeResp(200, b"kaputt"),
                 FakeResp(200, good)]
-    assert fd.download_bi5("u", backoff=1.0) == good
+    assert fd.download_bi5("u", backoff_base=1.0, jitter=0) == good
     assert len(calls) == 4
     assert no_sleep == [1.0, 2.0, 4.0]
 
@@ -311,14 +321,14 @@ def test_download_gives_up_after_retries(fake_get, no_sleep):
     calls, answers = fake_get
     answers += [FakeResp(500)] * 3
     with pytest.raises(fd.DownloadError):
-        fd.download_bi5("u", retries=2, backoff=0.5)
+        fd.download_bi5("u", attempts=3, backoff_base=0.5, jitter=0)
     assert len(calls) == 3 and no_sleep == [0.5, 1.0]
 
 
 def test_download_other_http_error_no_retry(fake_get):
     calls, answers = fake_get
-    answers.append(FakeResp(403))
-    with pytest.raises(fd.DownloadError, match="403"):
+    answers.append(FakeResp(401))          # 403 wird inzwischen wiederholt (WAF?)
+    with pytest.raises(fd.DownloadError, match="401"):
         fd.download_bi5("u")
     assert len(calls) == 1
 
@@ -347,3 +357,494 @@ def test_divisor_factor_ten_too_large_is_caught_by_anchor():
         fd.validate(make_bars(bid=205.0, ask=205.05), SYM, "t", MS, ME)
     rep = fd.validate(make_bars(), SYM, "t", MS, ME)
     assert 0.4 < rep["anchor_ratio"] < 2.5
+
+
+# ===================================================================== neu ===
+DAY0 = datetime(2026, 7, 1, tzinfo=UTC)
+
+
+class FakeClock:
+    """Uhr + Schlaf: Schlaf schiebt die Uhr vor, nichts wartet wirklich."""
+
+    def __init__(self):
+        self.t = 0.0
+        self.slept: list[float] = []
+
+    def __call__(self) -> float:
+        return self.t
+
+    def sleep(self, s: float) -> None:
+        self.slept.append(s)
+        self.t += s
+
+
+def pack_candles(rows, order: str = "OCLH") -> bytes:
+    """rows: [(sec, open, high, low, close, volume)] (Ganzzahl-Preise) -> LZMA-bi5."""
+    fields = fd.FIELD_ORDERS[order]
+    raw = b""
+    for sec, o, h, l, c, v in rows:
+        val = {"open": o, "high": h, "low": l, "close": c}
+        raw += struct.pack(">5I", sec, *(val[f] for f in fields)) + struct.pack(">f", v)
+    return lzma.compress(raw, format=lzma.FORMAT_ALONE)
+
+
+def day_rows(side: str, base: int = 4_200_000):
+    """Ein Tag: 10:00 und 10:02 aktiv, 10:01 Fuellkerze (flach, volume 0)."""
+    off = 300 if side == "ASK" else 0
+    b = base + off
+    return [(600 * 60, b, b + 1000, b - 500, b + 500, 1.5),
+            (601 * 60, b + 500, b + 500, b + 500, b + 500, 0.0),
+            (602 * 60, b + 500, b + 700, b + 100, b + 200, 2.0)]
+
+
+def candle_url_side(url: str) -> str:
+    return "BID" if url.endswith("BID_candles_min_1.bi5") else "ASK"
+
+
+@pytest.fixture
+def candle_net(monkeypatch):
+    """Ersetzt download_bi5 im Kerzenmodus. fail: {url-Teil: Anzahl Fehlschlaege}."""
+    state = {"requested": [], "fail": {}, "order": "OCLH", "special": {}}
+
+    def fake(url: str, **kw):
+        state["requested"].append(url)
+        for part, n in list(state["fail"].items()):
+            if part in url and n:
+                state["fail"][part] = n - 1 if n > 0 else n      # -1 = immer
+                raise fd.DownloadError(f"HTTP 503: {url}", status=503, attempts=kw.get("attempts", 1))
+        for part, blob in state["special"].items():
+            if part in url:
+                return blob
+        return pack_candles(day_rows(candle_url_side(url)), state["order"])
+
+    monkeypatch.setattr(fd, "download_bi5", fake)
+    return state
+
+
+def run_c(tmp_path, clock=None, **kw):
+    kw.setdefault("today", date(2026, 8, 20))
+    kw.setdefault("pause", 0)
+    clock = clock or FakeClock()
+    return fd.run(SYM, kw.pop("start", date(2026, 7, 1)), kw.pop("end", date(2026, 7, 1)),
+                  data_root=tmp_path, sleep=clock.sleep, clock=clock, **kw)
+
+
+JULY_BID_01 = "/XAUUSD/2026/06/01/BID_candles_min_1.bi5"
+
+
+# ------------------------------------------------------------ kerzen-format ---
+def test_candle_url_and_cache_path(tmp_path):
+    assert fd.candle_url_for(SYM, date(2024, 1, 5), "BID") == \
+        f"{fd.BASE}/XAUUSD/2024/00/05/BID_candles_min_1.bi5"
+    assert fd.candle_raw_path(tmp_path, SYM, date(2024, 12, 31), "ASK") == \
+        tmp_path / "raw" / "dukascopy" / "XAUUSD" / "2024" / "12" / "31" / "ASK_candles_min_1.bi5"
+
+
+@pytest.mark.parametrize("order", ["OCLH", "OHLC"])
+def test_decode_candles_both_field_orders(order):
+    d0 = hour_ms(2024, 3, 6, 0)
+    df, found = fd.decode_candles(pack_candles(day_rows("BID", 2_150_000), order), d0, 1000)
+    assert found == order
+    assert df["ts"].iloc[0] == pd.Timestamp("2024-03-06 10:00", tz="UTC")   # Sekunden, nicht ms
+    assert df["ts"].iloc[2] == pd.Timestamp("2024-03-06 10:02", tz="UTC")
+    r = df.iloc[0]
+    assert (r.open, r.high, r.low, r.close, r.volume) == pytest.approx((2150.0, 2151.0, 2149.5, 2150.5, 1.5))
+
+
+def test_field_order_unclear_or_flat():
+    # close == high in allen aktiven Kerzen -> OCLH und OHLC gleich moeglich
+    amb = [(0, 100, 110, 90, 110, 1.0), (60, 105, 120, 100, 120, 1.0)]
+    with pytest.raises(fd.FieldOrderError, match="unklar"):
+        fd.decode_candles(pack_candles(amb), 0, 1000)
+    # Widerspruch: keine Reihenfolge passt (Feld 2 < Feld 1, Feld 4 < Feld 1)
+    raw = struct.pack(">5If", 0, 100, 90, 95, 80, 1.0)
+    with pytest.raises(fd.FieldOrderError, match="unklar"):
+        fd.decode_candles(lzma.compress(raw, format=lzma.FORMAT_ALONE), 0, 1000)
+    # nur Fuellkerzen: Reihenfolge egal
+    _, order = fd.decode_candles(pack_candles([(0, 5, 5, 5, 5, 0.0)]), 0, 1000)
+    assert order == "flat"
+
+
+def test_decode_candles_rejects_bad_offsets_and_length():
+    with pytest.raises(fd.ValidationError, match="1 Tag"):
+        fd.decode_candles(pack_candles([(86_400_000, 1, 2, 1, 1, 1.0)]), 0, 1000)  # ms statt s
+    with pytest.raises(fd.ValidationError, match="Minutengrenze"):
+        fd.decode_candles(pack_candles([(61, 1, 2, 1, 1, 1.0)]), 0, 1000)
+    with pytest.raises(fd.ValidationError, match="Vielfaches"):
+        fd.decode_candles(lzma.compress(b"\0" * 23, format=lzma.FORMAT_ALONE), 0, 1000)
+
+
+def test_merge_candles_drops_fill_minutes():
+    d0 = int(DAY0.timestamp() * 1000)
+    bid, _ = fd.decode_candles(pack_candles(day_rows("BID")), d0, 1000)
+    ask_rows = day_rows("ASK") + [(700 * 60, 4_201_000, 4_201_000, 4_201_000, 4_201_000, 0.0)]
+    ask, _ = fd.decode_candles(pack_candles(ask_rows), d0, 1000)
+    bars, st = fd.merge_candles(bid, ask)
+    assert list(bars.columns) == fd.COLUMNS
+    assert list(bars["ts"]) == [pd.Timestamp("2026-07-01 10:00", tz="UTC"),
+                                pd.Timestamp("2026-07-01 10:02", tz="UTC")]
+    assert st == {"fill_minutes_dropped": 1, "one_side_minutes_dropped": 1,
+                  "zero_volume_nonflat_minutes": 0}
+    b = bars.iloc[0]
+    assert (b.bid_open, b.bid_high, b.bid_low, b.bid_close) == pytest.approx((4200.0, 4201.0, 4199.5, 4200.5))
+    assert (b.ask_open, b.ask_close) == pytest.approx((4200.3, 4200.8))
+    assert (bars["tick_count"] == 1).all() and bars["tick_count"].dtype == "int64"
+    assert b.bid_volume == pytest.approx(1.5) and bars["source"].eq("dukascopy").all()
+
+
+def test_candles_month_written_with_mode(tmp_path, candle_net):
+    rep = run_c(tmp_path)
+    assert rep["exit_code"] == 0 and rep["mode"] == "candles" and rep["gaps"] == []
+    # 31 Tage x 2 Seiten, keine Tick-Stunden
+    assert len(candle_net["requested"]) == 62
+    assert all(u.endswith("_candles_min_1.bi5") and "/2026/06/" in u for u in candle_net["requested"])
+    out = fd.store_path(tmp_path, SYM, 2026, 7)
+    df = pd.read_parquet(out)
+    assert list(df.columns) == fd.COLUMNS and len(df) == 31 * 2
+    import pyarrow.parquet as pq
+    assert pq.read_schema(out).metadata[b"dukascopy_mode"] == b"candles"
+    mrep = json.loads(fd.report_path(tmp_path, SYM, 2026, 7).read_text())
+    assert mrep["mode"] == "candles" and mrep["fill_minutes_dropped"] == 31
+    assert mrep["field_order"] == {"OCLH": 62}
+    assert mrep["continuity"]["bid"]["pairs"] == 0      # 10:00 -> 10:02 nicht direkt aufeinander
+    assert fd.candle_raw_path(tmp_path, SYM, DAY0, "BID").exists()
+
+
+def test_candles_ohlc_order_gives_same_store(tmp_path, candle_net):
+    run_c(tmp_path / "a")
+    candle_net["order"] = "OHLC"
+    run_c(tmp_path / "b")
+    pd.testing.assert_frame_equal(pd.read_parquet(fd.store_path(tmp_path / "a", SYM, 2026, 7)),
+                                  pd.read_parquet(fd.store_path(tmp_path / "b", SYM, 2026, 7)))
+
+
+def test_day_incomplete_if_one_side_fails(tmp_path, candle_net):
+    candle_net["fail"]["/2026/06/15/ASK_candles"] = -1
+    rep = run_c(tmp_path, final_retries=0)
+    assert rep["exit_code"] == 3
+    assert parquet_names(tmp_path) == []
+    assert [g["file"] for g in rep["gaps"]] == ["XAUUSD 2026-07-15 ASK candles"]
+    assert fd.candle_raw_path(tmp_path, SYM, datetime(2026, 7, 15, tzinfo=UTC), "BID").exists()
+
+
+def test_day_with_one_side_404_is_dropped_and_reported(tmp_path, candle_net, monkeypatch):
+    inner = fd.download_bi5
+    monkeypatch.setattr(fd, "download_bi5",
+                        lambda url, **kw: None if "/2026/06/15/ASK" in url else inner(url, **kw))
+    rep = run_c(tmp_path)
+    assert rep["exit_code"] == 0
+    mrep = json.loads(fd.report_path(tmp_path, SYM, 2026, 7).read_text())
+    assert mrep["days_one_side_only"] == ["2026-07-15 nur BID"] and mrep["rows"] == 30 * 2
+
+
+def test_unclear_field_order_is_a_gap_not_written(tmp_path, candle_net):
+    amb = pack_candles([(600 * 60, 4_200_000, 4_201_000, 4_199_000, 4_201_000, 1.0)])
+    candle_net["special"]["/2026/06/03/BID"] = amb
+    rep = run_c(tmp_path, final_retries=1)
+    assert rep["exit_code"] == 3 and parquet_names(tmp_path) == []
+    (g,) = rep["gaps"]
+    assert g["file"] == "XAUUSD 2026-07-03 BID candles" and "Feldreihenfolge unklar" in g["last_error"]
+    assert g["attempts"] == 2                                  # erster Durchgang + 1 Runde
+    p = fd.candle_raw_path(tmp_path, SYM, datetime(2026, 7, 3, tzinfo=UTC), "BID")
+    assert not p.exists() and p.with_name("BID_candles_min_1.unclear").exists()
+
+
+def test_unclear_file_already_in_cache_is_moved_aside(tmp_path, candle_net):
+    p = fd.candle_raw_path(tmp_path, SYM, datetime(2026, 7, 3, tzinfo=UTC), "BID")
+    fd._atomic_write(p, pack_candles([(0, 4_200_000, 4_201_000, 4_199_000, 4_201_000, 1.0)]))
+    rep = run_c(tmp_path, final_retries=0)
+    assert rep["exit_code"] == 3 and not p.exists()
+    assert "Feldreihenfolge unklar" in rep["gaps"][0]["last_error"]
+    rep = run_c(tmp_path)                                      # Folgelauf laedt neu -> fertig
+    assert rep["exit_code"] == 0 and parquet_names(tmp_path) == ["XAUUSD-1m-2026-07.parquet"]
+
+
+def test_running_day_candle_file_never_requested(tmp_path, fake_get):
+    calls, _ = fake_get
+    f = fd.RawFile(SYM, "candles", datetime(2026, 8, 20, tzinfo=UTC), "BID")
+    with pytest.raises(ValueError, match="laufenden"):
+        fd.Fetcher(tmp_path, today=date(2026, 8, 20), pause=0).get(f)
+    assert calls == [] and not f.path(tmp_path).exists()
+
+
+# -------------------------------------------------------- fehlertoleranz ---
+def test_failure_in_first_hour_does_not_abort_ticks(tmp_path, fake_net, monkeypatch):
+    inner = fd.download_bi5
+
+    def flaky(url, **kw):
+        if url.endswith("/2026/06/01/00h_ticks.bi5"):
+            fake_net.append(url)
+            raise fd.DownloadError("HTTP 503", status=503, attempts=kw["attempts"])
+        return inner(url, **kw)
+
+    monkeypatch.setattr(fd, "download_bi5", flaky)
+    clock = FakeClock()
+    rep = run_c(tmp_path, clock, mode="ticks", final_retries=2, final_wait=300)
+    assert len(set(fake_net)) == 31 * 24                     # alle uebrigen Stunden versucht
+    assert fake_net.count(f"{fd.BASE}/XAUUSD/2026/06/01/00h_ticks.bi5") == 3   # 1 + 2 Runden
+    assert clock.slept.count(300) == 2
+    assert rep["exit_code"] == 3 and rep["status"] == "gaps"
+    assert rep["summary"]["months_incomplete"] == ["2026-07"]
+    (g,) = rep["gaps"]
+    assert (g["symbol"], g["kind"], g["date"], g["hour"], g["http_status"]) == \
+        (SYM, "ticks", "2026-07-01", 0, 503)
+    assert g["attempts"] == 3 * 5 and "503" in g["last_error"]
+    assert parquet_names(tmp_path) == []
+    # Report auch auf Platte
+    assert json.loads(fd.run_report_path(tmp_path, SYM).read_text())["gaps"] == rep["gaps"]
+
+
+def test_collected_retry_at_end_recovers_and_writes(tmp_path, candle_net):
+    candle_net["fail"][JULY_BID_01] = 1                      # erster Versuch scheitert
+    clock = FakeClock()
+    rep = run_c(tmp_path, clock, final_wait=300)
+    assert rep["exit_code"] == 0 and rep["gaps"] == []
+    assert rep["summary"]["recovered_in_final_retries"] == 1
+    assert rep["summary"]["final_retry_rounds"] == 1 and clock.slept == [300]
+    # der Fehlschlag wurde erst am Ende wiederholt, nicht sofort
+    req = candle_net["requested"]
+    assert req[0].endswith(JULY_BID_01) and req[-1].endswith(JULY_BID_01) and len(req) == 63
+    assert parquet_names(tmp_path) == ["XAUUSD-1m-2026-07.parquet"]
+
+
+def test_gappy_month_not_written_followup_fetches_only_missing(tmp_path, candle_net):
+    candle_net["fail"][JULY_BID_01] = -1
+    rep = run_c(tmp_path, end=date(2026, 7, 1), final_retries=1, final_wait=10)
+    assert rep["exit_code"] == 3 and parquet_names(tmp_path) == []
+    assert rep["gaps"][0]["file"] == "XAUUSD 2026-07-01 BID candles"
+
+    candle_net["fail"].clear()
+    candle_net["requested"].clear()
+    rep = run_c(tmp_path, end=date(2026, 7, 1))
+    assert candle_net["requested"] == [f"{fd.BASE}{JULY_BID_01}"]    # nur die fehlende Datei
+    assert rep["exit_code"] == 0 and rep["gaps"] == []
+    assert rep["summary"]["files_pending_at_start"] == 1 and rep["summary"]["files_downloaded"] == 1
+    assert parquet_names(tmp_path) == ["XAUUSD-1m-2026-07.parquet"]
+
+
+def test_previous_gaps_are_tried_first(tmp_path, candle_net):
+    candle_net["fail"]["/2026/07/31/ASK"] = -1               # August, letzter Tag
+    rep = run_c(tmp_path, end=date(2026, 8, 1), today=date(2026, 9, 2), final_retries=0)
+    assert parquet_names(tmp_path) == ["XAUUSD-1m-2026-07.parquet"]
+    assert rep["summary"]["months_incomplete"] == ["2026-08"]
+    # Juli kuenstlich wieder offen machen (Monatsdatei + eine Rohdatei weg)
+    fd.store_path(tmp_path, SYM, 2026, 7).unlink()
+    fd.candle_raw_path(tmp_path, SYM, DAY0, "BID").unlink()
+    candle_net["fail"].clear()
+    candle_net["requested"].clear()
+    rep = run_c(tmp_path, end=date(2026, 8, 1), today=date(2026, 9, 2))
+    # Luecke des letzten Laufs zuerst, dann der normale Monatsablauf
+    assert candle_net["requested"] == [f"{fd.BASE}/XAUUSD/2026/07/31/ASK_candles_min_1.bi5",
+                                       f"{fd.BASE}{JULY_BID_01}"]
+    assert rep["exit_code"] == 0 and rep["summary"]["months_written"] == ["2026-07", "2026-08"]
+
+
+def test_corrupt_run_report_is_ignored(tmp_path, candle_net):
+    p = fd.run_report_path(tmp_path, SYM)
+    p.parent.mkdir(parents=True)
+    p.write_text("{kaputt")
+    assert run_c(tmp_path)["exit_code"] == 0
+
+
+def test_validation_error_still_writes_run_report(tmp_path, candle_net, monkeypatch):
+    monkeypatch.setitem(fd.POINT_DIVISOR, SYM, 100)
+    with pytest.raises(fd.ValidationError):
+        run_c(tmp_path)
+    rep = json.loads(fd.run_report_path(tmp_path, SYM).read_text())
+    assert rep["status"] == "validation_error" and rep["exit_code"] == 2 and rep["error"]
+
+
+# ------------------------------------------------------- backoff/drossel ---
+def test_backoff_exponential_capped_and_retry_after():
+    seq = [fd.backoff_delay(n, 2.0, 600.0, jitter=0) for n in range(12)]
+    assert seq[:6] == [2, 4, 8, 16, 32, 64] and seq[-3:] == [600, 600, 600]
+    assert fd.backoff_delay(0, 2.0, 600.0, jitter=0, retry_after=30) == 30
+    assert fd.backoff_delay(5, 2.0, 600.0, jitter=0, retry_after=1) == 64
+    assert fd.backoff_delay(0, 2.0, 600.0, jitter=0, retry_after=10_000) == 600
+    rng = random.Random(1)
+    for n in range(12):
+        d = fd.backoff_delay(n, 2.0, 600.0, jitter=0.5, rng=rng)
+        assert min(600, 2 * 2 ** n) * 0.5 <= d <= min(600, 2 * 2 ** n)
+    assert fd.parse_retry_after("12") == 12.0 and fd.parse_retry_after("x") is None
+    assert fd.parse_retry_after("Wed, 21 Oct 2015 07:28:10 GMT",
+                                now=datetime(2015, 10, 21, 7, 28, 0, tzinfo=UTC)) == 10.0
+
+
+def test_download_respects_retry_after(fake_get, no_sleep):
+    calls, answers = fake_get
+    good = make_bi5([(0, 2000500, 2000000, 1.0, 1.0)])
+    answers += [FakeResp(500, headers={"Retry-After": "45"}), FakeResp(200, good)]
+    assert fd.download_bi5("u", backoff_base=2, jitter=0) == good
+    assert no_sleep == [45.0]
+    assert calls[0]["timeout"] == (fd.CONNECT_TIMEOUT_S, fd.READ_TIMEOUT_S) == (10.0, 60.0)
+
+
+def test_503_sets_global_cooldown_for_all_workers(fake_get):
+    calls, answers = fake_get
+    clock = FakeClock()
+    th = fd.Throttle(clock, clock.sleep)
+    good = make_bi5([(0, 2000500, 2000000, 1.0, 1.0)])
+    answers += [FakeResp(503, headers={"Retry-After": "30"}), FakeResp(200, good)]
+    # Worker A: ein Versuch, 503 -> gibt auf, setzt aber die globale Abkuehlung
+    with pytest.raises(fd.DownloadError):
+        fd.download_bi5("a", attempts=1, jitter=0, throttle=th, sleep=clock.sleep)
+    assert th.not_before == 30 and th.cooldowns == 1 and clock.slept == []
+    # Worker B wartet vor seinem Request bis zum gemeinsamen Zeitpunkt
+    assert fd.download_bi5("b", jitter=0, throttle=th, sleep=clock.sleep) == good
+    assert clock.slept == [30] and len(calls) == 2
+
+
+def test_403_is_retried_with_cooldown_not_404(fake_get):
+    calls, answers = fake_get
+    clock = FakeClock()
+    th = fd.Throttle(clock, clock.sleep)
+    good = make_bi5([(0, 2000500, 2000000, 1.0, 1.0)])
+    answers += [FakeResp(403), FakeResp(403), FakeResp(200, good)]
+    assert fd.download_bi5("u", backoff_base=2, jitter=0, throttle=th, sleep=clock.sleep) == good
+    assert len(calls) == 3 and clock.slept == [2, 4] and th.cooldowns == 2
+
+
+def test_mostly_403_run_reports_waf_hint(tmp_path, fake_get, monkeypatch):
+    calls, answers = fake_get
+    monkeypatch.setattr(fd.requests, "get", lambda url, headers=None, timeout=None:
+                        (calls.append(url), FakeResp(403))[1])
+    clock = FakeClock()
+    rep = run_c(tmp_path, clock, attempts=2, final_retries=0)
+    assert rep["exit_code"] == 3 and len(rep["gaps"]) == 62
+    s = rep["summary"]
+    assert s["http_403_waf_suspected"] == 124 == s["requests"] and s["http_status_counts"] == {"403": 124}
+    assert "WAF" in rep["hint"] and rep["gaps"][0]["http_status"] == 403
+    assert "(WAF?)" in rep["gaps"][0]["last_error"]
+    assert not list((tmp_path / "raw").rglob("*.404"))       # 403 ist nicht "keine Daten"
+
+
+def test_pause_between_requests_and_cache_hits_are_free(tmp_path, candle_net):
+    clock = FakeClock()
+    rep = run_c(tmp_path, clock, pause=1.0)
+    assert clock.slept == [1.0] * 62
+    clock2 = FakeClock()
+    candle_net["requested"].clear()
+    rep = run_c(tmp_path, clock2, pause=1.0, rebuild=True)    # alles im Cache
+    assert candle_net["requested"] == [] and clock2.slept == [] and rep["summary"]["requests"] == 0
+
+
+def test_workers_parallel_same_result(tmp_path, candle_net):
+    run_c(tmp_path / "w1", workers=1)
+    n = len(candle_net["requested"])
+    run_c(tmp_path / "w4", workers=4)
+    assert len(candle_net["requested"]) == 2 * n
+    pd.testing.assert_frame_equal(pd.read_parquet(fd.store_path(tmp_path / "w1", SYM, 2026, 7)),
+                                  pd.read_parquet(fd.store_path(tmp_path / "w4", SYM, 2026, 7)))
+
+
+def test_progress_logged(tmp_path, candle_net, caplog):
+    with caplog.at_level("INFO", logger="dukascopy"):
+        run_c(tmp_path, progress_every=20)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("FORTSCHRITT")]
+    assert [ln.split()[1] for ln in lines] == ["20/62", "40/62", "60/62", "62/62"]
+    assert "ETA" in lines[0]
+
+
+def test_cli_defaults(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(fd, "install_stop_handler", lambda stop: None)
+    monkeypatch.setattr(fd, "run", lambda *a, **kw: seen.update(kw) or {"exit_code": 0})
+    assert fd.main(["--symbol", "xauusd", "--start", "2024-01", "--end", "2024-02"]) == 0
+    assert seen["mode"] == "candles" and seen["workers"] == 1 and seen["pause"] == 1.0
+    assert seen["attempts"] == 5 and seen["backoff_base"] == 2.0 and seen["max_backoff"] == 600.0
+    assert seen["final_retries"] == 2 and seen["final_wait"] == 300.0
+    assert seen["timeout"] == (10.0, 60.0)
+    monkeypatch.setattr(fd, "run", lambda *a, **kw: {"exit_code": 3, "summary": {
+        "failed_files": 1, "months_incomplete": ["2024-01"]}})
+    assert fd.main(["--symbol", "XAUUSD", "--start", "2024-01", "--mode", "ticks"]) == 3
+
+
+# ----------------------------------------------------------------- sigterm ---
+def test_stop_writes_report_and_exit_3(tmp_path, candle_net, monkeypatch):
+    stop = threading.Event()
+    inner = fd.download_bi5
+
+    def stopping(url, **kw):
+        if len(candle_net["requested"]) == 10:
+            stop.set()                                        # "SIGTERM" waehrend des Laufs
+        return inner(url, **kw)
+
+    monkeypatch.setattr(fd, "download_bi5", stopping)
+    rep = run_c(tmp_path, end=date(2026, 7, 1), stop=stop)
+    assert rep["status"] == "interrupted" and rep["exit_code"] == 3
+    assert rep["summary"]["interrupted"] and rep["summary"]["months_incomplete"] == ["2026-07"]
+    assert len(candle_net["requested"]) == 11 and parquet_names(tmp_path) == []
+    assert json.loads(fd.run_report_path(tmp_path, SYM).read_text())["status"] == "interrupted"
+    # Neustart setzt ohne Doppelarbeit fort
+    candle_net["requested"].clear()
+    monkeypatch.setattr(fd, "download_bi5", inner)
+    rep = run_c(tmp_path)
+    assert len(candle_net["requested"]) == 62 - 11 and rep["exit_code"] == 0
+
+
+def test_sigterm_handler_sets_stop():
+    stop = threading.Event()
+    old = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        fd.install_stop_handler(stop)
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert stop.wait(2)
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+
+
+# -------------------------------------------------------------- verify-day ---
+VDAY = date(2024, 3, 6)
+
+
+def verify_files(tmp_path, shift_close_points: int = 0):
+    """Tick-Stunden (nur 10h mit Ticks) und daraus abgeleitete Kerzen in den Cache."""
+    d0 = datetime(2024, 3, 6, tzinfo=UTC)
+    ticks = [  # (ms, ask, bid, ask_vol, bid_vol)
+        (1_000, 2150500, 2150000, 1.0, 2.0), (20_000, 2153500, 2153000, 1.0, 2.0),
+        (59_999, 2151500, 2151000, 1.0, 2.0), (120_000, 2149500, 2149000, 0.5, 0.25)]
+    for h in range(24):
+        fd._atomic_write(fd.raw_path(tmp_path, SYM, d0 + timedelta(hours=h)),
+                         make_bi5(ticks) if h == 10 else b"")
+    for side, i, vi in (("BID", 2, 4), ("ASK", 1, 3)):
+        rows = []
+        for minute in range(1440):
+            sel = [t for t in ticks if (10 * 3600_000 + t[0]) // 60_000 == minute]
+            if sel:
+                p = [t[i] for t in sel]
+                rows.append((minute * 60, p[0], max(p), min(p), p[-1], sum(t[vi] for t in sel)))
+            else:
+                last = rows[-1][4] if rows else 2150000
+                rows.append((minute * 60, last, last, last, last, 0.0))
+        if side == "BID" and shift_close_points:
+            r = rows[600]
+            rows[600] = (r[0], r[1], r[2] + shift_close_points, r[3], r[4] + shift_close_points, r[5])
+        fd._atomic_write(fd.candle_raw_path(tmp_path, SYM, d0, side), pack_candles(rows))
+
+
+def test_verify_day_match(tmp_path, fake_get):
+    calls, _ = fake_get
+    verify_files(tmp_path)
+    rep = fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7), pause=0)
+    assert calls == []                                       # alles aus dem Cache
+    assert rep["ok"] and rep["exit_code"] == 0
+    assert rep["field_order"] == {"BID": "OCLH", "ASK": "OCLH"}
+    assert rep["minutes_common"] == 2 and rep["minutes_only_ticks"] == rep["minutes_only_candles"] == 0
+    assert max(rep["max_abs_dev_points"].values()) == pytest.approx(0, abs=1e-6)
+    assert rep["fill_minutes_dropped"] == 1438
+    assert fd.verify_report_path(tmp_path, SYM, VDAY).exists()
+
+
+def test_verify_day_mismatch(tmp_path, fake_get):
+    verify_files(tmp_path, shift_close_points=5)
+    rep = fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7), pause=0)
+    assert not rep["ok"] and rep["exit_code"] == 4
+    assert rep["minutes_deviating"] == 1
+    assert rep["max_abs_dev_points"]["bid_close"] == pytest.approx(5)
+    assert rep["deviating_examples"][0]["ts"].startswith("2024-03-06T10:00")
+
+
+def test_verify_day_refuses_running_day(tmp_path):
+    with pytest.raises(ValueError):
+        fd.verify_day(SYM, VDAY, data_root=tmp_path, today=VDAY)

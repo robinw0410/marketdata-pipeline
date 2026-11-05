@@ -52,8 +52,9 @@ flowchart LR
 - **`verify_live.py`**: compares a collected day bar by bar against Binance's
   official daily archive (missing bars, phantom bars, OHLCV differences).
 - **`gaps.sql`**: DuckDB query that lists gaps in the historical store.
-- **`fetch_dukascopy.py`**: historical tick data for XAUUSD, XAGUSD and EURUSD
-  from Dukascopy, aggregated to 1-minute bars with **bid and ask** OHLC. See
+- **`fetch_dukascopy.py`**: historical 1-minute bars with **bid and ask** OHLC
+  for XAUUSD, XAGUSD and EURUSD from Dukascopy (daily 1-minute candle files by
+  default, hourly tick files optionally). See
   [Dukascopy (metals / FX)](#dukascopy-metals--fx) below.
 - **`fetch_calendar.py`**: economic calendar (US / euro area) for the news
   blackout of a gold/silver bot. See
@@ -65,33 +66,99 @@ flowchart LR
 
 ### Dukascopy (metals / FX)
 
-`fetch_dukascopy.py` downloads hourly `.bi5` tick files from
-`datafeed.dukascopy.com` (URL month is **0-based**, January = `00`; hours are
-UTC). Each file is LZMA-compressed; an empty file means no ticks, a 404 means
-missing. Records are 20 bytes big-endian (`>3I2f`): ms since the start of the
-hour, ask, bid (integers), ask volume, bid volume (float32).
+`fetch_dukascopy.py` reads `datafeed.dukascopy.com` (URL month is **0-based**,
+January = `00`; all times UTC). Files are LZMA-compressed; an empty file means
+no data, a 404 means missing.
 
+Two modes (`--mode`):
+
+- **`candles` (default)**: one file per day and side,
+  `{SYM}/{YYYY}/{MM0}/{DD}/{BID|ASK}_candles_min_1.bi5`, 24-byte big-endian
+  records (uint32 seconds since 00:00 UTC, four uint32 prices, float32
+  volume). Two requests per day instead of 24 (~12x fewer). BID and ASK are
+  merged into the same schema as the tick mode. Minutes where **both** sides
+  have volume 0 and flat prices are fill candles and are dropped.
+  `tick_count` is **1** for every kept minute (not a real tick count).
+- **`ticks`**: hourly `{HH}h_ticks.bi5`, 20-byte records (`>3I2f`: ms since
+  the hour, ask, bid, ask volume, bid volume), aggregated to 1-minute bars.
+
+The candle format is taken from `dukascopy-node` 1.46.4 (the last version that
+used the bi5 datafeed; line references in `DATA.md` and the script docstring)
+and was **not verified live**. The order of the four price fields is
+disputed (`dukascopy-node`: open, close, low, high; another source: open, high,
+low, close), so it is **determined per file from the data**: exactly one of
+the two orders must satisfy `high >= max(open, close)` and
+`low <= min(open, close)` for every non-flat candle, otherwise the file
+counts as a failed download ("field order unclear") and its month is not
+written. Check the format against ticks on the target machine with:
+
+```bash
+python scripts/fetch_dukascopy.py --symbol XAUUSD --verify-day 2024-03-06
+```
+
+It loads the day's 24 tick files and both candle files, aggregates the ticks to
+minutes and compares OHLC per side (detected field order, minutes only in one
+source, max deviation in points, volumes). Exit 0 = match, 4 = deviation above
+`--verify-tol` (points, default 0.5) / `--verify-max-share` (default 0), 3 =
+download failed. Report: `metals/reports/SYM-verify-YYYY-MM-DD.json`.
+
+Fault tolerance and throttling:
+
+- A file that still fails after `--attempts` (5) does **not** stop the run:
+  it is collected, the run continues, and all failures are retried at the end
+  in `--final-retries` rounds (2), each after `--final-wait` seconds (300).
+- A monthly file is written **only if the month has no unresolved failures**
+  (404 = no data is not a failure), so a month with gaps is never mistaken for
+  a finished one. The next run fetches only the missing files (raw cache,
+  404 markers) and then writes the month.
+- The run report `metals/reports/SYM-dukascopy-run.json` is **always** written
+  (also on gaps, SIGTERM or validation errors): summary plus a gap list
+  (symbol, month, file, day/hour/side, URL, HTTP status, last error, attempts).
+  The next run reads it and tries those files first.
+- `--workers` (default 1), `--pause` (1.0 s between requests per worker),
+  exponential backoff with jitter on 403/408/425/429/5xx, timeouts and
+  connection errors (`--backoff-base` 2 s, factor 2, cap `--max-backoff`
+  600 s), `Retry-After` honoured (up to the cap), separate
+  `--connect-timeout` (10 s) / `--read-timeout` (60 s). After a 503 (also 429
+  and 403) **all** workers pause until a shared "not before" time.
+- HTTP 403 is most likely the datafeed's WAF/bot protection (newer
+  `dukascopy-node` versions moved to a different API for that reason). It is
+  retried like 503, never treated as "no data", counted separately in the
+  report, and if most requests of a run get a 403 the log and report say so
+  (raise `--pause`, try later).
+- Progress (files done/total, rate, ETA) every `--progress-every` (50)
+  downloaded files; cache hits do not count as requests.
+- SIGTERM/SIGINT: no new downloads, running ones finish, the report is
+  written, exit 3 if anything is left. A restart (e.g. systemd
+  `Restart=on-failure`) continues without duplicate work; finished months
+  are skipped. Use `TimeoutStopSec` above the read timeout (e.g. 120 s).
+- Exit codes: **0** complete, **2** validation error, **3** gaps (failed
+  downloads after all retries, or interrupted), **4** `--verify-day` mismatch.
+
+Store and validation:
+
+- Raw files are cached (month 1-based in the cache path), so the store can be
+  rebuilt (`--rebuild`) without downloading again. 404s are cached as
+  `<name>.404` marker files; delete a marker to request that file again.
+- Bars cover `[t, t+1min)`, labelled left, and exist only for minutes with
+  trading (no filling). Only **completed UTC months** are written (so no
+  candle file of the running day is ever requested); existing monthly files
+  are not overwritten unless `--rebuild` is given. Parquet schema metadata
+  `dukascopy_mode` and the monthly report field `mode` record the mode.
 - **Assumption, to be verified:** price = integer / `POINT_DIVISOR`, with
   1000 for XAUUSD/XAGUSD and 100000 for EURUSD. A wrong divisor shifts prices
   by powers of ten, so every bar is checked against a coarse plausible range
-  (XAUUSD 200–20000, XAGUSD 3–500, EURUSD 0.5–2.0) and the run aborts hard
-  instead of writing wrong prices.
-- Raw files are cached (month 1-based in the cache path), so the store can be
-  rebuilt (`--rebuild`) without downloading again. 404s are cached as
-  `HHh_ticks.404` marker files; delete a marker to request that hour again.
-- Downloads are polite: generic User-Agent, retries with exponential backoff,
-  `--workers` (default 4) and a pause between requests.
-- Bars cover `[t, t+1min)`, labelled left, and exist only for minutes with
-  ticks (no filling). Only **completed UTC months** are written; existing
-  monthly files are not overwritten unless `--rebuild` is given.
+  (XAUUSD 200–20000, XAGUSD 3–500, EURUSD 0.5–2.0) and a yearly price anchor,
+  and the run aborts hard instead of writing wrong prices.
 - Hard validation before writing: duplicates, monotonic time, bid and ask OHLC
   consistency, prices > 0, NaNs, plausible range, crossed quotes
   (`ask_close < bid_close`, abort above 0.1 % of bars). Soft checks are only
   reported (log + JSON under `metals/reports/`): spread outliers (> 20x the
-  monthly median), 1m mid jumps > 2 %, and minutes without ticks Mon–Fri on a
-  coarse grid. There is deliberately **no hard gap limit** as for crypto:
-  metals and FX have daily breaks and weekends. Classifying gaps as planned or
-  unplanned is left to the consumer's trading calendar.
+  monthly median), 1m mid jumps > 2 %, minutes without ticks Mon–Fri on a
+  coarse grid, and continuity (`|open[t+1] - close[t]|` in points). There is
+  deliberately **no hard gap limit** as for crypto: metals and FX have daily
+  breaks and weekends. Classifying gaps as planned or unplanned is left to the
+  consumer's trading calendar.
 - Data root: `MARKETDATA_DATA_ROOT`, default `data/` in the repo (read only
   by this script and `fetch_calendar.py`).
 - **License:** check Dukascopy's terms of use yourself. Do not redistribute
@@ -271,7 +338,9 @@ python scripts/fetch_calendar.py --start-year 2003 --dry-run -v
 python scripts/fetch_calendar.py --sources fomc,ecb,adhoc,ff   # without FRED (fails validation on an empty store)
 
 # metals / FX from Dukascopy (written to data/metals, raw cache in data/raw/dukascopy)
-python scripts/fetch_dukascopy.py --symbol XAUUSD --start 2024-01 --workers 4
+python scripts/fetch_dukascopy.py --symbol XAUUSD --start 2024-01            # 1m candles, 1 worker
+python scripts/fetch_dukascopy.py --symbol XAUUSD --start 2024-01 --mode ticks
+python scripts/fetch_dukascopy.py --symbol XAUUSD --verify-day 2024-03-06   # candles vs. ticks
 
 # test fixture from the local kline store
 python scripts/export_fixture.py      # -> tests/fixtures/BTCUSDT-1m-2024-01-01_07.csv.gz
@@ -296,7 +365,7 @@ python -m pytest tests
 ├── scripts/
 │   ├── fetch_klines.py      historical spot klines (checksum-verified)
 │   ├── fetch_funding.py     funding rates + perp klines
-│   ├── fetch_dukascopy.py   Dukascopy ticks -> 1m bid/ask bars (metals, FX)
+│   ├── fetch_dukascopy.py   Dukascopy candles/ticks -> 1m bid/ask bars (metals, FX)
 │   ├── fetch_calendar.py    economic calendar (FRED, FOMC, ECB, ad hoc)
 │   ├── export_fixture.py    kline slice -> tests/fixtures/*.csv.gz
 │   ├── collect_klines.py    WebSocket live collector
@@ -317,12 +386,12 @@ python -m pytest tests
 ├── logs/experiments.jsonl   experiment log (committed)
 ├── data/                    not committed
 │   ├── klines/              spot klines, symbol=/year=
-│   ├── raw/dukascopy/       raw .bi5 cache, SYM/YYYY/MM/DD (month 1-based)
+│   ├── raw/dukascopy/       raw .bi5 cache (candles + ticks), SYM/YYYY/MM/DD (month 1-based)
 │   ├── raw/fomc/            cached FOMC historical pages
 │   ├── calendar/            events.parquet, snapshots/, reports/
 │   └── metals/
 │       ├── source=dukascopy/symbol=/year=/SYM-1m-YYYY-MM.parquet
-│       └── reports/         validation report per month (JSON)
+│       └── reports/         per-month validation, run report + gap list, verify-day (JSON)
 ├── DATA.md                  dataset inventory
 ├── GAPS.md                  gap analysis
 └── SPLITS.md                frozen data splits
