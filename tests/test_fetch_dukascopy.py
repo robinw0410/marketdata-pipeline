@@ -1434,3 +1434,14 @@ def test_verify_candles_only_lock_held_exit_3(tmp_path, fake_get):
         assert rep["exit_code"] == 3 and rep["status"] == "locked" and fake_get[0] == []
     finally:
         held.close()
+
+
+def test_cleanup_orphans_leaves_histdata_temp_files_alone(tmp_path):
+    rd = fd.reports_dir(tmp_path)
+    rd.mkdir(parents=True)
+    own = [rd / f".{SYM}-1m-2024-01.json.1.2.part", rd / f".{SYM}-dukascopy-run.json.1.2.part"]
+    foreign = rd / f".{SYM}-histdata-run.json.1.2.part"
+    for p in [*own, foreign]:
+        p.write_text("x")
+    assert fd.cleanup_orphans(tmp_path, SYM) == 2
+    assert foreign.exists() and not any(p.exists() for p in own)

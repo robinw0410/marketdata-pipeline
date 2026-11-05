@@ -191,6 +191,152 @@ Store and validation:
 - **License:** check Dukascopy's terms of use yourself. Do not redistribute
   or commit the data, raw or derived (`data/` is git-ignored).
 
+### HistData (metals / FX, default source)
+
+`fetch_histdata.py` is the **default source** for XAUUSD, XAGUSD and EURUSD.
+Dukascopy answers HTTP 429 per client IP in the homelab, even with one
+worker. The output is the same as the Dukascopy store (columns, dtypes,
+atomic writes, reports, exit codes). The bot can tell the two sources apart
+only by the partition `metals/source=histdata/...`. Research, sources and
+open points (German): [docs/histdata_research.md](docs/histdata_research.md).
+
+Download: GET the period page
+`https://www.histdata.com/download-free-forex-historical-data/?/ascii/{tick-data-quotes|1-minute-bar-quotes}/{sym}/{YYYY}[/{M}]`,
+read the hidden form `file_down` (`tk`, `date`, `datemonth`, `platform`,
+`timeframe`, `fxpair`), then POST it to `https://www.histdata.com/get.php`
+with that page as `Referer`. The response is a ZIP with one CSV and a status
+`.txt` (gap list). An empty body means no data. **Every file costs 2
+requests**, and only one request runs at a time.
+
+Two modes (`--mode`):
+
+- **`tick` (default)**: Generic ASCII ticks `YYYYMMDD HHMMSSmmm,bid,ask,volume`,
+  one ZIP per month, aggregated to 1-minute bid **and** ask OHLC with a real
+  `tick_count`. This is the only HistData format that has the ask side, so
+  it is the only one that keeps the spread. Parquet metadata:
+  `histdata_mode=histdata_tick`, `spread_available=true`.
+- **`m1`**: Generic ASCII 1-minute bars `YYYYMMDD HHMMSS;o;h;l;c;v`, **bid
+  only**. Past years come as one yearly ZIP, the current year monthly. The
+  store gets `ask_* = bid_*` (spread 0) and `tick_count = 1`, and the
+  metadata says `histdata_mode=histdata_m1`, `spread_available=false`. The
+  bot's cost model must supply the spread. Exact duplicate minutes are
+  dropped; conflicting duplicates (observed in real HistData M1 files) are
+  merged and counted in the monthly report.
+
+Time zone:
+
+- HistData documents its timestamps as **EST without daylight saving
+  (fixed UTC-5)**, so `ts_utc = raw + 5 h`, with no DST logic.
+- A UTC month M therefore needs raw months M-1 (its last 5 hours) and M. It
+  is written only when both are present, or when M-1 is before the symbol's
+  history or confirmed empty.
+- The claim is **checked in code for every raw month**. Anchor points are
+  taken from the data: weekly close (expected Friday 17:00 New York), weekly
+  open (expected Sunday 18:00 New York for metals, 17:00 for EURUSD) and, for
+  metals, the daily break (17:00–18:00 New York, Mon–Thu). Expected times
+  come from `zoneinfo` `America/New_York`, so they include DST. Each anchor
+  gives an implied UTC offset.
+- The month passes only if all of these hold:
+  - at least 3 anchors
+  - median offset -5 h
+  - at least 60 % of anchors at -5 h
+  - no run of 3 consecutive anchors with the same other offset (that means a
+    shift in mid-month)
+  - no timestamp jumps back by 30 minutes or more in file order (that means
+    a clock change)
+- Otherwise the raw month goes to **quarantine** (`<zip>.quarantine` with the
+  full check, exit 4). Nothing shifted is ever written.
+- **Third-party data suggests the claim may not hold in summer**: one-hour
+  regressions in late October and an August archive whose Sunday open is one
+  hour late (see the research doc). Run `--verify-month` on a winter and a
+  summer month before the first full run.
+
+Unpublished and missing data:
+
+- A month is requested only after its raw month has ended (UTC month end
+  + 5 h + 6 h settle time).
+- An empty answer within 45 days of month end is **pending** (exit 3). It is
+  checked again at most every 24 h.
+- An older empty answer is "no data". It is unconfirmed (exit 3) until a
+  check at least 24 h later is empty again. Confirmed months are listed under
+  `months_unavailable` and do not cause exit 3.
+- Months before the symbol's history (XAUUSD 2009-03, XAGUSD 2009-05, EURUSD
+  2000-05: these are the M1 start dates; tick start dates are unverified)
+  need no request.
+
+HTTP and errors:
+
+- `--pause` (5 s) is the minimum gap between two requests.
+- 5xx, timeouts, connection errors, 403 and non-ZIP answers each count as a
+  failed attempt (`--attempts` 5). Each one sets an escalating cooldown of
+  `--backoff-base` (10 s) × 2^k, capped at `--max-backoff` (600 s). After
+  `--max-consecutive-failures` (10) failures in a row the run stops (exit 3).
+- An HTML or text answer (error page, captcha, WAF) is a failure with a text
+  excerpt in the report, never data.
+- A corrupt cached ZIP (bad ZIP, missing CSV) is moved aside as
+  `<zip>.corrupt` and downloaded again.
+- **HTTP 429** goes through `scripts/ratelimit.py`:
+  - `gate.wait()` runs before every request.
+  - A 429 pauses all requests for max(`Retry-After`, `--rate-limit-pause`).
+    The default is 900 s, and smaller values are rejected.
+  - The block is persisted in `metals/state/histdata-ratelimit.json`, so
+    restarts and parallel symbols respect it.
+  - A 429 does **not** use up an attempt, does not escalate the backoff and
+    does not count toward the circuit breaker.
+  - Once `--max-rate-limit-wait` (21600 s) is used up, the run ends cleanly
+    with exit 3 and a report.
+
+Resume, files and reports:
+
+- Finished months and cached ZIPs are skipped and cost no requests.
+- `--rebuild` rebuilds months from the raw cache.
+- Raw cache:
+  `metals/raw/source=histdata/symbol=SYM/mode={tick|m1}/HISTDATA_COM_ASCII_SYM_{T|M1}{period}.zip`.
+- Reports:
+  - `metals/reports/SYM-histdata-run.json`: always written, also on errors
+    and SIGTERM. It holds the summary, `gaps`, `pending`, `unconfirmed`,
+    `quarantine`, `validation_errors` and the gaps HistData reports in its
+    status `.txt` (`histdata_reported_gaps`).
+  - `SYM-histdata-1m-YYYY-MM.json` per month: `fetch_dukascopy.validate`
+    plus the time zone check of each raw month.
+  - `SYM-histdata-verify-YYYY-MM.json` from `--verify-month`.
+- Lock: `metals/.lock-histdata-SYM`, separate from the Dukascopy lock. If
+  it is held, the run exits 3.
+- SIGTERM ends the run cleanly with a report and exit 3. Orphaned temp files
+  are removed at start.
+
+Exit codes are the same as Dukascopy:
+
+- **2**: validation error.
+- **3**: gaps, pending months, unconfirmed "no data", 429 budget used up,
+  circuit breaker, SIGTERM or lock held. Restarting later is fine.
+- **4**: quarantine (time zone mismatch, unreadable format). Check by hand,
+  no restart.
+- **0**: complete.
+
+Request count: 2 requests per raw month in tick mode, so a full XAUUSD
+history (2009-03 to now, about 210 months) is about 420 requests, which is
+about 35 minutes of pauses plus the download time. One tick month is several
+million rows; plan for 1–2 GB of RAM.
+
+Homelab commands (container user `mkt`):
+
+```bash
+# check one month first (max. 4 requests): decode, time zone check, validation
+runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
+  /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
+  --symbol XAUUSD --verify-month 2024-03
+runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
+  /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
+  --symbol XAUUSD --verify-month 2024-07          # summer month: DST check
+# full history (default start = history start of the symbol)
+runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
+  /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
+  --symbol XAUUSD --start 2009-03
+# bid-only fallback
+python scripts/fetch_histdata.py --symbol EURUSD --start 2024-01 --end 2024-06 --mode m1
+```
+
 ### Economic calendar
 
 `fetch_calendar.py` builds `calendar/events.parquet` (current state) plus a

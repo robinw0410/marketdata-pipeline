@@ -184,6 +184,112 @@ Handelskalender des Bots.
 Lizenz: Dukascopy-Nutzungsbedingungen selbst pruefen. Daten (roh und
 abgeleitet) nicht weitergeben und nicht committen.
 
+## Metalle / FX (HistData, Default-Quelle)
+
+Symbole:  XAUUSD, XAGUSD, EURUSD (1m, Bid- und Ask-OHLC)
+Stand:    noch nicht geladen (scripts/fetch_histdata.py)
+Quelle:   histdata.com, Generic ASCII; Default Ticks je Monat (--mode tick),
+          optional M1 nur Bid (--mode m1). Dukascopy liefert im Homelab
+          HTTP 429 je IP.
+Format:   wie Dukascopy (Parquet/zstd, gleiche Spalten und dtypes), nur
+          Partition source=histdata
+Zeitzone: UTC; Rohzeit laut HistData fest UTC-5 (EST ohne Sommerzeit),
+          JE ROHMONAT im Code geprueft (s. u.)
+Recherche, Quellen, Offenes: docs/histdata_research.md
+
+Store:
+    data/metals/source=histdata/symbol={SYM}/year={YYYY}/{SYM}-1m-{YYYY}-{MM}.parquet
+    data/metals/reports/{SYM}-histdata-1m-{YYYY}-{MM}.json   Validierungsreport je Monat
+                                                             (inkl. Zeitzonen-Pruefung je Rohmonat)
+    data/metals/reports/{SYM}-histdata-run.json              Laufreport (immer, auch bei Fehlern)
+    data/metals/reports/{SYM}-histdata-verify-{YYYY-MM}.json Ergebnis --verify-month
+    data/metals/raw/source=histdata/symbol={SYM}/mode={tick|m1}/
+        HISTDATA_COM_ASCII_{SYM}_{T|M1}{YYYY[MM]}.zip         Roh-Cache (ZIP wie geladen)
+        <zip>.empty                  keine Daten (JSON: first_seen, last_checked, confirmed, checks)
+        <zip>[.YYYY-MM].quarantine   Zeitzone/Format passt nicht (JSON mit Pruefbericht);
+                                     loeschen = erneut pruefen, ZIP loeschen = neu laden
+        <zip>.corrupt                beiseitegelegtes kaputtes ZIP
+    data/metals/state/histdata-ratelimit.json  429-Sperre (alle HistData-Prozesse)
+    data/metals/.lock-histdata-{SYM}           Prozess-Lock je Symbol (unabhaengig von Dukascopy)
+
+Spalten: wie Dukascopy (ts UTC ms, Label links; bid_/ask_open/high/low/close
+float64; tick_count int64; bid_volume, ask_volume float64; source =
+"histdata"). Parquet-Metadaten: histdata_mode = histdata_tick|histdata_m1,
+spread_available = true|false, source_timezone.
+- tick: aus Ticks "YYYYMMDD HHMMSSmmm,bid,ask,volume" verdichtet
+        (fetch_dukascopy.aggregate_1m, stabil sortiert: gleiche Zeitstempel
+        behalten die Dateireihenfolge). tick_count = echte Tickzahl.
+        Volumen: HistData liefert 0, bid_volume = ask_volume = 0.
+- m1:   "YYYYMMDD HHMMSS;o;h;l;c;v", NUR Bid -> ask_* = bid_*, Spread 0,
+        tick_count = 1. Den Spread liefert das Kostenmodell des Bots.
+        Exakt doppelte Minuten verworfen, abweichende Doppelminuten
+        zusammengefasst (open erste, high max, low min, close letzte Zeile)
+        und gezaehlt (m1_conflicting_minutes_merged). Vergangene Jahre nur
+        als Jahres-ZIP, laufendes Jahr monatlich.
+
+Zeitzone und Monatsgrenze:
+- ts_utc = roh + 5 h, keine Sommerzeitlogik. UTC-Monat M = letzte 5 h des
+  Rohmonats M-1 + Rohmonat M ohne dessen letzte 5 h. Geschrieben wird M nur,
+  wenn beide Rohmonate erledigt sind (Daten, bestaetigt leer oder vor
+  Historienbeginn); ist der Rohmonat M selbst bestaetigt leer, wird nichts
+  geschrieben (months_unavailable).
+- Pruefung je Rohmonat (check_timezone): Ankerpunkte Wochenschluss
+  (Fr 17:00 New York), Wochenstart (So 18:00 Metalle / 17:00 EURUSD),
+  Tagespause der Metalle Mo-Do (17:00-18:00 New York); erwartete Zeiten per
+  zoneinfo America/New_York (mit Sommerzeit). Impliziter Offset je Anker
+  (ganze Stunden). Bestanden nur bei: >= 3 Anker, Median -5 h, >= 60 % der
+  Anker bei -5 h, kein Lauf von 3 gleich abweichenden Ankern in Folge,
+  kein Ruecksprung >= 30 min in Dateireihenfolge. Sonst QUARANTAENE
+  (Exit 4), nichts verschoben geschrieben. Kleine Rueckspruenge (echte
+  Dateien haben Tausende, AIT) und einzelne Feiertage stoeren nicht.
+- Unverifiziert / Zweifel: Drittquellen sehen einstuendige Rueckspruenge
+  Ende Oktober und einen August-Wochenstart eine Stunde zu spaet (passt zu
+  Sommerzeit). Vor dem ersten Volllauf --verify-month auf einen Winter- und
+  einen Sommermonat; der Report zeigt median_offset_h und Beispiele.
+
+Verfuegbarkeit / "keine Daten":
+- Historienbeginn (ASCII M1, Auswahlliste): XAUUSD 2009-03, XAGUSD 2009-05,
+  EURUSD 2000-05. Tick-Beginn NICHT verifiziert. Monate davor ohne Request
+  als nicht verfuegbar gelistet.
+- Angefragt wird ein Monat erst nach Rohmonatsende (UTC-Monatsende + 5 h)
+  + 6 h. Leerer Body (keine Daten):
+    bis 45 Tage nach Monatsende -> pending (Exit 3), erneute Pruefung
+                                   fruehestens nach 24 h, nie bestaetigt
+    danach                      -> unbestaetigt (Exit 3), bestaetigt, wenn
+                                   eine Pruefung >= 24 h spaeter wieder leer
+                                   ist -> months_unavailable, kein Exit 3
+- HTML/Text statt ZIP (Fehlerseite, Captcha, WAF), Seite ohne Formular
+  file_down: Fehlschlag mit Textausschnitt im Report, nie Daten.
+- Kaputtes Cache-ZIP (BadZipFile, CSV fehlt/falscher Name) -> <zip>.corrupt,
+  neu geladen. Unlesbare CSV (Spalten, Trenner, Zeitstempel) -> Quarantaene.
+
+Drosselung (ein Request zur Zeit, je Datei 2 Requests: Seite + POST):
+- --pause 5 s Mindestabstand, --attempts 5, Abkuehlung --backoff-base 10 s
+  x 2^k (Deckel --max-backoff 600 s) bei 5xx/403/408/425/Timeout/
+  Verbindungsfehler/Nicht-ZIP, Schutzschalter nach
+  --max-consecutive-failures 10 Fehlschlaegen in Folge (Exit 3).
+- HTTP 429 ueber scripts/ratelimit.py: vor jedem Request gate.wait(); bei
+  429 Pause fuer alle max(Retry-After, --rate-limit-pause) (Default 900 s,
+  kleiner abgelehnt), persistiert in metals/state/histdata-ratelimit.json;
+  KEIN Versuch verbraucht, keine Eskalation, kein Schutzschalter. Nach
+  --max-rate-limit-wait (21600 s) Lauf sauber beendet (Exit 3, Report).
+- Requests: XAUUSD-Gesamthistorie im Tickmodus ca. 210 Monate x 2 = 420.
+
+Exit-Codes (Vorrang wie Dukascopy):
+    2  Validierungsfehler (fetch_dukascopy.validate) in mindestens einem Monat
+    3  Luecken, pending, unbestaetigt, 429-Budget erschoepft, Schutzschalter,
+       SIGTERM, Lock belegt -> spaeter erneut
+    4  Quarantaene (Zeitzone passt nicht, Format unlesbar) -> manuell pruefen
+    0  vollstaendig
+
+Pruefen auf dem LXC (max. 4 Requests, schreibt nur den Verify-Report):
+    runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
+      /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
+      --symbol XAUUSD --verify-month 2024-03
+
+Lizenz: HistData-Nutzungsbedingungen selbst pruefen (hier nicht
+erreichbar, nicht gelesen). Daten nicht weitergeben und nicht committen.
+
 ## Wirtschaftskalender
 
 Zweck:    News-Sperre des Gold/Silber-Bots (scripts/fetch_calendar.py)

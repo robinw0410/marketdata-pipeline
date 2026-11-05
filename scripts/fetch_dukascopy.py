@@ -464,7 +464,10 @@ def cleanup_orphans(data_root: Path, symbol: str) -> int:
     cands = list(sd.rglob(".*.part")) + list(sd.rglob("*.parquet.part")) if sd.exists() else []
     rd = reports_dir(data_root)
     if rd.exists():
-        cands += list(rd.glob(f".{symbol}-*.part"))
+        # nur eigene Report-Namen: ".{SYM}-*" traefe auch die Temp-Dateien eines
+        # gleichzeitig laufenden HistData-Laufs (.{SYM}-histdata-...)
+        for pat in (f".{symbol}-1m-*.part", f".{symbol}-dukascopy-*.part", f".{symbol}-verify-*.part"):
+            cands += list(rd.glob(pat))
     for p in cands:
         p.unlink(missing_ok=True)
         n += 1
