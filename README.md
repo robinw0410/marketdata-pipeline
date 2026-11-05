@@ -256,31 +256,52 @@ Time zone:
   hours in EST) and M; the raw months are computed from `RAW_TZ`. M is
   written only when both are present, or when M-1 is before the symbol's
   history or confirmed empty.
-- The time zone is **checked in code for every raw month**. Anchor points
-  are taken from the data:
-  - weekly close (expected Friday 17:00 New York);
-  - weekly open (expected Sunday 18:00 New York for metals, 17:00 for
-    EURUSD);
-  - for metals, the daily break (17:00–18:00 New York, Mon–Thu). Only gaps
-    starting within 3 h of the expected break count; thin markets such as
-    silver have other night-time gaps, and those are ignored.
+- The time zone is **checked in code for every raw month**. Every market gap
+  gives a close anchor and an open anchor:
+  - weekend (gap of 24 h or more): close Friday 17:00 New York, open Sunday
+    18:00 for metals, 17:00 for EURUSD;
+  - for metals, the daily break (Mon–Thu, 17:00–18:00 New York): at most
+    one per day (the longest), only if its offset is unambiguous and within
+    3 h of the expected one. Thin markets such as silver have other gaps,
+    and those are ignored.
 
-  Expected market times come from `zoneinfo` `America/New_York`. Each
-  anchor gives an implied offset (raw minus UTC). The expected offset is
-  taken per anchor from `RAW_TZ[mode]` at that moment (tick: -4 h in EDT,
-  -5 h in EST; m1: always -5 h). Decisions use the **deviation** = implied
-  minus expected.
+  The last tick of the previous cached raw month and the first ticks of the
+  next one are added, so the weekend across the month edge is an anchor
+  too (EURUSD has no daily break and otherwise had no anchor there).
+  Expected market times come from `zoneinfo` `America/New_York`. The
+  expected offset is taken per anchor from `RAW_TZ[mode]` at that moment
+  (tick: -4 h in EDT, -5 h in EST; m1: always -5 h). Decisions use the
+  **deviation** = implied minus expected. A gap's deviation is estimated
+  from both sides together: the close may not lie before the last tick and
+  the open not after the first tick. This stays correct for thin data,
+  where the ticks are minutes away from 17:00/18:00. Ambiguous gaps do not
+  count. An anchor is **reliable** when its gap gives a unique deviation,
+  when the two sides of a weekend contradict each other, or when both
+  ticks sit within 2 minutes of the event while the market is active
+  around them.
 - The month passes only if all of these hold:
   - at least 3 anchors
   - median deviation 0
   - at least 60 % of anchors with deviation 0
-  - no run of 3 consecutive anchors with the same non-zero deviation (that
+  - no run of 3 consecutive gaps with the same non-zero deviation (that
     means a shift in mid-month)
-  - **no anchor with a deviation of exactly 1 h in the first or last 72 h**
-    of the raw month (a clock change at the month edge; holiday early
-    closes are off by 2 h or more and stay allowed)
+  - **no reliable anchor with a deviation of exactly 1 h in the first or
+    last 72 h** of the raw month (a clock change at the month edge; holiday
+    early closes are off by 2 h or more and stay allowed)
+  - for zones with DST (tick): **no reliable anchor with any deviation
+    within 7 days of a New York clock change** (data stamped with another
+    DST rule, such as the EU rule or the US rule before 2007)
+  - no weekend across which the reliable deviation jumps by exactly 1 h
   - no timestamp jumps back by 30 minutes or more in file order (that means
     a clock change)
+- Tested on synthetic data for 2001–2026: correct New York stamping passes
+  every month; EU-rule and pre-2007-rule stamping never ends up in a
+  written UTC month (XAUUSD and EURUSD). Thin silver (about one tick per
+  20 minutes) passes every month and shifted stamping is never written.
+  Limit: EURUSD (weekend anchors only) at about one tick per 20 minutes
+  around the Sunday open can miss a shift that lasts one week; real EURUSD
+  ticks are dense. At about one tick per 50 minutes most months fail and
+  go to quarantine.
 - If the following raw month M+1 is cached and starts 1 h off, month M is
   not written either: the switch probably happened after M's last anchor.
   M+1 is fetched first whenever UTC month M+1 is due anyway, so this costs
@@ -295,20 +316,43 @@ Time zone:
     marker and the month is checked again.
   - Setting `"accepted": true` in the marker releases the month after a
     manual check.
-  - Markers carry `raw_tz` and `tz_check_version`. A marker from an older
-    check version (the previous fixed-UTC-5 check for ticks) is removed
-    with a WARNING and the raw month is re-checked without a download,
-    unless it says `"accepted": true`.
-- Monthly files carry the parquet metadata `source_timezone`
-  (`America/New_York (mit Sommerzeit) -> UTC, je Monat geprueft` for tick,
-  `Etc/GMT+5 (fest UTC-5) -> UTC, je Monat geprueft` for m1). A file of the
-  same mode with a different value (written by the previous fixed-UTC-5
-  code; its summer months are shifted by 1 h) is **rebuilt automatically
-  from the raw cache on the next run**, with no new requests. The run logs
-  a WARNING and lists the months under `rebuilt_timezone` in the run
-  report; `summary.months_rebuilt_timezone` holds the ones written and
-  `summary.months_stale_timezone_not_rebuilt` the ones that failed (the old
-  file stays and the next run retries).
+  - Markers carry `raw_tz` and `tz_check_version`. A marker that is not
+    released and comes from an older check version or another zone is
+    removed with a WARNING and the raw month is re-checked without a
+    download.
+  - `"accepted": true` holds only for the same conversion (`raw_tz`). A
+    release made under another conversion (the old fixed-UTC-5 check, no
+    `raw_tz`) is re-checked: if the month passes, the marker is removed;
+    if not, it is rewritten with `"accepted": false` and a note that the
+    earlier release applied to the old conversion. A tick at an ambiguous or
+    nonexistent local time blocks even a released month.
+  - An unreadable marker (invalid JSON, e.g. a typo while setting
+    `"accepted": true`) is kept, logged as ERROR and keeps blocking.
+- Monthly files carry the parquet metadata `source_timezone`, derived from
+  `RAW_TZ` and the check version, e.g.
+  `America/New_York -> UTC, je Rohmonat geprueft (tz_check v3)`. At the start
+  of **every** run, all monthly files of the symbol and mode are checked,
+  not only those in `--start`/`--end`:
+  - same conversion zone, old label only (e.g. m1 files of the previous
+    version): the metadata is rewritten, the file is never moved, no
+    requests (`relabelled_timezone` in the run report);
+  - different conversion that shifts UTC times in this month (tick months
+    touching EDT, written by the fixed-UTC-5 code, 1 h off): the file is
+    **moved to `metals/stale/` at once**, so the bot sees a gap rather than a
+    shifted month. Outside the range it is listed under
+    `stale_retired_out_of_range`;
+  - different conversion but identical UTC times in this month (fully EST:
+    December–February): the file stays until a rebuild replaces it
+    atomically (`stale_out_of_range` outside the range).
+
+  Months inside the range are rebuilt from the raw cache (WARNING,
+  `rebuilt_timezone`); this needs no requests when the raw ZIPs are cached,
+  otherwise they are downloaded as usual. `summary.months_rebuilt_timezone`
+  lists the months written; `summary.months_stale_timezone_not_rebuilt` the
+  ones whose rebuild failed. A shifted file has already left the store, so
+  the bot sees a gap. A file that was not shifted stays in place, and the
+  next run retries. `--verify-month` reports the state of the month's file
+  (`store_file`) without changing it.
 
 Unpublished and missing data:
 

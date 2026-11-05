@@ -94,29 +94,42 @@ Der Verify-Report zeigt je Rohmonat `raw_tz`, `median_offset_h`, `median_deviati
 
 ### Prüfung je Rohmonat (`check_timezone`)
 
-- Ankerpunkte aus den Daten: Wochenschluss (letzter Tick vor Lücke ≥ 24 h, erwartet Freitag 17:00 New York), Wochenstart (erster Tick danach, erwartet 18:00 Metalle / 17:00 EURUSD), bei Metallen zusätzlich Tagespause Mo-Do (Lücke 45 min bis 3 h, Beginn 17:00, Ende 18:00 New York). Erwartete Marktzeiten über `zoneinfo("America/New_York")`.
-- Je Anker der **implizite** Offset (Rohzeit minus UTC des Marktereignisses, ganze Stunden) und der **erwartete** Offset von `RAW_TZ[mode]` in genau diesem Zeitpunkt (tick: -4 h in EDT, -5 h in EST; m1: immer -5 h). Entschieden wird über die **Abweichung** = implizit - erwartet.
-- Als Tagespause zählen nur Lücken, deren Beginn höchstens 3 h vom erwarteten Pausenbeginn (mit dem erwarteten Offset dieses Ankers) entfernt ist. Dünne Märkte wie Silber haben nachts weitere Lücken.
+- Anker: je Marktlücke ein Schluss- und ein Öffnungsanker. Wochenende (Lücke ≥ 24 h): Schluss Freitag 17:00, Öffnung Sonntag 18:00 (Metalle) bzw. 17:00 (EURUSD) New York. Bei Metallen die Tagespause Mo-Do (17:00-18:00 New York): höchstens eine je Tag (die längste), nur wenn eindeutig und höchstens 3 h vom erwarteten Beginn entfernt. Dünne Märkte wie Silber haben weitere Lücken. Erwartete Marktzeiten über `zoneinfo("America/New_York")`.
+- **Randticks der Nachbar-Rohmonate:** Die letzten Ticks des gecachten Vormonats und die ersten des Folgemonats werden mitbetrachtet. Dadurch wird auch das Wochenende über den Monatsrand zur Lücke; Anker zählen nur auf der eigenen Seite. Vorher hatte EURUSD (keine Tagespause) dort gar keinen Anker (Review: EURUSD 2025-10 mit EU-Stempelung bestand mit `{0: 7, -1: 1}`).
+- Je Anker der **implizite** Offset (Rohzeit minus UTC des Marktereignisses) und der **erwartete** Offset von `RAW_TZ[mode]` in genau diesem Zeitpunkt (tick: -4 h in EDT, -5 h in EST; m1: immer -5 h). Entschieden wird über die **Abweichung** = implizit - erwartet.
+- Die Abweichung einer Lücke wird **aus beiden Seiten gemeinsam** bestimmt: alle ganzen Abweichungen, mit denen der Schluss nicht vor dem letzten und die Öffnung nicht nach dem ersten Tick läge (±5 min). Bei richtigen Daten jeder Dichte liegt 0 immer darin. Genau eine: beide Anker damit, auch wenn die Ticks Minuten vom Ereignis entfernt sind (dünne Daten; vorher rundete ein letzter Tick > 30 min vor 17:00 auf -1 h, und die Monatsrand-Regel ließ jeden dünnen Monat durchfallen). Mehrere: Lücke zählt nicht, außer Seiten mit Tick am Ereignis. Keine (Widerspruch): Stempelung wechselt über das Wochenende.
+- **Belastbar** ist ein Anker, wenn die Abweichung seiner Lücke eindeutig ist (Wochenende), die Seiten eines Wochenendes sich widersprechen, oder beide Ticks höchstens 2 min an der vollen Stunde liegen und der Markt dort aktiv ist (Nachbartick ebenfalls ≤ 2 min). Tagespausen sind nur mit Ticks am Ereignis belastbar.
 - Bestanden nur, wenn alle Bedingungen gelten:
   - mindestens 3 Anker
   - Median-Abweichung 0
   - Anteil Abweichung 0 mindestens 60 %
-  - weniger als 3 aufeinanderfolgende Anker mit gleicher Abweichung ≠ 0 (sonst Regimewechsel mitten im Monat)
+  - weniger als 3 aufeinanderfolgende Lücken mit gleicher Abweichung ≠ 0 (sonst Regimewechsel mitten im Monat)
   - kein Rücksprung ≥ 30 min in Dateireihenfolge (sonst Uhrumstellung)
-  - kein Anker mit genau ±1 h Abweichung in den ersten oder letzten 72 h des Rohmonats (Umstellung kurz vor Monatsende, z.B. nach EU-Regel, erzeugt sonst nur 1-2 abweichende Anker). Feiertage weichen um ≥ 2 h ab und bleiben erlaubt.
-- Report-Felder: `status`, `ok`, `reason`, `raw_tz`, `anchors`, `offsets` (implizit), `expected_offsets`, `deviations`, `median_offset_h` (implizit, zur Anzeige), `median_deviation_h`, `share_expected`, `edge_violations`, `deviating_examples`, `reversals`.
+  - kein belastbarer Anker mit genau ±1 h Abweichung in den ersten oder letzten 72 h des Rohmonats. Feiertage weichen um ≥ 2 h ab und bleiben erlaubt.
+  - bei Zonen mit Sommerzeit (tick): kein belastbarer Anker mit Abweichung ≠ 0 innerhalb von 7 Tagen vor oder nach einer New-York-Umstellung (andere Sommerzeitregel, z.B. EU oder US vor 2007)
+  - kein Wochenende, über das die belastbare Abweichung um genau 1 h springt
+- Report-Felder: `status`, `ok`, `reason`, `raw_tz`, `anchors`, `reliable_anchors`, `offsets` (implizit), `expected_offsets`, `deviations`, `median_offset_h` (implizit, zur Anzeige), `median_deviation_h`, `share_expected`, `edge_violations`, `transition_violations`, `weekend_switches`, `deviating_examples`, `reversals`.
+- Synthetisch geprüft (Tests `test_other_dst_rules_never_written_2001_2026`, `test_new_york_stamping_passes_every_month_2001_2026`, `test_thin_silver_one_tick_per_20_min`): New-York-Stempelung besteht 2001-2026 jeden Monat (XAUUSD, EURUSD). EU- und Vor-2007-US-Stempelung landen nie in einem geschriebenen UTC-Monat. Dünnes Silber (~1 Tick/20 min) besteht jeden Monat, fest-EST- und EU-gestempelt wird nie geschrieben. **Grenzen:** EURUSD (nur Wochenend-Anker) mit ~1 Tick/20 min um die Sonntagsöffnung kann eine nur eine Woche dauernde Verschiebung übersehen (echte EURUSD-Ticks sind dicht). Bei ~1 Tick/50 min fallen die meisten Monate durch (Quarantäne, also auf der sicheren Seite).
 - Beginnt der gecachte Folge-Rohmonat schon mit ±1 h Abweichung, wird auch der Monat davor nicht geschrieben (Umstellung nach dessen letztem Anker). M+1 wird zuerst geholt, wenn es ohnehin gebraucht wird.
 - Zu wenige Anker (z.B. kurzer erster Historienmonat): Prüfung gemeinsam mit gecachten Nachbar-Rohmonaten. Bleibt das Ergebnis unentscheidbar, folgt Quarantäne mit dem Grund "NICHT PRUEFBAR".
 - Sonst **Quarantäne** (`<zip>.quarantine` mit vollem Prüfbericht, `raw_tz` und `tz_check_version`, Exit 4). Die UTC-Monate, die diesen Rohmonat brauchen, werden nicht geschrieben. Es wird nie verschoben geschrieben.
-  - Freigeben nach manueller Prüfung: `"accepted": true` im Marker.
+  - Freigeben nach manueller Prüfung: `"accepted": true` im Marker. Gilt nur für dieselbe Umrechnung (`raw_tz`). Ein Tick in nicht eindeutiger Ortszeit sperrt trotzdem.
   - Marker löschen: erneute Prüfung ohne Download.
   - ZIP löschen: neuer Download; dabei wird der Marker entfernt.
-  - Marker einer älteren Prüfversion (`tz_check_version` fehlt oder ist kleiner, z.B. die Quarantäne von 2024-07 durch die Vorversion mit "fest UTC-5") werden automatisch entfernt (WARNING) und der Rohmonat ohne Download neu geprüft. Ausnahme: `"accepted": true` gilt weiter.
-- Grenzen: Im Winter sind New-York-Ortszeit und EST identisch und nicht unterscheidbar (darum sind alte Wintermonate inhaltlich richtig). EURUSD hat nur 2 Anker pro Woche (keine Tagespause). Eine Verschiebung, die kürzer als etwa 1,5 Wochen dauert, kann dort unentdeckt bleiben. Eine Rückstellung erkennt der Rücksprung-Check trotzdem.
+  - Nicht freigegebene Marker einer älteren Prüfversion (`tz_check_version` fehlt oder ist kleiner) oder anderer Zone werden entfernt (WARNING) und der Rohmonat ohne Download neu geprüft.
+  - Freigaben unter einer anderen Umrechnung (Vorversion "fest UTC-5", ohne `raw_tz`) werden neu geprüft: besteht der Monat, verschwindet der Marker; sonst wird er als `accepted: false` mit Hinweis (`note`) neu geschrieben. Grund: die Freigabe galt der alten Umrechnung. Ein fest-EST-gestempelter Juli mit v1-Freigabe würde sonst 1 h zu früh geschrieben.
+  - Ein unlesbarer Marker (kein gültiges JSON, z.B. Tippfehler beim Freigeben) bleibt liegen, wird als ERROR gemeldet und sperrt weiter.
+- Grenzen: Im Winter sind New-York-Ortszeit und EST identisch und nicht unterscheidbar (darum sind alte Wintermonate inhaltlich richtig).
 
 ### Altbestand
 
-Monatsdateien tragen das Parquet-Metadatum `source_timezone` (tick: `America/New_York (mit Sommerzeit) -> UTC, je Monat geprueft`, m1: `Etc/GMT+5 (fest UTC-5) -> UTC, je Monat geprueft`). Dateien desselben Modus mit anderem Wert (Vorversion: `EST fixed UTC-5, ...`) werden im nächsten Lauf automatisch aus dem Roh-Cache neu gebaut, ohne neue Requests (WARNING, Laufreport `rebuilt_timezone`, `summary.months_rebuilt_timezone`). Sommermonate der Vorversion wären um 1 h verschoben. Wintermonate sind zufällig richtig, werden aber trotzdem neu gebaut. Die alte Datei wird vor dem Neubau nach `metals/stale/...` verschoben (nichts gelöscht). Scheitert der Neubau (z.B. Quarantäne), sieht der Bot eine Lücke statt eines verschobenen Monats; der Monat steht unter `summary.months_stale_timezone_not_rebuilt`, und der nächste Lauf versucht es erneut.
+Monatsdateien tragen das Parquet-Metadatum `source_timezone`, abgeleitet aus `RAW_TZ` und `TZ_CHECK_VERSION` (z.B. `America/New_York -> UTC, je Rohmonat geprueft (tz_check v3)`). Wird `RAW_TZ` geändert (z.B. für M1 nach einer Messung), passen alte Dateien automatisch nicht mehr. Zu Beginn **jedes** Laufs werden alle Monatsdateien des Symbols/Modus geprüft, nicht nur `--start`/`--end`:
+
+- Gleiche Umrechnungszone, nur altes Metadatum (z.B. M1-Dateien der Vorversion): nur das Metadatum wird erneuert, die Datei nie verschoben, keine Requests (`relabelled_timezone`).
+- Andere Umrechnung, die im Monat UTC-Zeiten verschiebt (Tick-Monate mit EDT aus der Fest-UTC-5-Version, 1 h verschoben): sofort nach `metals/stale/...` verschoben (nichts gelöscht; der Bot sieht eher eine Lücke als einen verschobenen Monat), auch außerhalb des Bereichs (`stale_retired_out_of_range`).
+- Andere Umrechnung, im Monat aber gleiche UTC-Zeiten (Dezember bis Februar, nur EST): bleibt liegen, bis der Neubau sie atomar ersetzt (`stale_out_of_range`).
+
+Monate im Bereich werden aus dem Roh-Cache neu gebaut (WARNING, `rebuilt_timezone`, Ergebnis `summary.months_rebuilt_timezone` bzw. `summary.months_stale_timezone_not_rebuilt`; der nächste Lauf versucht es erneut). Ohne Requests nur, wenn die Roh-ZIPs gecached sind; sonst wird normal geladen. `--verify-month` meldet den Zustand der Monatsdatei (`store_file`), ändert aber nichts.
 
 ### Weitere Beobachtungen Dritter (nicht selbst geprüft)
 

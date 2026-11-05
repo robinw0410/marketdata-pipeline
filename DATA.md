@@ -229,10 +229,16 @@ Store (SRC = histdata im Tickmodus, histdata_m1 im M1-Modus):
                                    loeschen = erneut pruefen (ohne Download);
                                    "accepted": true = nach manueller Pruefung frei;
                                    ZIP loeschen = neu laden, der Download entfernt
-                                   den Marker und es wird neu geprueft; Marker
-                                   aelterer tz_check_version (Vorversion "fest
-                                   UTC-5") werden automatisch entfernt und neu
-                                   geprueft (ausser "accepted": true)
+                                   den Marker und es wird neu geprueft; nicht
+                                   freigegebene Marker aelterer tz_check_version
+                                   oder anderer Zone: neu geprueft (ohne Download);
+                                   "accepted": true gilt nur bei gleichem raw_tz -
+                                   eine Freigabe der Vorversion (fest UTC-5, ohne
+                                   raw_tz) wird neu geprueft: besteht -> Marker
+                                   weg, sonst accepted false mit "note"; Tick in
+                                   nicht eindeutiger Ortszeit sperrt immer;
+                                   unlesbarer Marker (JSON-Fehler): ERROR, bleibt,
+                                   sperrt weiter
         <zip>.failed               dauerhafter Inhaltsfehler (JSON: error, count,
                                    last_checked); naechster Versuch fruehestens 24 h
         <zip>.corrupt              beiseitegelegtes kaputtes ZIP
@@ -242,17 +248,27 @@ Store (SRC = histdata im Tickmodus, histdata_m1 im M1-Modus):
 Spalten: wie Dukascopy (ts UTC ms, Label links; bid_/ask_open/high/low/close
 float64; tick_count int64; bid_volume, ask_volume float64; source = SRC).
 Parquet-Metadaten: histdata_mode = histdata_tick|histdata_m1,
-spread_available = true|false, source_timezone =
-"America/New_York (mit Sommerzeit) -> UTC, je Monat geprueft" (tick) bzw.
-"Etc/GMT+5 (fest UTC-5) -> UTC, je Monat geprueft" (m1). Dateien desselben
-Modus mit anderem source_timezone (Vorversion: "EST fixed UTC-5, ...",
-Sommermonate um 1 h verschoben) werden im naechsten Lauf automatisch aus dem
-Roh-Cache neu gebaut, ohne Requests (WARNING, Laufreport rebuilt_timezone;
-Ergebnis summary.months_rebuilt_timezone bzw.
-summary.months_stale_timezone_not_rebuilt). Die alte Datei wird VOR dem
-Neubau nach metals/stale/... verschoben (nichts geloescht): scheitert der
-Neubau, sieht der Bot eine Luecke statt eines verschobenen Monats; der
-naechste Lauf versucht den Neubau erneut.
+spread_available = true|false, source_timezone = aus RAW_TZ und
+TZ_CHECK_VERSION abgeleitet, z.B. "America/New_York -> UTC, je Rohmonat
+geprueft (tz_check v3)" (tick) bzw. "Etc/GMT+5 -> UTC, ..." (m1). Zu Beginn
+JEDES Laufs werden alle Monatsdateien des Symbols/Modus geprueft (nicht nur
+--start/--end):
+  gleiche Umrechnungszone, nur altes Metadatum (z.B. m1 der Vorversion):
+    nur Metadatum erneuert, nie verschoben, keine Requests
+    (Laufreport relabelled_timezone)
+  andere Umrechnung, die im Monat UTC-Zeiten verschiebt (Tick-Monate mit
+    EDT aus der Fest-UTC-5-Version, 1 h verschoben): SOFORT nach
+    metals/stale/... verschoben (nichts geloescht; der Bot sieht eher eine
+    Luecke als einen verschobenen Monat), auch ausserhalb des Bereichs
+    (stale_retired_out_of_range)
+  andere Umrechnung, im Monat aber gleiche UTC-Zeiten (Dez-Feb, nur EST):
+    bleibt liegen, bis der Neubau sie atomar ersetzt (stale_out_of_range)
+Monate im Bereich werden aus dem Roh-Cache neu gebaut (WARNING, Laufreport
+rebuilt_timezone; Ergebnis summary.months_rebuilt_timezone bzw.
+summary.months_stale_timezone_not_rebuilt, der naechste Lauf versucht es
+erneut). Ohne Requests nur, wenn die Roh-ZIPs gecached sind; sonst wird
+normal geladen. --verify-month meldet den Zustand der Monatsdatei
+(store_file), aendert nichts.
 - tick: aus Ticks "YYYYMMDD HHMMSSmmm,bid,ask,volume" verdichtet
         (fetch_dukascopy.aggregate_1m, stabil sortiert: gleiche Zeitstempel
         behalten die Dateireihenfolge). tick_count = echte Tickzahl.
@@ -284,25 +300,43 @@ Zeitzone und Monatsgrenze:
   Rohmonat M ohne diese Stunden an seinem Ende (aus RAW_TZ berechnet).
   Geschrieben wird M nur, wenn beide Rohmonate erledigt sind (Daten,
   bestaetigt leer oder vor Historienbeginn).
-- Pruefung je Rohmonat (check_timezone): Ankerpunkte Wochenschluss
-  (Fr 17:00 New York), Wochenstart (So 18:00 Metalle / 17:00 EURUSD),
-  Tagespause der Metalle Mo-Do (17:00-18:00 New York) - aber nur Luecken,
-  deren Beginn hoechstens 3 h vom erwarteten Pausenbeginn liegt (duenne
-  Maerkte wie Silber haben nachts weitere Luecken; die zaehlen nicht).
-  Erwartete Marktzeiten per zoneinfo America/New_York (mit Sommerzeit).
-  Impliziter Offset je Anker (ganze Stunden), erwarteter Offset je Anker
-  aus RAW_TZ[mode] in diesem Zeitpunkt (tick -4 h in EDT, -5 h in EST;
-  m1 immer -5 h); entschieden wird ueber Abweichung = implizit - erwartet.
-  Bestanden nur bei:
+- Pruefung je Rohmonat (check_timezone): je Marktluecke ein Schluss- und
+  ein Oeffnungsanker: Wochenende (>= 24 h; Fr 17:00 -> So 18:00 Metalle /
+  17:00 EURUSD New York), Tagespause der Metalle Mo-Do (17:00-18:00 New
+  York; hoechstens eine je Tag, nur eindeutig und hoechstens 3 h vom
+  erwarteten Beginn - duenne Maerkte wie Silber haben weitere Luecken).
+  Mit Randticks der gecachten Nachbar-Rohmonate wird auch das Wochenende
+  ueber den Monatsrand zum Anker (EURUSD hat sonst dort keinen).
+  Erwartete Marktzeiten per zoneinfo America/New_York (mit Sommerzeit),
+  erwarteter Offset je Anker aus RAW_TZ[mode] im Ereigniszeitpunkt (tick -4 h
+  in EDT, -5 h in EST; m1 immer -5 h); entschieden wird ueber Abweichung =
+  implizit - erwartet. Die Abweichung einer Luecke wird aus beiden Seiten
+  gemeinsam bestimmt (Schluss nicht vor dem letzten, Oeffnung nicht nach dem
+  ersten Tick, +-5 min) - auch bei duennen Daten richtig; mehrdeutige
+  Luecken zaehlen nicht. "Belastbar": eindeutig bestimmt, Widerspruch
+  zwischen den Seiten eines Wochenendes, oder beide Ticks <= 2 min am
+  Ereignis bei aktivem Markt. Bestanden nur bei:
     >= 3 Anker, Median-Abweichung 0, >= 60 % der Anker mit Abweichung 0,
-    kein Lauf von 3 gleich abweichenden Ankern in Folge,
-    KEIN Anker mit Abweichung genau +-1 h in den ersten/letzten 72 h des
-      Rohmonats (Uhrumstellung am Monatsrand, z.B. nach EU-Regel;
-      Feiertage weichen um >= 2 h ab und bleiben erlaubt),
+    kein Lauf von 3 gleich abweichenden Luecken in Folge,
+    KEIN belastbarer Anker mit Abweichung genau +-1 h in den ersten/letzten
+      72 h des Rohmonats (Uhrumstellung am Monatsrand; Feiertage weichen
+      um >= 2 h ab und bleiben erlaubt),
+    bei Zonen mit Sommerzeit (tick) KEIN belastbarer Anker mit Abweichung
+      != 0 innerhalb von 7 Tagen um eine New-York-Umstellung (andere
+      Sommerzeitregel: EU, US vor 2007),
+    kein Wochenende, ueber das die belastbare Abweichung um genau 1 h springt,
     kein Ruecksprung >= 30 min in Dateireihenfolge.
   Report: raw_tz, offsets, expected_offsets, deviations, median_offset_h
   (implizit), median_deviation_h, share_expected, edge_violations,
+  transition_violations, weekend_switches, reliable_anchors,
   deviating_examples, reversals.
+  Synthetisch geprueft 2001-2026 (XAUUSD, EURUSD): New York besteht jeden
+  Monat; EU- und Vor-2007-Stempelung landen nie in einem geschriebenen
+  UTC-Monat. Duennes Silber (~1 Tick/20 min) besteht jeden Monat,
+  verschobene Stempelung wird nie geschrieben. Grenze: EURUSD (nur
+  Wochenend-Anker) mit ~1 Tick/20 min um die Sonntagsoeffnung kann eine
+  einwoechige Verschiebung uebersehen (echte EURUSD-Ticks sind dicht);
+  ~1 Tick/50 min: meist Quarantaene.
   Zusaetzlich: beginnt der Folge-Rohmonat M+1 (im Cache; wird zuerst
   geholt, wenn UTC-Monat M+1 ohnehin offen ist) mit 1 h Abweichung, wird
   auch UTC-Monat M nicht geschrieben (Umstellung nach dem letzten Anker

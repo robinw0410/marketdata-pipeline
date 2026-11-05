@@ -877,3 +877,117 @@ def test_new_format_quarantine_of_bad_month_keeps_blocking(tmp_path, entry):
         assert site.requests == 0
         assert _markers(tmp_path) == before                # Marker unveraendert (kein Neupruefen)
         assert not fh.store_path(tmp_path, SYM, 2024, 7).exists()
+
+
+# ====== 10. Review: andere Sommerzeitregeln / duenne Daten ueber viele Jahre ---
+# Modell "wuerde geschrieben": UTC-Monat M wird geschrieben, wenn die Rohmonate
+# M-1 und M bestehen und der Folge-Rohmonat nicht mit +-1 h Abweichung beginnt
+# (check_following). Geprueft wird wie in raw_slice: mit den Randticks der
+# Nachbar-Rohmonate. Ein falsch umgerechneter Tick in einem geschriebenen
+# UTC-Monat ist ein Fehler.
+_H = 3_600_000
+
+
+def _market_utc(sym, lo, hi, step_s, thin=None, seed=1):
+    idx = pd.date_range(lo, hi, freq=f"{step_s}s", inclusive="left", tz="UTC") + pd.Timedelta(milliseconds=137)
+    ny = idx.tz_convert(NY)
+    wd, h = ny.dayofweek, ny.hour + ny.minute / 60
+    open_h = 17 if sym == "EURUSD" else 18
+    closed = ((wd == 4) & (h >= 17)) | (wd == 5) | ((wd == 6) & (h < open_h))
+    if sym != "EURUSD":
+        closed |= (wd <= 3) & (h >= 17) & (h < 18)
+    idx = idx[~np.asarray(closed)]
+    if thin is not None:
+        idx = idx[np.random.default_rng(seed).random(len(idx)) < thin]
+    return idx
+
+
+def _sunday(y, m, n=1, last=False):
+    if last:
+        d = pd.Timestamp(y, m, 1) + pd.offsets.MonthEnd(0)
+        return d - pd.Timedelta(days=(d.dayofweek - 6) % 7)
+    d = pd.Timestamp(y, m, 1)
+    return d + pd.Timedelta(days=(6 - d.dayofweek) % 7) + pd.Timedelta(weeks=n - 1)
+
+
+def _stamp(utc, how):
+    """Rohzeit-ms: ny = New York (richtig), est = fest UTC-5, eu = UTC-5/-4 nach
+    EU-Umstellung (letzter So Maerz/Oktober 01:00 UTC), us2006 = US-Regel vor
+    2007 (erster So April 2:00 bis letzter So Oktober 2:00) fuer ALLE Jahre."""
+    if how == "ny":
+        return np.asarray(utc.tz_convert(NY).tz_localize(None).as_unit("ms").asi8, dtype=np.int64)
+    u = np.asarray(utc.as_unit("ms").asi8, dtype=np.int64)
+    off = np.full(len(u), -5 * _H, dtype=np.int64)
+    if how == "est":
+        return u + off
+    naive = utc.tz_localize(None)
+    for y in np.unique(utc.year):
+        if how == "eu":
+            s, e = _sunday(y, 3, last=True) + pd.Timedelta(hours=1), _sunday(y, 10, last=True) + pd.Timedelta(hours=1)
+        else:
+            s, e = _sunday(y, 4, 1) + pd.Timedelta(hours=7), _sunday(y, 10, last=True) + pd.Timedelta(hours=6)
+        off[np.asarray((naive >= s) & (naive < e))] = -4 * _H
+    return u + off
+
+
+def _written_with_wrong_ticks(sym, how, y0, y1, step_s, thin=None):
+    utc = _market_utc(sym, pd.Timestamp(y0 - 1, 11, 1, tz="UTC"), pd.Timestamp(y1 + 1, 3, 1, tz="UTC"),
+                      step_s, thin)
+    u = np.asarray(utc.as_unit("ms").asi8, dtype=np.int64)
+    raw = _stamp(utc, how)
+    order = np.argsort(raw, kind="stable")
+    raw, u = raw[order], u[order]
+    months = [(y, m) for y in range(y0 - 1, y1 + 2) for m in range(1, 13)
+              if (y0 - 1, 12) <= (y, m) <= (y1 + 1, 1)]
+    res, wrong_in = {}, {}
+    for ym in months[1:-1]:
+        lo, hi = fh.raw_month_bounds_ms(ym)
+        a, b = int(np.searchsorted(raw, lo)), int(np.searchsorted(raw, hi))
+        nb = (raw[max(a - 2, 0):a] if a else None, raw[b:b + 2] if b < len(raw) else None)
+        chk = fh.check_timezone(raw[a:b], sym, (lo, hi), "tick", nb)
+        try:
+            bad = fh.raw_to_utc_ms(raw[a:b], "tick") != u[a:b]
+        except fh.TimezoneError:
+            chk, bad = {"ok": False, "first_deviation_h": None}, np.ones(b - a, bool)
+        res[ym] = chk
+        days = np.unique(u[a:b][bad] // 86_400_000)
+        wrong_in[ym] = {(d.year, d.month) for d in pd.to_datetime(days, unit="D")}
+    out, fails = [], []
+    for M in months[2:-2]:
+        p, n = fh._ym_add(M, -1), fh._ym_add(M, 1)
+        if not res[M]["ok"]:
+            fails.append((M, res[M].get("reason")))
+        fd = res[n].get("first_deviation_h")
+        written = res[p]["ok"] and res[M]["ok"] and not (not res[n]["ok"] and fd is not None and abs(fd) == 1)
+        if written and any(M in wrong_in[r] for r in (p, M)):
+            out.append((M, dict(res[M].get("deviations") or {})))
+    return out, fails
+
+
+@pytest.mark.parametrize("sym", ["EURUSD", "XAUUSD"])
+@pytest.mark.parametrize("how", ["eu", "us2006"])
+def test_other_dst_rules_never_written_2001_2026(sym, how):
+    """EU- bzw. Vor-2007-US-Stempelung: kein falsch umgerechneter Tick landet in
+    einem geschriebenen UTC-Monat (Review: EURUSD 2025-10 bestand mit {0: 7, -1: 1})."""
+    wrong, fails = _written_with_wrong_ticks(sym, how, 2001, 2026, step_s=180)
+    assert wrong == []
+    assert len(fails) >= 30                                     # die Abweichungen werden gesehen
+
+
+@pytest.mark.parametrize("sym", ["EURUSD", "XAUUSD"])
+def test_new_york_stamping_passes_every_month_2001_2026(sym):
+    wrong, fails = _written_with_wrong_ticks(sym, "ny", 2001, 2026, step_s=180)
+    assert wrong == [] and fails == []
+
+
+@pytest.mark.parametrize("how", ["ny", "est", "eu"])
+def test_thin_silver_one_tick_per_20_min(how):
+    """Review 8: ~1 Tick je 20 min (XAGUSD nachts/frueh). Vorher fiel jeder Monat
+    an der +-1-h-Randregel durch (letzter Tick > 30 min vor 17:00 rundete auf -1).
+    Jetzt: New York besteht ueberall; falsch gestempelte Monate werden nie geschrieben."""
+    wrong, fails = _written_with_wrong_ticks("XAGUSD", how, 2014, 2025, step_s=60, thin=0.05)
+    assert wrong == []
+    if how == "ny":
+        assert fails == []
+    else:
+        assert len(fails) >= (90 if how == "est" else 20)
