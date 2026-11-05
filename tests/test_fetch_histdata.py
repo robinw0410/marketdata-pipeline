@@ -351,7 +351,8 @@ def test_tz_tolerates_holiday_early_close_and_small_reversals():
     ms[100], ms[101] = ms[101], ms[100]                 # kleine Vertauschung (Sekunden)
     rep = hd.check_timezone(ms, "XAUUSD")
     assert rep["ok"], rep
-    assert rep["reversals"] == 1 and rep["share_expected"] < 1.0
+    # frueher Schluss 13:00: Luecke mehrdeutig -> kein Anker, nur Warnung (v4)
+    assert rep["reversals"] == 1 and rep["ambiguous_gaps"] >= 1 and rep["share_expected"] == 1.0
 
 
 def test_tz_needs_enough_anchors():
@@ -629,11 +630,17 @@ def test_timezone_mismatch_quarantine_exit_4(tmp_path, clock):
     """Ticks fest UTC-5 gestempelt (alte Annahme) -> im Sommer Quarantaene."""
     site = Site(clock, {("T", "202406"): tick_zip("XAUUSD", 2024, 6, stamping="est"),
                         ("T", "202407"): tick_zip("XAUUSD", 2024, 7, stamping="est")})
+    # Nachbar-Rohmonate Mai/August liegen schon im Cache (fruehere Laeufe): sonst
+    # waere das Ergebnis vorlaeufig und wuerde nicht als Marker gespeichert
+    for m in (5, 8):
+        p = hd.Unit("XAUUSD", "tick", 2024, m).path(tmp_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(tick_zip("XAUUSD", 2024, m, stamping="est"))
     rep = run(tmp_path, clock, site, start=(2024, 7))
     assert rep["exit_code"] == 4 and rep["status"] == "quarantine"
     q = rep["quarantine"][0]
     assert "Zeitzone" in q["reason"] and q["check"]["median_offset_h"] == -5
-    assert q["check"]["median_deviation_h"] == -1
+    assert q["check"]["median_deviation_h"] == -1 and "VORLAEUFIG" not in q["reason"]
     marker = json.loads(hd.Unit("XAUUSD", "tick", 2024, 6).qmarker(tmp_path, (2024, 6)).read_text())
     assert marker["tz_check_version"] == hd.TZ_CHECK_VERSION
     assert marker["raw_tz"] == "America/New_York"
@@ -742,12 +749,23 @@ SWITCH = {"tick": ((2024, 10), "ny", ("2024-10-27 01:00", "est")),
 
 @pytest.mark.parametrize("mode", ["tick", "m1"])
 def test_review1_dst_switch_at_month_end_is_caught(mode):
+    """Wechsel kurz vor Monatsende: ein bestaetigter Lauf (>= 2 unabhaengige Luecken,
+    ggf. mit Kontext aus dem Folgemonat) ist hart; ein einzelner Eintrag ohne
+    Folgemonat ist nur Warnung, aber trailing_suspect (raw_slice haelt zurueck)."""
     ym, stamping, switch = SWITCH[mode]
     ms = _raw_ms(raw_month_ticks("XAUUSD", *ym, stamping=stamping, switch=switch))
-    rep = hd.check_timezone(ms, "XAUUSD", hd.raw_month_bounds_ms(ym), mode=mode)
-    assert hd.check_timezone(ms, "XAUUSD", mode=mode)["edge_violations"]   # Rand auch ohne bounds
-    assert not rep["ok"] and rep["edge_violations"] and "Monatsrand" in rep["reason"]
-    assert {e["deviation_h"] for e in rep["edge_violations"]} == {-1 if mode == "tick" else 1}
+    nxt = _raw_ms(raw_month_ticks("XAUUSD", *hd._ym_add(ym, 1), stamping=switch[1]))
+    rep = hd.check_timezone(ms, "XAUUSD", hd.raw_month_bounds_ms(ym), mode=mode,
+                            neighbours=(None, nxt[nxt < nxt[0] + hd.TZ_PAD_MS]))
+    dev = -1 if mode == "tick" else 1
+    assert not rep["ok"] and rep["switch_runs"] and "Stempelungswechsel" in rep["reason"], rep["reason"]
+    assert {e["deviation_h"] for r in rep["switch_runs"] for e in r} == {dev}
+    assert rep["edge_violations"]                                   # Bericht: Rand betroffen
+    alone = hd.check_timezone(ms, "XAUUSD", hd.raw_month_bounds_ms(ym), mode=mode)
+    if mode == "tick":                       # Oktober: Mo-Do-Pausen bestaetigen sich selbst
+        assert not alone["ok"]
+    else:                                    # Maerz: nur die Sonntagsoeffnung 31.3.
+        assert alone["ok"] and alone["trailing_suspect"] and alone["warnings"]
     # Feiertag am Monatsrand (frueher Schluss, >= 2 h) bleibt erlaubt
     hol = raw_month_ticks("XAUUSD", 2024, 7, stamping="ny" if mode == "tick" else "est",
                           early_close={date(2024, 7, 3): 13})
@@ -763,17 +781,31 @@ def test_review1_dst_switch_at_month_end_not_written(tmp_path, clock):
     assert rep["exit_code"] == 4 and not hd.store_path(tmp_path, "XAUUSD", 2024, 10).exists()
 
 
-def test_review1_following_month_starting_shifted_blocks_month(tmp_path, clock):
+def test_review1_switch_exactly_at_month_edge_keeps_previous_month(tmp_path, clock):
     files = {("T", "202402"): tick_zip("XAUUSD", 2024, 2), ("T", "202403"): tick_zip("XAUUSD", 2024, 3),
              ("T", "202404"): tick_zip("XAUUSD", 2024, 4, stamping="est")}
     site = Site(clock, files)
     rep = run(tmp_path, clock, site, start=(2024, 3), end=(2024, 4))
-    assert rep["exit_code"] == 4 and rep["summary"]["months_written"] == []
+    # April ab dem 1. fest UTC-5: der Wechsel liegt genau auf dem Monatsrand, der
+    # Maerz (und damit UTC-Maerz) ist richtig -> geschrieben; April nicht (v4: nur
+    # ein Lauf, der in den Vormonat reicht, sperrt den Vormonat)
+    assert rep["exit_code"] == 4 and rep["summary"]["months_written"] == ["2024-03"]
     q = {r["month"]: r for r in rep["quarantined"]}
-    assert "Folge-Rohmonat 2024-04" in q["2024-03"]["reason"] and "2024-04" in q
-    # nur Maerz angefragt: April nicht im Cache -> keine Nachbarpruefung, Maerz geschrieben
-    rep = run(tmp_path / "b", clock, Site(clock, files), start=(2024, 3))
+    assert "2024-04" in q and "2024-03" not in q
+    out = hd.store_path(tmp_path, "XAUUSD", 2024, 3)
+    assert pq.read_schema(out).metadata[b"tz_right_padding"] == b"true"
+    # nur Maerz angefragt: April nicht im Cache -> ohne rechten Kontext geprueft,
+    # geschrieben mit tz_right_padding=false; sobald April im Cache ist, nachgeprueft
+    b_ = tmp_path / "b"
+    rep = run(b_, clock, Site(clock, files), start=(2024, 3))
     assert rep["exit_code"] == 0 and rep["summary"]["months_written"] == ["2024-03"]
+    out = hd.store_path(b_, "XAUUSD", 2024, 3)
+    assert pq.read_schema(out).metadata[b"tz_right_padding"] == b"false"
+    assert hd.classify_store_file(out, "tick", (2024, 3))[0] == "recheck_padding"
+    site = Site(clock, files)
+    rep = run(b_, clock, site, start=(2024, 4))                 # holt April, Maerz wird nachgeprueft
+    assert rep["relabelled_timezone"] == ["2024-03"] and site.requests == 2
+    assert pq.read_schema(out).metadata[b"tz_right_padding"] == b"true"
 
 
 def test_review6_thin_market_night_gaps_are_no_break_anchors():
@@ -1076,20 +1108,28 @@ def test_stale_timezone_store_files_rebuilt_from_cache(tmp_path, clock, caplog):
     assert any("source_timezone" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
 
 
-def test_m1_old_metadata_is_only_relabelled(tmp_path, clock):
-    """M1 rechnet unveraendert fest UTC-5: altes Metadatum = gleiche Umrechnung ->
-    nur Metadatum erneuern, nie verschieben, kein Neubau, keine Requests."""
+def _seed_raw(root, months, stamping="ny", sym="XAUUSD"):
+    """Rohmonate direkt in den Cache legen (wie nach frueheren Laeufen)."""
+    for y, m in months:
+        p = hd.Unit(sym, "tick", y, m).path(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(tick_zip(sym, y, m, stamping=stamping))
+
+
+def test_m1_old_metadata_is_rechecked_then_relabelled(tmp_path, clock):
+    """M1 rechnet unveraendert fest UTC-5: altes Metadatum = gleiche Umrechnung,
+    aber aeltere Pruefversion -> Rohmonate aus dem Cache neu pruefen (kein
+    Download); besteht -> nur Metadaten erneuern, nie verschieben. Ohne Roh-Cache
+    bleibt die Datei und wird als unverified_after_version_bump gemeldet."""
     m1 = make_zip("XAUUSD", "M1", "2024", m1_csv(pd.concat(
-        [raw_month_ticks("XAUUSD", 2024, k, stamping="est") for k in (6, 7)])))
+        [raw_month_ticks("XAUUSD", 2024, k, stamping="est") for k in (5, 6, 7, 8)])))
     now = datetime(2025, 3, 1, tzinfo=UTC)
     assert run(tmp_path, clock, Site(clock, {("M1", "2024"): m1}), start=(2024, 7), mode="m1",
                now=now)["exit_code"] == 0
     out = hd.store_path(tmp_path, "XAUUSD", 2024, 7, "m1")
     _make_old_store_file(out, 0)
     before = pd.read_parquet(out)
-    for z in hd.raw_dir(tmp_path, "XAUUSD", "m1").rglob("*.zip"):        # Roh-Cache weg
-        z.unlink()
-    assert hd.classify_store_file(out, "m1", (2024, 7))[0] == "relabel"
+    assert hd.classify_store_file(out, "m1", (2024, 7))[0] == "recheck"
     site = Site(clock)
     rep = run(tmp_path, clock, site, start=(2024, 7), mode="m1", now=now)
     assert rep["exit_code"] == 0 and site.requests == 0, rep
@@ -1098,6 +1138,35 @@ def test_m1_old_metadata_is_only_relabelled(tmp_path, clock):
     assert hd.stored_timezone(out) == hd.SOURCE_TZ_META["m1"]
     pd.testing.assert_frame_equal(pd.read_parquet(out), before)
     assert not (tmp_path / "metals" / "stale").exists()
+    # Roh-Cache weg: nicht nachpruefbar -> Datei bleibt (richtige Daten nicht wegwerfen)
+    _make_old_store_file(out, 0)
+    for z in hd.raw_dir(tmp_path, "XAUUSD", "m1").rglob("*.zip"):
+        z.unlink()
+    rep = run(tmp_path, clock, Site(clock), start=(2024, 7), mode="m1", now=now)
+    assert rep["unverified_after_version_bump"] == ["2024-07"] and out.exists()
+    assert hd.stored_timezone(out) == OLD_TZ_META.decode()
+
+
+def test_v3_store_file_failing_v4_is_retired(tmp_path, clock):
+    """Pruefversion im Metadatum aelter (v3), gleiche Zone: aus dem Cache neu pruefen;
+    faellt durch -> aus dem Store, Quarantaene (die Version im Label zaehlt)."""
+    _seed_raw(tmp_path, [(2024, 5), (2024, 8)])
+    _seed_raw(tmp_path, [(2024, 6), (2024, 7)], stamping="utc")    # falsch gestempelt
+    out = hd.store_path(tmp_path, "XAUUSD", 2024, 7)
+    bars = hd.ticks_to_bars(hd.parse_csv(tick_csv(raw_month_ticks("XAUUSD", 2024, 7).head(50)), "tick"))
+    hd.write_parquet(out, bars, "tick")
+    t = pq.read_table(out)
+    meta = dict(t.schema.metadata)
+    meta[b"source_timezone"] = hd.source_tz_label("America/New_York").replace(
+        f"v{hd.TZ_CHECK_VERSION}", "v3").encode()
+    pq.write_table(t.replace_schema_metadata(meta), out)
+    assert hd.classify_store_file(out, "tick", (2024, 7))[0] == "recheck"
+    site = Site(clock)
+    rep = run(tmp_path, clock, site, start=(2024, 12))               # anderer Monat
+    assert site.requests == 0 and not out.exists()
+    assert "2024-07" in rep["retired_after_recheck"]
+    assert hd.Unit("XAUUSD", "tick", 2024, 7).qmarker(tmp_path, (2024, 7)).exists() or \
+        hd.Unit("XAUUSD", "tick", 2024, 6).qmarker(tmp_path, (2024, 6)).exists()
 
 
 def test_source_tz_meta_is_derived_from_raw_tz(tmp_path, clock, monkeypatch):
@@ -1159,6 +1228,7 @@ def _old_marker_v1(**extra):
 
 def test_old_hypothesis_quarantine_marker_is_rechecked(tmp_path, clock, caplog):
     files = {("T", "202406"): tick_zip("XAUUSD", 2024, 6), ("T", "202407"): tick_zip("XAUUSD", 2024, 7)}
+    _seed_raw(tmp_path, [(2024, 5), (2024, 8)])      # Nachbarn da: Ergebnisse endgueltig
     assert run(tmp_path, clock, Site(clock, files), start=(2024, 7))["exit_code"] == 0
     out = hd.store_path(tmp_path, "XAUUSD", 2024, 7)
     out.unlink()
@@ -1211,6 +1281,7 @@ def test_v1_accepted_marker_on_data_failing_v2_blocks_again(tmp_path, clock):
         q.write_text(json.dumps(_old_marker_v1(accepted=True)))
     hd.Unit("XAUUSD", "tick", 2024, 6).path(tmp_path).write_bytes(files[("T", "202406")])
     hd.Unit("XAUUSD", "tick", 2024, 7).path(tmp_path).write_bytes(files[("T", "202407")])
+    _seed_raw(tmp_path, [(2024, 5), (2024, 8)], stamping="est")
     rep = run(tmp_path, clock, site, start=(2024, 7))
     assert rep["exit_code"] == 4 and site.requests == 0, rep
     assert not hd.store_path(tmp_path, "XAUUSD", 2024, 7).exists()
@@ -1306,29 +1377,26 @@ def _eurusd_eu_oct_2025():
 
 def test_eurusd_dst_rule_mismatch_in_last_week_fails():
     """Review: EURUSD hat keine Tagespause; das Wochenende ueber den Monatsrand
-    lieferte keinen Anker -> nur EIN abweichender Anker, Pruefung bestand."""
+    lieferte keinen Anker -> nur EIN abweichender Anker, Pruefung bestand.
+    v4: Sonntagsoeffnung 26.10. (-1) und Freitagsschluss 31.10. (-1, sichtbar mit
+    dem Kontext aus dem November) sind zwei unabhaengige Luecken -> Wechsel."""
     sep, oct_, nov = _eurusd_eu_oct_2025()
     ms, b = _raw_ms(oct_), hd.raw_month_bounds_ms((2025, 10))
-    nb = (_raw_ms(sep)[-2:], _raw_ms(nov)[:2])
+    pad = hd.TZ_PAD_MS
+    s_, n_ = _raw_ms(sep), _raw_ms(nov)
+    nb = (s_[s_ >= s_[-1] - pad], n_[n_ <= n_[0] + pad])
     rep = hd.check_timezone(ms, "EURUSD", b, neighbours=nb)
-    assert not rep["ok"] and rep["transition_violations"] and rep["edge_violations"], rep["reason"]
-    # (a) Randticks der Nachbarmonate allein: Freitagsschluss 31.10. wird Anker
-    old = hd.TZ_TRANSITION_MS
-    try:
-        hd.TZ_TRANSITION_MS = 0
-        r = hd.check_timezone(ms, "EURUSD", b, neighbours=nb)
-        assert not r["ok"] and any(e["raw"].startswith("2025-10-31") for e in r["edge_violations"])
-        # (c) ohne Nachbarn und Fenster: Wochenende 24.->26.10. wechselt um 1 h
-        r = hd.check_timezone(ms, "EURUSD", b)
-        assert not r["ok"] and r["weekend_switches"] and "Wochenende" in r["reason"]
-    finally:
-        hd.TZ_TRANSITION_MS = old
-    # (b) Umstellungsfenster allein (ohne Nachbarmonate): 26.10. liegt 7 Tage vor 2.11.
-    r = hd.check_timezone(ms, "EURUSD", b)
-    assert not r["ok"] and r["transition_violations"][0]["raw"].startswith("2025-10-26")
+    assert not rep["ok"] and rep["switch_runs"], rep["reason"]
+    days = {e["raw"][:10] for r in rep["switch_runs"] for e in r}
+    assert {"2025-10-26", "2025-10-31"} <= days
+    # ohne Folgemonat: nur ein Eintrag -> keine harte Abweichung, aber am Rand
+    # unbestaetigt -> raw_slice haelt den Monat zurueck (trailing_suspect)
+    r = hd.check_timezone(ms, "EURUSD", b, neighbours=(nb[0], None))
+    assert r["ok"] and r["trailing_suspect"] and r["warnings"]
     # richtige Daten bestehen in denselben Monaten
     for df, ym in ((sep, (2025, 9)), (raw_month_ticks("EURUSD", 2025, 10), (2025, 10)), (nov, (2025, 11))):
-        assert hd.check_timezone(_raw_ms(df), "EURUSD", hd.raw_month_bounds_ms(ym))["ok"]
+        r = hd.check_timezone(_raw_ms(df), "EURUSD", hd.raw_month_bounds_ms(ym))
+        assert r["ok"] and not r["trailing_suspect"] and not r["warnings"]
 
 
 def test_eurusd_dst_rule_mismatch_is_not_written(tmp_path, clock):

@@ -250,12 +250,14 @@ float64; tick_count int64; bid_volume, ask_volume float64; source = SRC).
 Parquet-Metadaten: histdata_mode = histdata_tick|histdata_m1,
 spread_available = true|false, source_timezone = aus RAW_TZ und
 TZ_CHECK_VERSION abgeleitet, z.B. "America/New_York -> UTC, je Rohmonat
-geprueft (tz_check v3)" (tick) bzw. "Etc/GMT+5 -> UTC, ..." (m1). Zu Beginn
+geprueft (tz_check v4)" (tick) bzw. "Etc/GMT+5 -> UTC, ..." (m1). Zu Beginn
 JEDES Laufs werden alle Monatsdateien des Symbols/Modus geprueft (nicht nur
 --start/--end):
-  gleiche Umrechnungszone, nur altes Metadatum (z.B. m1 der Vorversion):
-    nur Metadatum erneuert, nie verschoben, keine Requests
-    (Laufreport relabelled_timezone)
+  gleiche Umrechnungszone, aeltere Pruefversion (z.B. m1 der Vorversionen,
+    Tick-Dateien der Pruefung v2/v3): Rohmonate aus dem Cache neu pruefen
+    (kein Download); besteht -> nur Metadaten erneuert (relabelled_timezone),
+    faellt durch -> nach metals/stale/ + Quarantaene (retired_after_recheck),
+    Roh-Cache fehlt -> Datei bleibt (unverified_after_version_bump)
   andere Umrechnung, die im Monat UTC-Zeiten verschiebt (Tick-Monate mit
     EDT aus der Fest-UTC-5-Version, 1 h verschoben): SOFORT nach
     metals/stale/... verschoben (nichts geloescht; der Bot sieht eher eine
@@ -267,8 +269,9 @@ Monate im Bereich werden aus dem Roh-Cache neu gebaut (WARNING, Laufreport
 rebuilt_timezone; Ergebnis summary.months_rebuilt_timezone bzw.
 summary.months_stale_timezone_not_rebuilt, der naechste Lauf versucht es
 erneut). Ohne Requests nur, wenn die Roh-ZIPs gecached sind; sonst wird
-normal geladen. --verify-month meldet den Zustand der Monatsdatei
-(store_file), aendert nichts.
+normal geladen. --verify-month ist nur Bericht: Zustand der Monatsdatei
+(store_file) und Pruefergebnis; aendert keine Datei und schreibt/loescht
+keine Quarantaene-Marker.
 - tick: aus Ticks "YYYYMMDD HHMMSSmmm,bid,ask,volume" verdichtet
         (fetch_dukascopy.aggregate_1m, stabil sortiert: gleiche Zeitstempel
         behalten die Dateireihenfolge). tick_count = echte Tickzahl.
@@ -300,50 +303,48 @@ Zeitzone und Monatsgrenze:
   Rohmonat M ohne diese Stunden an seinem Ende (aus RAW_TZ berechnet).
   Geschrieben wird M nur, wenn beide Rohmonate erledigt sind (Daten,
   bestaetigt leer oder vor Historienbeginn).
-- Pruefung je Rohmonat (check_timezone): je Marktluecke ein Schluss- und
-  ein Oeffnungsanker: Wochenende (>= 24 h; Fr 17:00 -> So 18:00 Metalle /
-  17:00 EURUSD New York), Tagespause der Metalle Mo-Do (17:00-18:00 New
-  York; hoechstens eine je Tag, nur eindeutig und hoechstens 3 h vom
-  erwarteten Beginn - duenne Maerkte wie Silber haben weitere Luecken).
-  Mit Randticks der gecachten Nachbar-Rohmonate wird auch das Wochenende
-  ueber den Monatsrand zum Anker (EURUSD hat sonst dort keinen).
-  Erwartete Marktzeiten per zoneinfo America/New_York (mit Sommerzeit),
+- Pruefung je Rohmonat (check_timezone, Pruefversion 4): je Marktluecke ein
+  Schluss- und ein Oeffnungsanker: Wochenende (>= 24 h, Schluss Do/Fr,
+  Oeffnung So/Mo; Fr 17:00 -> So 18:00 Metalle / 17:00 EURUSD New York;
+  andere Luecken >= 24 h sind Ausfaelle: nur Bericht "outages"),
+  Tagespause der Metalle Mo-Do (17:00-18:00 New York; nur wenn ALLE
+  pausenartigen Luecken des Tages dieselbe eindeutige Abweichung <= 1 h
+  ergeben - so ersetzt kein Ausfall die echte Pause). Kontext: die Ticks der
+  ersten/letzten 8 Tage der gecachten Nachbar-Rohmonate (Luecken ueber den
+  Monatsrand). Erwartete Marktzeiten per zoneinfo America/New_York,
   erwarteter Offset je Anker aus RAW_TZ[mode] im Ereigniszeitpunkt (tick -4 h
   in EDT, -5 h in EST; m1 immer -5 h); entschieden wird ueber Abweichung =
-  implizit - erwartet. Die Abweichung einer Luecke wird aus beiden Seiten
-  gemeinsam bestimmt (Schluss nicht vor dem letzten, Oeffnung nicht nach dem
-  ersten Tick, +-5 min) - auch bei duennen Daten richtig; mehrdeutige
-  Luecken zaehlen nicht. "Belastbar": eindeutig bestimmt, Widerspruch
-  zwischen den Seiten eines Wochenendes, oder beide Ticks <= 2 min am
-  Ereignis bei aktivem Markt. Bestanden nur bei:
-    >= 3 Anker, Median-Abweichung 0, >= 60 % der Anker mit Abweichung 0,
-    kein Lauf von 3 gleich abweichenden Luecken in Folge,
-    KEIN belastbarer Anker mit Abweichung genau +-1 h in den ersten/letzten
-      72 h des Rohmonats (Uhrumstellung am Monatsrand; Feiertage weichen
-      um >= 2 h ab und bleiben erlaubt),
-    bei Zonen mit Sommerzeit (tick) KEIN belastbarer Anker mit Abweichung
-      != 0 innerhalb von 7 Tagen um eine New-York-Umstellung (andere
-      Sommerzeitregel: EU, US vor 2007),
-    kein Wochenende, ueber das die belastbare Abweichung um genau 1 h springt,
-    kein Ruecksprung >= 30 min in Dateireihenfolge.
+  implizit - erwartet, je Luecke aus beiden Seiten gemeinsam (Schluss nicht
+  vor dem letzten Tick, Toleranz 15 min; Oeffnung nicht nach dem ersten,
+  5 min) - auch bei duennen Daten richtig.
+  HART (Quarantaene) nur Systematisches oder Bestaetigtes:
+    Median-Abweichung != 0 oder < 60 % der eindeutigen Anker bei 0,
+    >= 2 UNABHAENGIGE Luecken in Folge mit derselben Abweichung != 0 ohne 0
+      dazwischen, mindestens eine im eigenen Monat (Stempelungswechsel, z.B.
+      eine Woche nach EU- oder US-vor-2007-Regel; Kontext zaehlt mit),
+    Ruecksprung >= 30 min in Dateireihenfolge, nicht eindeutige Ortszeit.
+  Nur WARNUNG (Monat wird geschrieben): einzelne Ausreisser - verirrter Tick
+  nach Schluss/vor Oeffnung, Feed stoppt Fr 16:00 oder oeffnet 1 h spaet,
+  Schluss 17:15, Feiertag, Ausfall >= 24 h unter der Woche, Ausfall genau
+  60 min auf vollen Stunden -, widerspruechliche/mehrdeutige Luecken.
   Report: raw_tz, offsets, expected_offsets, deviations, median_offset_h
-  (implizit), median_deviation_h, share_expected, edge_violations,
-  transition_violations, weekend_switches, reliable_anchors,
-  deviating_examples, reversals.
-  Synthetisch geprueft 2001-2026 (XAUUSD, EURUSD): New York besteht jeden
-  Monat; EU- und Vor-2007-Stempelung landen nie in einem geschriebenen
-  UTC-Monat. Duennes Silber (~1 Tick/20 min) besteht jeden Monat,
-  verschobene Stempelung wird nie geschrieben. Grenze: EURUSD (nur
-  Wochenend-Anker) mit ~1 Tick/20 min um die Sonntagsoeffnung kann eine
-  einwoechige Verschiebung uebersehen (echte EURUSD-Ticks sind dicht);
-  ~1 Tick/50 min: meist Quarantaene.
-  Zusaetzlich: beginnt der Folge-Rohmonat M+1 (im Cache; wird zuerst
-  geholt, wenn UTC-Monat M+1 ohnehin offen ist) mit 1 h Abweichung, wird
-  auch UTC-Monat M nicht geschrieben (Umstellung nach dem letzten Anker
-  von M). Zu wenige Anker (kurzer erster Historienmonat): Pruefung
-  gemeinsam mit gecachten Nachbar-Rohmonaten (joint_with im Report);
-  bleibt es unpruefbar -> Quarantaene "NICHT PRUEFBAR".
-  Sonst QUARANTAENE (Exit 4), nichts verschoben geschrieben.
+  (implizit), median_deviation_h, share_expected, switch_runs, warnings,
+  outages, contradictions, edge_violations/transition_violations (nur
+  Bericht), padding, deviating_examples, reversals.
+  Reihenfolge: Ergebnisse ohne einen Nachbar-Rohmonat, der existieren sollte
+  (abgeschlossen, in der Historie, nicht im Cache), sind VORLAEUFIG: weder
+  gemerkt noch als Marker gespeichert. Ein einzelner abweichender Eintrag am
+  Monatsrand ohne Kontext dahinter haelt den Monat zurueck (vorlaeufige
+  Quarantaene), bis der Nachbar da ist. Neuester Monat (Rohmonat M+1 noch
+  nicht veroeffentlicht): geschrieben mit Parquet-Metadatum
+  tz_right_padding=false, nachgeprueft, sobald M+1 im Cache ist (Laufbeginn
+  und -ende): besteht -> true, sonst nach metals/stale/ + Quarantaene.
+  Reicht ein bestaetigter Wechsel im Folge-Rohmonat M+1 in Monat M zurueck,
+  wird auch UTC-Monat M nicht geschrieben. Zu wenige Anker (kurzer erster
+  Historienmonat): Pruefung gemeinsam mit gecachten Nachbar-Rohmonaten
+  (joint_with im Report); bleibt es unpruefbar -> Quarantaene "NICHT
+  PRUEFBAR". Sonst QUARANTAENE (Exit 4), nichts verschoben geschrieben.
+  Synthetisch geprueft: s. docs/histdata_research.md (Zahlen, Grenzen).
 - Unverifiziert: Zeitzone der M1-Dateien. Drittquellen sehen je Oktober
   60 doppelte M1-Minuten (Hinweis auf eine Uhr mit Umstellung). Vor dem
   ersten M1-Volllauf: --mode m1 --verify-month 2024-07; liegt die

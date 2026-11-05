@@ -852,7 +852,9 @@ def test_new_format_quarantine_of_bad_month_keeps_blocking(tmp_path, entry):
     """Ein wirklich falscher Monat (UTC-gestempelt) wird von der NEUEN Pruefung
     quarantaeniert; deren Marker blockiert weiter: kein erneutes Pruefen/
     Neuschreiben des Markers, keine Requests, nichts geschrieben."""
-    _seed_cache(tmp_path, [(2024, 6), (2024, 7)], stamping="utc")
+    # mit Nachbar-Rohmonaten im Cache (sonst ist das Ergebnis vorlaeufig und wird
+    # bewusst nicht als Marker gespeichert, v4)
+    _seed_cache(tmp_path, [(2024, 5), (2024, 6), (2024, 7), (2024, 8)], stamping="utc")
     clock = Clock()
     site = Site(clock)
     rep = do_run(tmp_path, site, clock, (2024, 7))
@@ -943,12 +945,14 @@ def _written_with_wrong_ticks(sym, how, y0, y1, step_s, thin=None):
     for ym in months[1:-1]:
         lo, hi = fh.raw_month_bounds_ms(ym)
         a, b = int(np.searchsorted(raw, lo)), int(np.searchsorted(raw, hi))
-        nb = (raw[max(a - 2, 0):a] if a else None, raw[b:b + 2] if b < len(raw) else None)
+        pad = fh.TZ_PAD_MS                                      # wie Ctx._edge_ms
+        nb = (raw[int(np.searchsorted(raw, lo - pad)):a] if a else None,
+              raw[b:int(np.searchsorted(raw, hi + pad))] if b < len(raw) else None)
         chk = fh.check_timezone(raw[a:b], sym, (lo, hi), "tick", nb)
         try:
             bad = fh.raw_to_utc_ms(raw[a:b], "tick") != u[a:b]
         except fh.TimezoneError:
-            chk, bad = {"ok": False, "first_deviation_h": None}, np.ones(b - a, bool)
+            chk, bad = {"ok": False}, np.ones(b - a, bool)
         res[ym] = chk
         days = np.unique(u[a:b][bad] // 86_400_000)
         wrong_in[ym] = {(d.year, d.month) for d in pd.to_datetime(days, unit="D")}
@@ -957,8 +961,7 @@ def _written_with_wrong_ticks(sym, how, y0, y1, step_s, thin=None):
         p, n = fh._ym_add(M, -1), fh._ym_add(M, 1)
         if not res[M]["ok"]:
             fails.append((M, res[M].get("reason")))
-        fd = res[n].get("first_deviation_h")
-        written = res[p]["ok"] and res[M]["ok"] and not (not res[n]["ok"] and fd is not None and abs(fd) == 1)
+        written = res[p]["ok"] and res[M]["ok"] and not (not res[n]["ok"] and res[n].get("switch_reaches_prev_month"))
         if written and any(M in wrong_in[r] for r in (p, M)):
             out.append((M, dict(res[M].get("deviations") or {})))
     return out, fails
@@ -991,3 +994,167 @@ def test_thin_silver_one_tick_per_20_min(how):
         assert fails == []
     else:
         assert len(fails) >= (90 if how == "est" else 20)
+
+
+# ======= 11. v4: Datenfehler bei RICHTIGER Stempelung sind keine Quarantaene ---
+# (Re-Review: verirrte Ticks, Feed-Kanten genau 1 h daneben, 17:15-Schluss,
+# Ausfaelle >= 24 h unter der Woche, Ausfall genau 60 min auf vollen Stunden)
+def _ny_local(sym, lo, hi, step_s=30):
+    """Ticks in New-York-Ortszeit (naiv) mit den Marktzeiten von _market_utc."""
+    utc = _market_utc(sym, pd.Timestamp(lo, tz="UTC"), pd.Timestamp(hi, tz="UTC"), step_s)
+    return pd.DatetimeIndex(utc.tz_convert(NY).tz_localize(None))
+
+
+def _check_with_context(loc, sym, ym):
+    """Wie Ctx.raw_slice: eigener Rohmonat + TZ_PAD_MS Kontext der Nachbarmonate."""
+    raw = np.asarray(pd.DatetimeIndex(loc).sort_values().as_unit("ms").asi8, dtype=np.int64)
+    lo, hi = fh.raw_month_bounds_ms(ym)
+    a, b = int(np.searchsorted(raw, lo)), int(np.searchsorted(raw, hi))
+    pad = fh.TZ_PAD_MS
+    nb = (raw[int(np.searchsorted(raw, lo - pad)):a], raw[b:int(np.searchsorted(raw, hi + pad))])
+    return fh.check_timezone(raw[a:b], sym, (lo, hi), "tick", nb)
+
+
+def _nth(ym, wd, n):
+    d = [x for x in pd.date_range(pd.Timestamp(*ym, 1), pd.Timestamp(*ym, 1) + pd.offsets.MonthEnd(0))
+         if x.dayofweek == wd]
+    return d[n]
+
+
+def _drop(loc, a, b):
+    return loc[~((loc >= a) & (loc < b))]
+
+
+def _fault(case, sym, ym, loc):
+    op = 17 if sym == "EURUSD" else 18
+    H = pd.Timedelta(hours=1)
+    fri, sun, tue = _nth(ym, 4, 1), _nth(ym, 6, 1), _nth(ym, 1, 1)
+    if case == "stray_fri_1706":
+        return loc.append(pd.DatetimeIndex([fri + 17 * H + pd.Timedelta(minutes=6)]))
+    if case == "stray_fri_1720":
+        return loc.append(pd.DatetimeIndex([fri + 17 * H + pd.Timedelta(minutes=20)]))
+    if case == "stray_sun_minus10":
+        return loc.append(pd.DatetimeIndex([sun + op * H - pd.Timedelta(minutes=10)]))
+    if case == "stray_sun_minus30":
+        return loc.append(pd.DatetimeIndex([sun + op * H - pd.Timedelta(minutes=30)]))
+    if case == "fri_feed_stops_1600":
+        return _drop(loc, fri + 16 * H, fri + 17 * H)
+    if case == "sun_opens_1h_late":
+        return _drop(loc, sun + op * H, sun + (op + 1) * H)
+    if case == "fri_1600_and_sun_late_same_weekend":
+        return _drop(_drop(loc, fri + 16 * H, fri + 17 * H), fri + 2 * 24 * H + op * H, fri + 2 * 24 * H + (op + 1) * H)
+    if case == "close_1715_every_week":           # alter CME-Plan: Fr-Schluss/Tagespause ab 17:15
+        extra = pd.date_range(loc[0].normalize(), loc[-1], freq="30s") + pd.Timedelta(seconds=1)
+        wd, hm = extra.dayofweek, extra.hour * 60 + extra.minute
+        add = extra[np.asarray(((wd <= 4) & (hm >= 17 * 60) & (hm < 17 * 60 + 15)))]
+        return loc.append(add)
+    if case == "midweek_outage_24h30":
+        return _drop(loc, tue + 10 * H, tue + 34 * H + pd.Timedelta(minutes=30))
+    if case == "exact_hour_outage_2000":         # 60 min auf vollen Stunden (Kandidat fuer "Pause")
+        return _drop(loc, tue + 20 * H, tue + 21 * H + pd.Timedelta(minutes=1))
+    if case == "holiday_early_close_fri_1300":
+        return _drop(loc, fri + 13 * H, fri + 17 * H)
+    raise ValueError(case)
+
+
+FAULTS = ["stray_fri_1706", "stray_fri_1720", "stray_sun_minus10", "stray_sun_minus30",
+          "fri_feed_stops_1600", "sun_opens_1h_late", "fri_1600_and_sun_late_same_weekend",
+          "close_1715_every_week", "midweek_outage_24h30", "exact_hour_outage_2000",
+          "holiday_early_close_fri_1300"]
+
+
+@functools.lru_cache(maxsize=None)
+def _base_local(sym, ym):
+    lo = pd.Timestamp(*ym, 1) - pd.Timedelta(days=12)
+    return _ny_local(sym, lo, pd.Timestamp(*ym, 1) + pd.offsets.MonthBegin(1) + pd.Timedelta(days=12))
+
+
+@pytest.mark.parametrize("ym", [(2021, 3), (2019, 7)], ids=["2021-03_transition", "2019-07"])
+@pytest.mark.parametrize("sym", ["XAUUSD", "EURUSD"])
+@pytest.mark.parametrize("case", FAULTS)
+def test_v4_data_faults_on_correct_stamping_pass(case, sym, ym):
+    """Jeder dieser Fehler liess v3 den ganzen Monat durchfallen; jetzt hoechstens Warnung."""
+    if case == "close_1715_every_week" and sym == "EURUSD":
+        pytest.skip("CME-Plan nur Metalle")
+    loc = _fault(case, sym, ym, _base_local(sym, ym)).sort_values()
+    rep = _check_with_context(loc, sym, ym)
+    assert rep["ok"], (case, rep["reason"])
+    if case == "midweek_outage_24h30":
+        assert rep["outages"]                    # gemeldet, kein Wochenend-Anker
+
+
+@pytest.mark.parametrize("sym", ["XAUUSD", "EURUSD"])
+def test_v4_two_independent_gaps_with_same_shift_fail(sym):
+    """Gegenprobe: eine Woche +1 h (Sonntag bis Sonntag) mitten im Monat -> Wechsel."""
+    ym = (2021, 3)
+    loc = _base_local(sym, ym)
+    s = pd.Timestamp(2021, 3, 21, 12)                     # Sonntag (Ortszeit), nach der Umstellung
+    shifted = loc.where(~((loc >= s) & (loc < s + pd.Timedelta(days=7))), loc + pd.Timedelta(hours=1))
+    rep = _check_with_context(pd.DatetimeIndex(shifted).sort_values(), sym, ym)
+    assert not rep["ok"] and rep["switch_runs"], rep["reason"]
+    assert {e["deviation_h"] for r in rep["switch_runs"] for e in r} == {1}
+
+
+def test_v4_e2e_week_shift_eurusd_not_written(tmp_path):
+    """Re-Review e2e_week: EURUSD +1 h So 2025-05-25 21:00 UTC .. 06-01, die ersten
+    4 Minuten nach der verschobenen Oeffnung fehlen. Im echten Lauf (Backfill
+    April..Juni, Juli veroeffentlicht) darf UTC-Mai nicht geschrieben werden."""
+    import test_fetch_histdata as tf
+    sym = "EURUSD"
+    utc = tf.market_utc(sym, pd.Timestamp("2025-02-20", tz="UTC"), pd.Timestamp("2025-07-05", tz="UTC"), 60)
+    s, e = pd.Timestamp("2025-05-25 21:00", tz="UTC"), pd.Timestamp("2025-06-01 21:00", tz="UTC")
+    utc = utc[~((utc >= s) & (utc < s + pd.Timedelta(minutes=4)))]
+    raw = utc.tz_convert(NY).tz_localize(None)
+    shift = (utc >= s) & (utc < e)
+    raw = raw.where(~shift, raw + pd.Timedelta(hours=1))
+    i = (utc.as_unit("ms").asi8 // 60_000).astype(float)
+    bid = np.round(1.1 * (1 + 0.002 * np.sin(i / 97.0)), 5)
+    df = pd.DataFrame({"raw": raw, "utc": utc, "bid": bid, "ask": bid + 0.00008})
+    files = {}
+    for (y, m) in ((2025, 3), (2025, 4), (2025, 5), (2025, 6), (2025, 7)):
+        sel = (df.raw >= pd.Timestamp(y, m, 1)) & (df.raw < pd.Timestamp(y, m, 1) + pd.offsets.MonthBegin(1))
+        files[("T", f"{y}{m:02d}")] = tf._zip_from(df[sel], sym, y, m)
+    now = datetime(2025, 8, 25, tzinfo=UTC)
+    clock = tf.Clock()
+    rep = fh.run(sym, date(2025, 4, 1), date(2025, 6, 1), tmp_path, mode="tick", now=lambda: now,
+                 **tf.kw(clock, tf.Site(clock, files)))
+    assert "2025-05" not in rep["summary"]["months_written"], rep["quarantine"]
+    assert "2025-04" in rep["summary"]["months_written"]
+    # Monat fuer Monat veroeffentlicht (Folgemonat noch nicht da): auch zwischendurch
+    # nie ein UTC-Monat mit verschobenen Ticks im Store
+    root = tmp_path / "monthly"
+    for ym in ((2025, 4), (2025, 5), (2025, 6)):
+        avail = {k: v for k, v in files.items() if (int(k[1][:4]), int(k[1][4:])) <= ym}
+        t = datetime(*fh._ym_add(ym, 1), 20, tzinfo=UTC)
+        fh.run(sym, date(2025, 4, 1), date(*ym, 1), root, mode="tick", now=lambda: t,
+               **tf.kw(clock, tf.Site(clock, avail)))
+        assert not fh.store_path(root, sym, 2025, 5).exists(), ym
+    fh.run(sym, date(2025, 4, 1), date(2025, 6, 1), root, mode="tick", now=lambda: now,
+           **tf.kw(clock, tf.Site(clock, files)))
+    assert not fh.store_path(root, sym, 2025, 5).exists()
+
+
+def test_v4_verify_month_writes_and_deletes_no_markers(tmp_path):
+    """--verify-month ist nur Bericht: alte Marker bleiben, neue entstehen nicht."""
+    _seed_cache(tmp_path, [(2024, 5), (2024, 6), (2024, 7), (2024, 8)], stamping="utc")
+    q6 = _old_marker(tmp_path, (2024, 6))
+    before = q6.read_bytes()
+    clock = Clock()
+    v = _verify(tmp_path, clock, Site(clock), (2024, 7))
+    assert v["exit_code"] == 4 and not v["ok"]
+    assert q6.read_bytes() == before
+    assert list(_markers(tmp_path)) == [q6.name]
+
+
+def test_v4_failure_without_expected_neighbour_is_not_persisted(tmp_path):
+    """Fehlt ein Nachbar-Rohmonat, der existieren sollte, ist das Ergebnis vorlaeufig:
+    Quarantaene in diesem Lauf, aber kein Marker (naechster Lauf prueft neu)."""
+    _seed_cache(tmp_path, [(2024, 6), (2024, 7)], stamping="utc")
+    clock = Clock()
+    rep = do_run(tmp_path, Site(clock), clock, (2024, 7))
+    assert rep["exit_code"] == 4 and all("VORLAEUFIG" in q["reason"] for q in rep["quarantine"])
+    assert not _markers(tmp_path)
+    _seed_cache(tmp_path, [(2024, 5), (2024, 8)], stamping="utc")   # Nachbarn jetzt da
+    rep = do_run(tmp_path, Site(clock), clock, (2024, 7))
+    assert rep["exit_code"] == 4 and _markers(tmp_path)
+    assert not any("VORLAEUFIG" in q["reason"] for q in rep["quarantine"])

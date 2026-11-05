@@ -45,43 +45,52 @@ TimezoneError -> Quarantaene (Exit 4); der Markt ist dann ohnehin zu. Folge:
 UTC-Monat M braucht die Rohmonate M-1 (dessen letzte 4 h in EDT bzw. 5 h in
 EST; aus RAW_TZ berechnet) und M; er gilt nur als vollstaendig, wenn beide da
 sind (oder M-1 vor Historienbeginn bzw. bestaetigt leer ist).
-Die Zeitzone wird JE ROHMONAT aus den Daten geprueft (check_timezone):
-je Marktluecke ein Schluss- und ein Oeffnungsanker - Wochenende (>= 24 h:
-Fr 17:00 -> So 18:00 Metalle / 17:00 EURUSD New York), bei Metallen die
-Tagespause Mo-Do (17:00-18:00 New York, hoechstens eine je Tag, nur wenn
-eindeutig und hoechstens 3 h vom erwarteten Beginn). Mit den Randticks der
-gecachten Nachbar-Rohmonate wird auch das Wochenende ueber den Monatsrand
-zum Anker. Der Offset einer Luecke wird gemeinsam aus beiden Seiten
-bestimmt (Abweichung, mit der Schluss nicht vor dem letzten und Oeffnung
-nicht nach dem ersten Tick laege); so liegen auch duenne Daten (Ticks
-Minuten vom Ereignis entfernt) richtig, mehrdeutige Luecken zaehlen nicht.
-Erwartet je Anker: Offset von RAW_TZ[mode] im Ereigniszeitpunkt (tick: -4 h
-in EDT, -5 h in EST; m1: immer -5 h). Abweichung = implizit - erwartet:
-Median 0, Anteil 0 und Laengster-Abweichungs-Lauf muessen passen; "belastbare"
-Anker (eindeutig bestimmt oder Ticks am Ereignis bei aktivem Markt) duerfen
-in den ersten/letzten 72 h des Rohmonats nicht um genau 1 h abweichen, bei
-Zonen mit Sommerzeit innerhalb von 7 Tagen um jede Umstellung gar nicht
-(andere Sommerzeitregel, z.B. EU oder US vor 2007), und ueber ein Wochenende
-darf die Abweichung nicht um genau 1 h springen; kein Zeitstempel darf in
-Dateireihenfolge um >= 30 min zurueckspringen. Zu wenige Anker -> gemeinsam
-mit dem Nachbar-Rohmonat pruefen. Beginnt der (gecachte) Folge-Rohmonat
-bereits mit 1 h Abweichung, wird auch Monat M nicht geschrieben (Umstellung
-nach dem letzten Anker von M). Sonst QUARANTAENE (Exit 4), es wird nichts
-verschoben geschrieben.
+Die Zeitzone wird JE ROHMONAT aus den Daten geprueft (check_timezone, v4):
+je Marktluecke ein Schluss- und ein Oeffnungsanker - Wochenende (>= 24 h,
+Schluss Do/Fr, Oeffnung So/Mo: Fr 17:00 -> So 18:00 Metalle / 17:00 EURUSD
+New York; andere Luecken >= 24 h sind Ausfaelle, nur Bericht), bei Metallen
+die Tagespause Mo-Do (17:00-18:00 New York; nur wenn alle pausenartigen
+Luecken des Tages dieselbe eindeutige Abweichung <= 1 h ergeben). Die
+Abweichung einer Luecke wird aus beiden Seiten gemeinsam bestimmt (Schluss
+nicht vor dem letzten Tick, Toleranz 15 min; Oeffnung nicht nach dem ersten,
+5 min) - auch bei duennen Daten richtig. Erwartet je Anker: Offset von
+RAW_TZ[mode] im Ereigniszeitpunkt (tick: -4 h in EDT, -5 h in EST; m1:
+immer -5 h). Abweichung = implizit - erwartet.
+HART (Quarantaene, Exit 4) nur Systematisches oder Bestaetigtes: Median-
+Abweichung != 0, Anteil 0 < 60 %, >= 2 UNABHAENGIGE Luecken in Folge mit
+derselben Abweichung != 0 ohne 0 dazwischen (auch ueber den Monatsrand: die
+Ticks der ersten/letzten 8 Tage der gecachten Nachbar-Rohmonate sind
+Kontext), Ruecksprung >= 30 min, nicht eindeutige Ortszeit. Nur WARNUNG:
+einzelne Ausreisser (verirrter Tick, Feed-Kante genau 1 h daneben,
+Feiertag, Ausfall), widerspruechliche/mehrdeutige Luecken.
+Reihenfolge: Ergebnisse ohne einen Nachbar-Rohmonat, der existieren sollte
+(abgeschlossen, in der Historie, nicht im Cache), sind VORLAEUFIG: weder
+gemerkt noch als Marker gespeichert. Ein einzelner abweichender Eintrag am
+Monatsrand ohne Kontext dahinter haelt den Monat zurueck, bis der Nachbar
+da ist. Fehlt der rechte Nachbar (neuester Monat), wird mit
+tz_right_padding=false geschrieben und nachgeprueft, sobald Rohmonat M+1 im
+Cache ist (besteht -> Flag true, sonst aus dem Store + Quarantaene). Reicht
+ein bestaetigter Wechsel im Folge-Rohmonat in Monat M zurueck, wird M nicht
+geschrieben (check_following). Zu wenige Anker -> gemeinsam mit dem
+Nachbar-Rohmonat pruefen.
 Parquet-Metadatum source_timezone = SOURCE_TZ_META[mode], abgeleitet aus
 RAW_TZ und TZ_CHECK_VERSION. Zu Beginn JEDES Laufs werden alle Monatsdateien
 des Symbols/Modus geprueft (classify_store_file):
-- gleiche Umrechnungszone, nur altes Metadatum (z.B. m1 der Vorversion):
-  nur Metadatum erneuern, nie verschieben, keine Requests;
+- gleiche Umrechnungszone, aeltere Pruefversion (z.B. m1 der Vorversion,
+  Tick-Dateien v2/v3): Rohmonate aus dem Cache neu pruefen (kein Download);
+  besteht -> nur Metadaten erneuern, faellt durch -> nach metals/stale/ +
+  Quarantaene, Roh-Cache fehlt -> Datei bleibt (unverified_after_version_bump);
+- tz_right_padding=false und Rohmonat M+1 jetzt im Cache: ebenso nachpruefen
+  (auch am Laufende);
 - andere Umrechnung mit anderen UTC-Zeiten im Monat (Tick-Monate mit EDT
-  aus der Fest-EST-Version): sofort nach metals/stale/ verschieben (der Bot
-  sieht eher eine Luecke als einen verschobenen Monat), auch ausserhalb von
-  --start/--end (Laufreport stale_retired_out_of_range);
+  aus der Fest-EST-Version): sofort nach metals/stale/ verschieben, auch
+  ausserhalb von --start/--end (Laufreport stale_retired_out_of_range);
 - andere Umrechnung, im Monat aber gleiche UTC-Zeiten (Dez/Jan/Feb): bleibt
   liegen, bis der Neubau sie atomar ersetzt.
 Monate in [start, end] werden aus dem Roh-Cache neu gebaut (WARNING, Laufreport
 "rebuilt_timezone"); fehlt der Roh-Cache, wird normal geladen (Requests).
---verify-month meldet den Zustand der Monatsdatei nur (store_file), aendert nichts.
+--verify-month ist nur Bericht: Zustand der Monatsdatei (store_file), keine
+Quarantaene-Marker schreiben oder loeschen.
 Quarantaene-Marker tragen raw_tz und tz_check_version. Nicht freigegebene
 Marker aelterer Version/anderer Zone: neu pruefen (ohne Download). "accepted":
 true gilt nur fuer dieselbe Umrechnung (raw_tz); eine Freigabe unter anderer
@@ -198,8 +207,10 @@ RAW_TZ = {"tick": "America/New_York", "m1": "Etc/GMT+5"}
 # Version der Zeitzonen-Pruefung; steht in jedem Quarantaene-Marker und im
 # Parquet-Metadatum. v1 = fest UTC-5 fuer beide Modi (ohne Versionsfeld),
 # v2 = Zone je Modus, v3 = Anker je Luecke (duenne Daten, Nachbar-Randticks,
-# Umstellungsfenster). Nicht freigegebene Marker aelterer Version werden neu geprueft.
-TZ_CHECK_VERSION = 3
+# Umstellungsfenster), v4 = hart nur Systematisches/Bestaetigtes (>= 2 unabhaengige
+# Luecken), Einzelausreisser nur Warnung, vorlaeufige Ergebnisse nie gespeichert.
+# Nicht freigegebene Marker und Store-Dateien aelterer Version werden neu geprueft.
+TZ_CHECK_VERSION = 4
 # Parquet-Metadatum source_timezone: aus RAW_TZ abgeleitet (nie von Hand pflegen),
 # damit eine Umstellung von RAW_TZ alte Dateien automatisch als veraltet erkennt.
 def source_tz_label(zone: str) -> str:
@@ -231,14 +242,17 @@ EMPTY_RECHECK_DAYS = 30          # bestaetigt leere Monate in der Historie danac
 # ---- Zeitzonen-Pruefung -----------------------------------------------------
 # Offset = Rohzeit - UTC in Stunden; erwartet je Anker aus RAW_TZ[mode],
 # Abweichung = impliziter - erwarteter Offset (soll 0 sein)
-TZ_MIN_ANCHORS = 3
-TZ_MIN_SHARE = 0.6         # Anteil der Ankerpunkte mit Abweichung 0
-TZ_MAX_RUN = 3             # so viele aufeinanderfolgende gleich abweichende Anker = Regimewechsel
-TZ_EDGE_MS = 72 * HOUR_MS  # Monatsrand: hier ist schon EIN Anker mit +-1 h fatal
-TZ_BREAK_WINDOW_H = 3      # Tagespausen-Anker nur hoechstens so weit vom erwarteten Beginn
-TZ_TOL_MS = 5 * MIN_MS     # Ticks so weit nach Schluss/vor Oeffnung gelten noch als Rand
-TZ_TIGHT_MS = 2 * MIN_MS   # Tick so nah am Marktereignis = "am Ereignis" (echte Daten: Sekunden)
-TZ_TRANSITION_MS = 7 * DAY_MS   # um jede Umstellung: belastbare Abweichung != 0 fatal
+TZ_MIN_ANCHORS = 3         # so viele eindeutige Anker (eigene Seite) mindestens, sonst nicht pruefbar
+TZ_MIN_SHARE = 0.6         # Anteil der eindeutigen Anker mit Abweichung 0
+TZ_MAX_RUN = 2             # so viele UNABHAENGIGE Luecken mit gleicher Abweichung != 0 in Folge = Wechsel
+TZ_EDGE_MS = 72 * HOUR_MS  # Monatsrand (nur Bericht)
+TZ_BREAK_MAX_DEV_H = 1     # Tagespausen mit groesserer Abweichung sind Ausfaelle, keine Anker
+TZ_TOL_MS = 15 * MIN_MS    # Ticks so weit NACH dem Schluss gelten noch als Rand (verirrte Ticks, 17:15-Schluss)
+TZ_TOL_OPEN_MS = 5 * MIN_MS  # ... so weit VOR der Oeffnung (enger: sonst wirkt eine duenne verschobene Oeffnung richtig)
+TZ_TIGHT_MS = 10 * MIN_MS  # Einzelseite: Tick so nah an einer vollen Stunde ...
+TZ_ACTIVE_MS = 5 * MIN_MS  # ... und Markt dort aktiv (Nachbartick so nah)
+TZ_TRANSITION_MS = 7 * DAY_MS   # Umstellungsfenster (nur Bericht)
+TZ_PAD_MS = 8 * DAY_MS     # so viele Tage der Nachbar-Rohmonate als Kontext (Laeufe ueber den Monatsrand)
 REGRESSION_MAX_MS = 30 * MIN_MS  # Ruecksprung in Dateireihenfolge ab dem -> Uhrumstellung
 WEEKEND_GAP_MS = 24 * HOUR_MS
 BREAK_GAP_MS = (45 * MIN_MS, 3 * HOUR_MS)
@@ -537,23 +551,32 @@ def unit_for(symbol: str, mode: str, ym: tuple[int, int], current_raw_year: int,
 
 
 # ------------------------------------------------------- atomar schreiben ---
-def write_parquet(out: Path, df: pd.DataFrame, mode: str) -> None:
-    """Atomar wie fetch_dukascopy.write_parquet; Metadaten: Modus, Spread, Zeitzone."""
+def write_parquet(out: Path, df: pd.DataFrame, mode: str, right_padding: bool = True) -> None:
+    """Atomar wie fetch_dukascopy.write_parquet; Metadaten: Modus, Spread, Zeitzone,
+    tz_right_padding (false: Rohmonat M ohne Randticks von M+1 geprueft -> nachpruefen)."""
     out.parent.mkdir(parents=True, exist_ok=True)
     table = pa.Table.from_pandas(df, preserve_index=False)
     meta = dict(table.schema.metadata or {})
     meta[b"histdata_mode"] = PARQUET_MODE[mode].encode()
     meta[b"spread_available"] = b"true" if mode == "tick" else b"false"
     meta[b"source_timezone"] = SOURCE_TZ_META[mode].encode()
+    meta[b"tz_right_padding"] = b"true" if right_padding else b"false"
     _write_table_atomic(out, table.replace_schema_metadata(meta))
 
 
-def relabel_store_file(out: Path, mode: str) -> None:
-    """Nur das Metadatum source_timezone aktualisieren (Inhalt unveraendert, atomar)."""
+def relabel_store_file(out: Path, mode: str, right_padding: bool = True) -> None:
+    """Nur die Zeitzonen-Metadaten aktualisieren (Inhalt unveraendert, atomar)."""
     table = pq.read_table(out)
     meta = dict(table.schema.metadata or {})
     meta[b"source_timezone"] = SOURCE_TZ_META[mode].encode()
+    meta[b"tz_right_padding"] = b"true" if right_padding else b"false"
     _write_table_atomic(out, table.replace_schema_metadata(meta))
+
+
+def label_version(label: str | None) -> int:
+    """Pruefversion aus source_timezone (0: unbekannt/aelter als v3)."""
+    m = re.search(r"tz_check v(\d+)", label or "")
+    return int(m.group(1)) if m else 0
 
 
 def label_zone(label: str | None) -> str | None:
@@ -590,8 +613,14 @@ def classify_store_file(out: Path, mode: str, ym: tuple[int, int]) -> tuple[str,
     """
     Zeitzonen-Zustand einer vorhandenen Monatsdatei desselben Modus ->
     (zustand, altes_metadatum):
-      current     Metadatum = SOURCE_TZ_META[mode]
-      relabel     gleiche Umrechnungszone (z.B. altes m1-Metadatum): nur Metadatum neu
+      current     Metadatum = SOURCE_TZ_META[mode] (und rechter Nachbar geprueft)
+      recheck_padding  aktuelles Metadatum, aber tz_right_padding=false: nachpruefen,
+                  sobald Rohmonat M+1 im Cache ist (besteht -> Flag setzen, sonst
+                  aus dem Store nehmen)
+      recheck     gleiche Umrechnungszone, aeltere Pruefversion (z.B. altes
+                  m1-Metadatum, v2/v3): Rohmonate aus dem Cache neu pruefen; besteht
+                  -> nur Metadatum neu, sonst aus dem Store nehmen + Quarantaene;
+                  ohne Roh-Cache bleibt die Datei (unverified_after_version_bump)
       stale       andere Umrechnung, in diesem Monat aber gleiche UTC-Zeiten
                   (z.B. Tick-Wintermonat der Fest-EST-Version): neu bauen, Datei
                   bleibt bis zum erfolgreichen Neubau liegen
@@ -600,10 +629,12 @@ def classify_store_file(out: Path, mode: str, ym: tuple[int, int]) -> tuple[str,
     """
     old = stored_timezone(out)
     if old == SOURCE_TZ_META[mode]:
+        if _stored_meta(out, b"tz_right_padding") == "false":
+            return "recheck_padding", old
         return "current", old
     zone = label_zone(old)
     if zone == RAW_TZ[mode]:
-        return "relabel", old
+        return "recheck", old
     return ("stale_shifted" if _zones_differ_in(zone, mode, ym) else "stale"), old
 
 
@@ -939,71 +970,25 @@ def _expected_ms(r_ms: int, hour_ny: int) -> int:
     return int(datetime(d.year, d.month, d.day, hour_ny, tzinfo=NY).timestamp() * 1000)
 
 
-def _gap_anchors(a: int, b: int, kinds: tuple[str, str], hours: tuple[int, int], mode: str,
-                 weekend: bool, dense: tuple[bool, bool] = (True, True)) -> tuple[list[tuple], str | None]:
+def _gap_fit(a: int, b: int, hours: tuple[int, int], mode: str) -> dict:
     """
-    Anker einer Marktluecke [a, b] (a = letzter Tick davor, b = erster danach)
-    mit erwartetem Schluss hours[0]:00 (Rohdatum von a) und Oeffnung
-    hours[1]:00 New York (Rohdatum von b). Rueckgabe ([(roh, art, stunde,
-    implizit, erwartet, ereignis_utc_ms, belastbar), ...], grund_wenn_keine).
-
-    F = alle ganzen Abweichungen v (vom erwarteten Offset der jeweiligen Seite),
-    mit denen der Schluss nicht vor dem letzten und die Oeffnung nicht nach dem
-    ersten Tick laege (+-TZ_TOL_MS, spaete/fruehe Ticks). Genau ein v: beide
-    Anker damit, belastbar (auch bei duennen Daten richtig: der Lueckenrand muss
-    nicht am Ereignis liegen). Tagespausen nur so, und dann nur belastbar, wenn
-    beide Ticks hoechstens TZ_TIGHT_MS am Ereignis liegen (bei duennen Daten
-    kann eine zufaellige Luecke wie eine Pause aussehen). Wochenenden sonst:
-    F leer = Widerspruch (bei richtigen Daten jeder Dichte unmoeglich, also
-    Stempelungswechsel ueber das Wochenende) -> je Seite die mit ihrem Tick
-    vertraegliche Grenze, belastbar; F mehrdeutig -> nur Seiten mit Tick am
-    Ereignis (gerundet), belastbar nur wenn beide dort liegen.
-    Nur belastbare Anker zaehlen fuer die Einzelanker-Regeln (Monatsrand,
-    Umstellungsfenster); alle zaehlen fuer Median/Anteil/Lauf.
+    Luecke [a, b] (a = letzter Tick davor, b = erster danach) gegen erwarteten
+    Schluss hours[0]:00 (Rohdatum von a) und Oeffnung hours[1]:00 New York
+    (Rohdatum von b). F = alle ganzen Abweichungen v (vom erwarteten Offset der
+    jeweiligen Seite), mit denen der Schluss nicht vor dem letzten (Toleranz
+    TZ_TOL_MS) und die Oeffnung nicht nach dem ersten Tick laege (Toleranz
+    TZ_TOL_OPEN_MS). Richtige Daten
+    jeder Dichte haben 0 in F (auch am Umstellungssonntag).
     """
-    (kc, ko), (hc, ho) = kinds, hours
+    hc, ho = hours
     ec, eo = _expected_ms(a, hc), _expected_ms(b, ho)
     xc, xo = int(round(tz_offset_h(ec, mode))), int(round(tz_offset_h(eo, mode)))
-    # F in Abweichungen (nicht Offsets): die Zone darf selbst ueber das
-    # Wochenende umstellen (Umstellungssonntag), richtige Daten haben immer 0 in F
     lo = math.ceil((a - ec - xc * HOUR_MS - TZ_TOL_MS) / HOUR_MS)
-    hi = math.floor((b - eo - xo * HOUR_MS + TZ_TOL_MS) / HOUR_MS)
-    oc = math.floor((a - ec) / HOUR_MS + 0.5)
-    oo = math.floor((b - eo) / HOUR_MS + 0.5)
-    # "am Ereignis": hoechstens TZ_TIGHT_MS von einer vollen Stunde UND Markt dort
-    # aktiv (Nachbartick auf der Marktseite ebenfalls <= TZ_TIGHT_MS entfernt) -
-    # sonst landet bei duennen Daten ein Tick zufaellig auf der falschen Stunde
-    tight_c = dense[0] and abs(a - ec - oc * HOUR_MS) <= TZ_TIGHT_MS
-    tight_o = dense[1] and abs(b - eo - oo * HOUR_MS) <= TZ_TIGHT_MS
-    if lo == hi:
-        # Wochenende (>= 24 h) ist sicher eine Marktpause; eine 45-min..3-h-Luecke
-        # bei duennen Daten evtl. nicht -> dort belastbar nur mit Ticks am Ereignis
-        rel = weekend or (tight_c and tight_o)
-        return [(a, kc, hc, xc + lo, xc, ec, rel, a), (b, ko, ho, xo + lo, xo, eo, rel, a)], None
-    if not weekend:
-        return [], "mehrdeutig" if hi > lo else "widerspruechlich"
-    if hi < lo:
-        # Widerspruch: kein v passt zu beiden Seiten. Bei richtigen Daten (jeder
-        # Dichte) liegt 0 immer in F -> Stempelung wechselt ueber das Wochenende.
-        # Schluss: kleinste mit dem letzten Tick vertraegliche Abweichung (lo),
-        # Oeffnung: groesste mit dem ersten Tick vertraegliche (hi). Belastbar.
-        return [(a, kc, hc, xc + lo, xc, ec, True, None),
-                (b, ko, ho, xo + hi, xo, eo, True, None)], None
-    # mehrdeutig (duenne Ticks oder Vorwaertsumstellung ueber das Wochenende):
-    # nur Seiten mit Tick am Ereignis, belastbar nur wenn beide dort liegen
-    out = []
-    if tight_c:
-        out.append((a, kc, hc, oc, xc, ec, tight_o, None))
-    if tight_o:
-        out.append((b, ko, ho, oo, xo, eo, tight_c, None))
-    return out, None if out else "mehrdeutig"
-
-
-def _dense(t: np.ndarray, i: int) -> tuple[bool, bool]:
-    """Markt aktiv am Lueckenrand: Tick vor t[i] bzw. nach t[i+1] hoechstens TZ_TIGHT_MS entfernt."""
-    i = int(i)
-    return (bool(i > 0 and int(t[i] - t[i - 1]) <= TZ_TIGHT_MS),
-            bool(i + 2 < len(t) and int(t[i + 2] - t[i + 1]) <= TZ_TIGHT_MS))
+    hi = math.floor((b - eo - xo * HOUR_MS + TZ_TOL_OPEN_MS) / HOUR_MS)
+    vc = math.floor((a - ec - xc * HOUR_MS) / HOUR_MS + 0.5)        # naechste volle Stunde je Seite
+    vo = math.floor((b - eo - xo * HOUR_MS) / HOUR_MS + 0.5)
+    return {"a": a, "b": b, "ec": ec, "eo": eo, "xc": xc, "xo": xo, "lo": lo, "hi": hi,
+            "vc": vc, "vo": vo, "rc": a - ec - (xc + vc) * HOUR_MS, "ro": b - eo - (xo + vo) * HOUR_MS}
 
 
 def _transitions_ms(mode: str, lo_ms: int, hi_ms: int) -> np.ndarray:
@@ -1013,42 +998,56 @@ def _transitions_ms(mode: str, lo_ms: int, hi_ms: int) -> np.ndarray:
     return T[(T >= lo_ms) & (T <= hi_ms)]
 
 
+def _wd(ms: int) -> int:
+    """Wochentag der Rohzeit (Mo = 0)."""
+    return (ms // DAY_MS + 3) % 7
+
+
 def check_timezone(raw_ms: np.ndarray, symbol: str,
                    bounds: tuple[int, int] | None = None, mode: str = "tick",
                    neighbours: tuple = (None, None)) -> dict:
     """
-    Impliziten Offset (Rohzeit - UTC, ganze Stunden) aus Marktzeiten schaetzen
-    und je Anker mit dem erwarteten Offset von RAW_TZ[mode] vergleichen
-    (tick America/New_York: -4 h in EDT, -5 h in EST; m1 Etc/GMT+5: immer -5 h).
-    Anker (Marktzeiten New York, zoneinfo America/New_York), je Luecke ein
-    Schluss- und ein Oeffnungsanker (s. _gap_anchors):
-      Wochenende     Luecke >= 24 h: Schluss Fr 17:00, Oeffnung So 18:00
-                     (Metalle) / 17:00 (EURUSD)
-      Tagespause     (nur Metalle, Mo-Do) Luecke 45 min..3 h, Schluss 17:00,
-                     Oeffnung 18:00; nur wenn der Offset eindeutig ist und
-                     hoechstens TZ_BREAK_WINDOW_H vom erwarteten abweicht
-                     (duenne Maerkte haben nachts weitere Luecken).
-    neighbours = (letzte Ticks des Vor-Rohmonats, erste des Folge-Rohmonats;
-    je ein Wert oder eine Folge, z.B. zwei Ticks), falls gecached: dann wird
-    auch das Wochenende ueber den Monatsrand zur Luecke (Anker nur auf der
-    eigenen Seite).
-    Entschieden wird ueber die Abweichung = implizit - erwartet. status:
-      ok             genug Anker, Median-Abweichung 0, Anteil Abweichung 0 >=
-                     TZ_MIN_SHARE, kein Lauf von TZ_MAX_RUN gleich abweichenden
-                     Ankern, kein belastbarer Anker mit Abweichung genau +-1 h
-                     in den ersten/letzten 72 h von `bounds` (Uhrumstellung am
-                     Monatsrand), bei Zonen mit Sommerzeit kein belastbarer
-                     Anker mit Abweichung != 0 innerhalb von 7 Tagen um eine
-                     Umstellung der Zone (andere Sommerzeitregel, z.B. EU oder
-                     US vor 2007), kein Wochenende, ueber das die Abweichung
-                     belastbar um genau 1 h springt, kein Ruecksprung >= 30 min
-                     in Dateireihenfolge
-      failed         eine dieser Bedingungen verletzt
-      not_checkable  zu wenige Anker (und sonst kein Fehler)
-    Report: raw_tz, offsets (implizit), expected_offsets, deviations (Counter),
-    median_offset_h (implizit, Anzeige), median_deviation_h, share_expected
-    (Anteil Abweichung 0), edge_violations, transition_violations,
-    deviating_examples, reversals, ...
+    Impliziten Offset (Rohzeit - UTC, ganze Stunden) aus Marktluecken schaetzen
+    und mit dem erwarteten Offset von RAW_TZ[mode] im Ereigniszeitpunkt
+    vergleichen (tick America/New_York: -4 h in EDT, -5 h in EST; m1 Etc/GMT+5:
+    immer -5 h). Abweichung = implizit - erwartet.
+
+    Luecken (Marktzeiten New York):
+      Wochenende   >= 24 h, Schluss Do/Fr (Fr oder Feiertagsvorabend), Oeffnung
+                   So/Mo: Schluss 17:00, Oeffnung 18:00 Metalle / 17:00 EURUSD.
+                   Andere Luecken >= 24 h sind Ausfaelle (Bericht "outages").
+      Tagespause   (nur Metalle, Mo-Do) 45 min..3 h, nur eindeutig und
+                   |Abweichung| <= 1 h; je Rohtag die Luecke mit Beginn am
+                   naechsten an 17:00, aber nur wenn alle solchen Kandidaten
+                   des Tages (auch mehrdeutige, die zu +-1 h passen) dieselbe
+                   eindeutige Abweichung ergeben.
+    neighbours = (Ticks vom Ende des Vor-, vom Anfang des Folge-Rohmonats,
+    z.B. je TZ_PAD_MS), falls gecached: Luecken dort liefern Kontext-Eintraege
+    (Laeufe ueber den Monatsrand), aber keine Anker fuer Median/Anteil.
+
+    Je Luecke F = vertraegliche Abweichungen (_gap_fit). Genau eine: EINDEUTIGER
+    Eintrag (auch bei duennen Daten richtig) - nur diese zaehlen fuer Median und
+    Anteil. F leer (Seiten widersprechen sich; bei richtigen Daten unmoeglich,
+    z.B. Wechsel ueber das Wochenende, verirrter Tick): je Seite ein Eintrag
+    (Schluss = kleinste, Oeffnung = groesste vertraegliche Abweichung). F
+    mehrdeutig (nur Wochenende): je Seite ein schwacher Eintrag mit der
+    naechsten vollen Stunde, aber nur wenn der Tick hoechstens TZ_TIGHT_MS
+    daneben liegt und der Markt dort aktiv ist (Nachbartick <= TZ_ACTIVE_MS).
+
+    HARTE Fehler (status failed):
+      - Median-Abweichung der eindeutigen Anker != 0
+      - Anteil Abweichung 0 < TZ_MIN_SHARE
+      - >= TZ_MAX_RUN unabhaengige Luecken in Folge (Eintraege in Zeitfolge,
+        Nachbar-Randticks eingeschlossen, kein Eintrag mit 0 dazwischen) mit
+        derselben Abweichung != 0, mindestens einer im eigenen Monat
+        (Stempelungswechsel; auch eine Woche mit anderer Sommerzeitregel)
+      - Ruecksprung >= 30 min in Dateireihenfolge
+    Nur WARNUNG (warnings, kein Fehler): einzelne abweichende Eintraege
+    (Ausfall am Freitag, verspaetete Oeffnung, verirrter Tick, Feiertag),
+    widerspruechliche oder mehrdeutige Luecken, Ausfaelle >= 24 h unter der
+    Woche. not_checkable: weniger als TZ_MIN_ANCHORS eindeutige Anker.
+    switch_reaches_prev_month: ein Wechsel-Lauf beginnt schon im Vormonat
+    (check_following sperrt dann den Vormonat).
     """
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
     if bounds is None and len(raw_ms):        # Rohmonat des Medians als Monatsrand
@@ -1070,86 +1069,140 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
             if not len(raw_ms) or x < own_lo or x > own_hi]
     t = np.unique(np.concatenate([raw_ms, np.array(pads, dtype=np.int64)]))
     d = np.diff(t)
-    anchors: list[tuple] = []   # roh, art, stunde NY, implizit, erwartet, ereignis, belastbar, luecke
-    skipped: Counter = Counter()
-    switches = []                    # Wochenenden, ueber die die Stempelung um 1 h wechselt
+
+    def own(x: int) -> bool:
+        return own_lo <= x <= own_hi
+
+    def active(i: int, side: str) -> bool:
+        if side == "c":
+            return i > 0 and int(t[i] - t[i - 1]) <= TZ_ACTIVE_MS
+        return i + 2 < len(t) and int(t[i + 2] - t[i + 1]) <= TZ_ACTIVE_MS
+
+    anchors: list[tuple] = []      # eindeutig, eigene Seite: roh, art, stunde, implizit, erwartet
+    entries: list[tuple] = []      # zeit, abweichung, luecke, eigen, art, eindeutig
+    outages, contradictions, warnings = [], [], []
+    ambiguous = 0
+
+    def add_unique(f: dict, gid: int, kinds: tuple[str, str], hours: tuple[int, int]) -> None:
+        v = f["lo"]
+        for r, k, h, x in ((f["a"], kinds[0], hours[0], f["xc"]), (f["b"], kinds[1], hours[1], f["xo"])):
+            if own(r):
+                anchors.append((r, k, h, x + v, x))
+        entries.append((f["a"], v, gid, own(f["a"]) or own(f["b"]), kinds[0], True))
+
     for i in np.nonzero(d >= WEEKEND_GAP_MS)[0]:
-        got, why = _gap_anchors(int(t[i]), int(t[i + 1]), ("wochenschluss", "wochenstart"),
-                                (CLOSE_H_NY, OPEN_H_NY[symbol]), mode, weekend=True,
-                                dense=_dense(t, i))
-        anchors += got
-        # beide Seiten belastbar, Abweichungen um genau 1 h verschieden: bei
-        # richtigen Daten unmoeglich (auch am Umstellungssonntag: dort sind beide
-        # Abweichungen 0); Feiertage (frueher Schluss) weichen um >= 2 h ab
-        if len(got) == 2 and got[0][6] and got[1][6] and \
-                abs((got[0][3] - got[0][4]) - (got[1][3] - got[1][4])) == 1 and \
-                (own_lo <= got[0][0] <= own_hi or own_lo <= got[1][0] <= own_hi):
-            switches.append(got)
-        if why:
-            skipped[f"wochenende_{why}"] += 1
+        a, b = int(t[i]), int(t[i + 1])
+        if _wd(a) not in (3, 4) or _wd(b) not in (6, 0) or b - a > 5 * DAY_MS:
+            if not (own(a) or own(b)):
+                continue
+            outages.append({"from_raw": _raw_iso(a), "to_raw": _raw_iso(b),
+                            "hours": round((b - a) / HOUR_MS, 1)})
+            continue
+        hours = (CLOSE_H_NY, OPEN_H_NY[symbol])
+        f = _gap_fit(a, b, hours, mode)
+        if f["lo"] == f["hi"]:
+            add_unique(f, a, ("wochenschluss", "wochenstart"), hours)
+            continue
+        if f["lo"] > f["hi"]:
+            # Widerspruch (bei richtigen Daten jeder Dichte unmoeglich): beide Seiten
+            # als Eintraege (Schluss = kleinste, Oeffnung = groesste vertraegliche
+            # Abweichung); hart erst mit Bestaetigung durch eine weitere Luecke
+            contradictions.append({"from_raw": _raw_iso(a), "to_raw": _raw_iso(b),
+                                   "close_deviation_h": f["lo"], "open_deviation_h": f["hi"]})
+            entries.append((a, f["lo"], a, own(a), "wochenschluss", False))
+            entries.append((b, f["hi"], a, own(b), "wochenstart", False))
+            continue
+        ambiguous += 1
+        # schwache Einzelseiten: Tick an einer vollen Stunde bei aktivem Markt
+        for r, v, res, side, k in ((a, f["vc"], f["rc"], "c", "wochenschluss"),
+                                   (b, f["vo"], f["ro"], "o", "wochenstart")):
+            if abs(res) <= TZ_TIGHT_MS and active(int(i), side):
+                entries.append((r, v, a, own(r), k, False))
+
     ignored_breaks = 0
     if symbol in METALS:
         lo, hi = BREAK_GAP_MS
-        best_by_day: dict[int, tuple[int, list]] = {}    # je Rohtag hoechstens eine Tagespause
+        cands: dict[int, list[tuple[int, dict]]] = {}     # rohtag -> [(abstand zu 17:00, fit)]
         for i in np.nonzero((d >= lo) & (d <= hi))[0]:
-            if (int(t[i]) // DAY_MS + 3) % 7 >= 4:       # nur Mo-Do (1.1.1970 = Do)
+            a = int(t[i])
+            if _wd(a) >= 4:
                 continue
-            got, why = _gap_anchors(int(t[i]), int(t[i + 1]), ("pause_beginn", "pause_ende"),
-                                    (CLOSE_H_NY, 18), mode, weekend=False, dense=_dense(t, i))
-            if not got or abs(got[0][3] - got[0][4]) > TZ_BREAK_WINDOW_H:
-                ignored_breaks += 1                       # z.B. naechtliche Luecke, duenner Markt
+            f = _gap_fit(a, int(t[i + 1]), (CLOSE_H_NY, 18), mode)
+            f["rng"] = (max(f["lo"], -TZ_BREAK_MAX_DEV_H), min(f["hi"], TZ_BREAK_MAX_DEV_H))
+            if f["rng"][0] > f["rng"][1]:
+                ignored_breaks += 1               # keine Pause (Ausfall, naechtliche Luecke)
                 continue
-            day, length = int(t[i]) // DAY_MS, int(d[i])
-            if day in best_by_day:
-                ignored_breaks += 1
-                if best_by_day[day][0] >= length:        # die laengere Luecke ist die Pause
-                    continue
-            best_by_day[day] = (length, got)
-        for _, got in best_by_day.values():
-            anchors += got
-    # Anker auf Nachbar-Ticks gehoeren zum Nachbarmonat (dort geprueft)
-    anchors = sorted(a for a in anchors if own_lo <= a[0] <= own_hi)
+            cands.setdefault(a // DAY_MS, []).append(
+                (abs(a - (a // DAY_MS * DAY_MS + CLOSE_H_NY * HOUR_MS)), f))
+        for day, cs in cands.items():
+            # Anker nur, wenn ALLE Kandidaten des Tages (auch mehrdeutige) genau
+            # dieselbe Abweichung ergeben: bei richtigen Daten passt die echte Pause
+            # immer zu 0, eine zufaellige Luecke kann sie also nie allein ersetzen
+            if len({f["rng"] for _, f in cs}) > 1 or cs[0][1]["rng"][0] != cs[0][1]["rng"][1]:
+                ignored_breaks += len(cs)
+                continue
+            ignored_breaks += len(cs) - 1
+            f = dict(min(cs, key=lambda c: c[0])[1])   # Beginn am naechsten an 17:00
+            f["lo"] = f["hi"] = f["rng"][0]            # auf +-1 h begrenzt eindeutig
+            add_unique(f, f["a"], ("pause_beginn", "pause_ende"), (CLOSE_H_NY, 18))
+    anchors.sort()
+    entries.sort()
     offs = [a[3] for a in anchors]
     exps = [a[4] for a in anchors]
     devs = [o - x for o, x in zip(offs, exps)]
 
-    # laengster Lauf gleich abweichender Anker; Schluss+Oeffnung derselben
-    # Luecke mit gemeinsam bestimmtem Offset (F eindeutig) zaehlen einmal
-    run, best, prev = 0, 0, None
-    for k, (a, v) in enumerate(zip(anchors, devs)):
-        if k and v == devs[k - 1] and a[1] in ("wochenstart", "pause_ende") \
-                and anchors[k - 1][1] in ("wochenschluss", "pause_beginn") \
-                and a[7] == anchors[k - 1][7] and a[7] is not None:
+    # Laeufe unabhaengiger Luecken mit gleicher Abweichung != 0
+    runs, cur = [], []
+    for e in entries:
+        if e[1] == 0:
+            cur = []
             continue
-        if v == 0:
-            run = 0
+        if cur and cur[-1][1] != e[1]:
+            cur = []
+        if not cur or cur[-1][2] != e[2]:
+            cur.append(e)
         else:
-            run = run + 1 if prev == v else 1
-        prev = v
-        best = max(best, run)
-    edge = []
-    if bounds is not None:
-        blo, bhi = bounds
-        edge = [(a, v) for a, v in zip(anchors, devs)
-                if a[6] and abs(v) == 1 and (a[0] < blo + TZ_EDGE_MS or a[0] >= bhi - TZ_EDGE_MS)]
-    trans_v = []
-    if anchors:
-        tr = _transitions_ms(mode, anchors[0][5] - TZ_TRANSITION_MS, anchors[-1][5] + TZ_TRANSITION_MS)
-        if len(tr):
-            trans_v = [(a, v) for a, v in zip(anchors, devs)
-                       if a[6] and v and np.abs(tr - a[5]).min() <= TZ_TRANSITION_MS]
+            cur[-1] = e if e[3] else cur[-1]
+        if len({x[2] for x in cur}) >= TZ_MAX_RUN and any(x[3] for x in cur):
+            if runs and runs[-1] is cur:
+                continue
+            runs.append(cur)
+    best_run = 0
+    cnt, prev = 0, None
+    for e in entries:
+        cnt = 0 if e[1] == 0 else (cnt + 1 if prev is not None and prev[1] == e[1] and prev[2] != e[2] else 1)
+        prev = e
+        best_run = max(best_run, cnt)
+
     n = len(devs)
     share = devs.count(0) / n if n else 0.0
     med = float(np.median(offs)) if n else None
     med_dev = float(np.median(devs)) if n else None
+    blo, bhi = bounds if bounds is not None else (own_lo, own_hi + 1)
+    nonzero = [e for e in entries if e[1] and e[3]]
+    tr = (_transitions_ms(mode, own_lo - TZ_TRANSITION_MS, own_hi + TZ_TRANSITION_MS)
+          if len(raw_ms) else np.array([], dtype=np.int64))
 
-    def row(a, v) -> dict:
-        r, k, h, o, x, _, rel, _ = a
+    def erow(e) -> dict:
+        return {"raw": _raw_iso(e[0]), "kind": e[4], "deviation_h": e[1], "unique": e[5],
+                "own_month": e[3]}
+
+    def arow(a) -> dict:
+        r, k, h, o, x = a
         return {"raw": _raw_iso(r), "kind": k, "expected_ny": f"{h}:00", "implied_offset_h": o,
-                "expected_offset_h": x, "deviation_h": v, "reliable": rel}
+                "expected_offset_h": x, "deviation_h": o - x}
 
-    rep.update(anchors=n, reliable_anchors=sum(1 for a in anchors if a[6]),
-               ignored_break_gaps=ignored_breaks, skipped_gaps=dict(skipped),
+    first = entries[0] if entries else None
+    for e in nonzero:
+        if not any(e in r for r in runs):
+            warnings.append(f"einzelner abweichender Eintrag {_raw_iso(e[0])} {e[4]} {e[1]:+d} h "
+                            f"({'eindeutig' if e[5] else 'Einzelseite'}, nicht bestaetigt)")
+    for c in contradictions:
+        warnings.append(f"widerspruechliches Wochenende {c['from_raw']} -> {c['to_raw']}")
+    for o in outages:
+        warnings.append(f"Ausfall {o['from_raw']} -> {o['to_raw']} ({o['hours']} h, kein Wochenende)")
+    rep.update(anchors=n, entries=len(entries), unique_entries=sum(1 for e in entries if e[5]),
+               ignored_break_gaps=ignored_breaks, ambiguous_gaps=ambiguous,
                neighbour_ticks_used=len(pads), share_expected=round(share, 3),
                median_offset_h=med, median_deviation_h=med_dev,
                offsets=Counter(dict(sorted(Counter(offs).items()))),
@@ -1157,43 +1210,43 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
                deviations=Counter(dict(sorted(Counter(devs).items()))),
                first_offset_h=offs[0] if n else None, last_offset_h=offs[-1] if n else None,
                first_deviation_h=devs[0] if n else None, last_deviation_h=devs[-1] if n else None,
-               longest_deviating_run=best,
-               edge_violations=[row(a, v) for a, v in edge],
-               transition_violations=[row(a, v) for a, v in trans_v][:N_EXAMPLES],
-               weekend_switches=[[row(a, a[3] - a[4]) for a in g] for g in switches][:N_EXAMPLES],
-               deviating_examples=[row(a, v) for a, v in zip(anchors, devs) if v][:N_EXAMPLES])
+               first_entry_deviation_h=first[1] if first else None,
+               first_entry_in_prev_month=bool(first and first[0] < own_lo),
+               # ein Wechsel-Lauf reicht in den Vormonat (Schluss-Seite dort):
+               # check_following sperrt dann den Vormonat
+               switch_reaches_prev_month=any(e[0] < own_lo for r in runs for e in r),
+               # erster/letzter Eintrag weicht ab und ist (noch) nicht bestaetigt: ohne
+               # Nachbar-Kontext auf dieser Seite haelt raw_slice den Monat zurueck
+               leading_suspect=bool(first and first[1] and first[3] and not any(first in r for r in runs)),
+               trailing_suspect=bool(entries and entries[-1][1] and entries[-1][3]
+                                     and not any(entries[-1] in r for r in runs)),
+               longest_deviating_run=best_run,
+               switch_runs=[[erow(e) for e in r] for r in runs][:N_EXAMPLES],
+               edge_violations=[erow(e) for e in nonzero
+                                if abs(e[1]) == 1 and (e[0] < blo + TZ_EDGE_MS or e[0] >= bhi - TZ_EDGE_MS)],
+               transition_violations=[erow(e) for e in nonzero
+                                      if len(tr) and np.abs(tr - e[0]).min() <= TZ_TRANSITION_MS],
+               contradictions=contradictions[:N_EXAMPLES], outages=outages[:N_EXAMPLES],
+               warnings=warnings[:N_EXAMPLES],
+               deviating_examples=[arow(a) for a in anchors if a[3] != a[4]][:N_EXAMPLES])
     reasons = []
     if len(large):
         reasons.append(f"{len(large)} Ruecksprung/Rueckspruenge >= {REGRESSION_MAX_MS // MIN_MS} min "
                        f"in Dateireihenfolge (max {rep['max_reversal_s'] / 60:.0f} min, Uhrumstellung?)")
-    if edge:
-        (r, k, _, o, x, _, _, _), v = edge[0]
-        reasons.append(f"{len(edge)} Anker am Monatsrand (erste/letzte 72 h) mit genau 1 h "
-                       f"Abweichung, z.B. {_raw_iso(r)} {k} -> {o} h statt {x} h "
-                       f"(Uhrumstellung am Monatsrand?)")
-    if trans_v:
-        (r, k, _, o, x, _, _, _), v = trans_v[0]
-        reasons.append(f"{len(trans_v)} Anker mit Abweichung innerhalb von "
-                       f"{TZ_TRANSITION_MS // DAY_MS} Tagen um eine Uhrumstellung von {RAW_TZ[mode]}, "
-                       f"z.B. {_raw_iso(r)} {k} -> {o} h statt {x} h (andere Sommerzeitregel, "
-                       "z.B. EU oder US vor 2007?)")
-    if switches:
-        c, o = switches[0]
-        reasons.append(f"{len(switches)} Wochenende(n), ueber das die Stempelung um 1 h wechselt, "
-                       f"z.B. {_raw_iso(c[0])} {c[3]} h statt {c[4]} h -> {_raw_iso(o[0])} {o[3]} h "
-                       f"statt {o[4]} h (andere Sommerzeitregel?)")
+    for r in runs[:1]:
+        reasons.append(f"{len(runs)} Stempelungswechsel: {len({x[2] for x in r})} unabhaengige Luecken in "
+                       f"Folge mit {r[0][1]:+d} h Abweichung von {RAW_TZ[mode]}, z.B. "
+                       + ", ".join(f"{_raw_iso(x[0])} {x[4]}" for x in r[:3])
+                       + " (andere Sommerzeitregel/Verschiebung?)")
     if n >= TZ_MIN_ANCHORS:
         if med_dev != 0:
             reasons.append(f"Median-Abweichung {med_dev:+g} h (Median-Offset {med:g} h, erwartet "
                            f"{_fmt_counter(rep['expected_offsets'])} h aus {RAW_TZ[mode]})")
         if share < TZ_MIN_SHARE:
             reasons.append(f"nur {share:.0%} der Anker ohne Abweichung von {RAW_TZ[mode]}")
-        if best >= TZ_MAX_RUN:
-            reasons.append(f"{best} aufeinanderfolgende Anker mit gleicher Abweichung "
-                           "(Wechsel mitten im Monat?)")
     rep["status"] = "failed" if reasons else ("ok" if n >= TZ_MIN_ANCHORS else "not_checkable")
     if rep["status"] == "not_checkable":
-        reasons.append(f"nur {n} Ankerpunkte (< {TZ_MIN_ANCHORS}), Zeitzone nicht pruefbar")
+        reasons.append(f"nur {n} eindeutige Ankerpunkte (< {TZ_MIN_ANCHORS}), Zeitzone nicht pruefbar")
     rep["ok"] = rep["status"] == "ok"
     rep["reason"] = "; ".join(reasons) or None
     return rep
@@ -1282,12 +1335,13 @@ class Ctx:
     """Cache, Client und Zustand je Datei fuer einen Lauf (ein Symbol, ein Modus)."""
 
     def __init__(self, symbol: str, mode: str, data_root: Path, client: Client, now,
-                 rebuild: bool = False):
+                 rebuild: bool = False, report_only: bool = False):
         self.symbol, self.mode, self.data_root, self.client, self.now = symbol, mode, data_root, client, now
         self.rebuild = rebuild
+        self.report_only = report_only          # --verify-month: Marker weder schreiben noch loeschen
         self.decoded: OrderedDict[Unit, Decoded] = OrderedDict()
-        self.tz: dict[tuple[Unit, tuple[int, int]], dict] = {}
-        self.edges: dict[tuple[tuple[int, int], bool], list[int]] = {}
+        self.tz: dict[tuple, dict] = {}         # (unit, ym, links da, rechts da) -> endgueltige Pruefung
+        self.edges: dict[tuple[tuple[int, int], bool], np.ndarray] = {}
         self.downloaded = 0
         self.empty_streak = self.content_streak = 0
         self.first_data = self._first_cached_month()
@@ -1489,16 +1543,16 @@ class Ctx:
         except (CorruptZip, FormatError):
             return None
 
-    def _edge_ms(self, ym: tuple[int, int], last: bool) -> list[int] | None:
-        """Letzte (last) bzw. erste zwei Ticks eines gecachten Nachbar-Rohmonats (gemerkt;
-        zwei, damit erkennbar ist, ob der Markt am Lueckenrand aktiv war)."""
+    def _edge_ms(self, ym: tuple[int, int], last: bool) -> np.ndarray | None:
+        """Ticks der letzten (last) bzw. ersten TZ_PAD_MS eines gecachten Nachbar-
+        Rohmonats (gemerkt): Kontext fuer Luecken und Laeufe ueber den Monatsrand."""
         key = (ym, last)
         if key not in self.edges:
             ms = self._neighbour_ms(ym)
             if ms is None or not len(ms):
                 return None                    # nicht merken: kann spaeter geladen werden
             u = np.unique(ms)
-            self.edges[key] = [int(x) for x in (u[-2:] if last else u[:2])]
+            self.edges[key] = u[u >= u[-1] - TZ_PAD_MS] if last else u[u <= u[0] + TZ_PAD_MS]
         return self.edges[key]
 
     @staticmethod
@@ -1541,8 +1595,35 @@ class Ctx:
                     ", war freigegeben" if info.get("accepted") else "")
         return False, info
 
+    def _neighbour_expected(self, ym: tuple[int, int]) -> bool:
+        """Nachbar-Rohmonat sollte existieren, ist aber nicht im Cache: abgeschlossen,
+        innerhalb der Historie, nicht bestaetigt leer, ZIP fehlt."""
+        if before_history(self.symbol, ym) or not _month_closed(self.now(), ym, self.mode):
+            return False
+        u = self.unit(ym)
+        if u.path(self.data_root).exists():
+            return False
+        return self.state(u)[0] != "empty"
+
+    def _neighbours(self, ym: tuple[int, int]) -> tuple[tuple, dict]:
+        prev, nxt = _ym_add(ym, -1), _ym_add(ym, 1)
+        left, right = self._edge_ms(prev, last=True), self._edge_ms(nxt, last=False)
+        pad = {"left": left is not None, "right": right is not None,
+               "left_missing": left is None and self._neighbour_expected(prev),
+               "right_missing": right is None and self._neighbour_expected(nxt)}
+        # rechter Rand endgueltig geprueft: Randticks da oder M+1 bestaetigt leer
+        pad["right_final"] = pad["right"] or self.state(self.unit(nxt))[0] == "empty"
+        pad["provisional"] = pad["left_missing"] or pad["right_missing"]
+        return (left, right), pad
+
     def raw_slice(self, u: Unit, ym: tuple[int, int]) -> tuple[pd.DataFrame, dict]:
-        """Rohmonat ym aus Datei u, zeitzonengeprueft, mit Spalte utc_ms; Quarantined wenn nicht."""
+        """
+        Rohmonat ym aus Datei u, zeitzonengeprueft, mit Spalte utc_ms; Quarantined wenn nicht.
+        Geprueft mit den Randticks der gecachten Nachbar-Rohmonate. Fehlt ein
+        Nachbar, der existieren sollte (abgeschlossen, in der Historie), ist das
+        Ergebnis VORLAEUFIG: weder gemerkt noch als Marker gespeichert (der
+        naechste Aufruf mit Nachbar prueft neu); tz["padding"] sagt, was fehlte.
+        """
         q = u.qmarker(self.data_root, ym)
         accepted, old = self._marker_decision(u, ym, q)
         note = None
@@ -1565,13 +1646,15 @@ class Ctx:
             if accepted:
                 raise Quarantined(u, ym, reason, None)
             self._quarantine(u, ym, reason, None, note)
-        key = (u, ym)
         if accepted:
             return sel, {"accepted_manually": True, "marker": str(q)}
-        if key not in self.tz and len(sel):
+        if not len(sel):
+            return sel, {}
+        nb, pad = self._neighbours(ym)
+        key = (u, ym, pad["left"], pad["right"])
+        chk = self.tz.get(key)
+        if chk is None:
             bounds = raw_month_bounds_ms(ym)
-            # Randticks der gecachten Nachbar-Rohmonate: Wochenende ueber den Monatsrand
-            nb = (self._edge_ms(_ym_add(ym, -1), last=True), self._edge_ms(_ym_add(ym, 1), last=False))
             chk = check_timezone(sel["raw_ms"].to_numpy(), self.symbol, bounds, self.mode, nb)
             if chk["status"] == "not_checkable":
                 # zu wenige Anker (kurzer erster Historienmonat, duenner Monat):
@@ -1589,22 +1672,40 @@ class Ctx:
                     chk["reason"] = (f"Zeitzone NICHT PRUEFBAR: {chk['reason']} (auch gemeinsam mit "
                                      f"Nachbarmonaten {used}) - manuell pruefen, dann im Marker "
                                      "\"accepted\": true setzen")
-            self.tz[key] = chk
-            if not chk["ok"]:
-                self._quarantine(u, ym, ("" if chk["status"] == "not_checkable" else
-                                         f"Zeitzone passt nicht zu {RAW_TZ[self.mode]}: ")
-                                 + chk["reason"], chk, note)
-        if old is not None and q.exists():
+            chk["padding"] = pad
+            if not pad["provisional"]:
+                self.tz[key] = chk
+        hold = [_ymstr(_ym_add(ym, k)) for k, cond in (
+            (-1, pad["left_missing"] and chk.get("leading_suspect")),
+            (1, not pad["right_final"] and chk.get("trailing_suspect"))) if cond]
+        if chk["ok"] and hold:
+            # einzelne Abweichung am Rand ohne Kontext dahinter: koennte der Beginn
+            # eines Wechsels sein -> nicht schreiben, bis der Nachbarmonat da ist
+            ex = (chk.get("warnings") or ["?"])[0]
+            raise Quarantined(u, ym, f"VORLAEUFIG zurueckgehalten (nicht gespeichert): abweichender "
+                              f"Eintrag am Monatsrand ohne Bestaetigung ({ex}) - wartet auf Rohmonat "
+                              f"{', '.join(hold)}", chk)
+        if not chk["ok"]:
+            reason = ("" if chk["status"] == "not_checkable" else
+                      f"Zeitzone passt nicht zu {RAW_TZ[self.mode]}: ") + chk["reason"]
+            if pad["provisional"]:
+                miss = [_ymstr(_ym_add(ym, k)) for k, s_ in ((-1, "left_missing"), (1, "right_missing"))
+                        if pad[s_]]
+                raise Quarantined(u, ym, f"VORLAEUFIG (Nachbar-Rohmonat {', '.join(miss)} fehlt im "
+                                  f"Cache, nicht gespeichert): {reason}", chk)
+            self._quarantine(u, ym, reason, chk, note)
+        if old is not None and q.exists() and not self.report_only and not pad["provisional"]:
             q.unlink(missing_ok=True)                  # neu geprueft und bestanden
             log.warning("Quarantaene-Marker %s (aeltere Pruefung) entfernt: %s besteht die Pruefung "
                         "unter %s", q.name, _ymstr(ym), RAW_TZ[self.mode])
-        return sel, self.tz.get(key, {})
+        return sel, chk
 
     def check_following(self, ym: tuple[int, int]) -> None:
         """
-        Folge-Rohmonat ym+1 (falls gecached) beginnt mit 1 h Abweichung ->
-        Umstellung vermutlich nach dem letzten Anker von ym: UTC-Monat ym
-        nicht schreiben (Quarantined, Marker liegt am Folgemonat).
+        Folge-Rohmonat ym+1 (falls gecached) faellt mit einem Stempelungswechsel
+        durch, der schon in ym beginnt (Lauf mit Eintrag aus dem ym-Kontext, z.B.
+        Sonntagsoeffnung/Freitagsschluss am Ende von ym): UTC-Monat ym nicht
+        schreiben (Quarantined, Marker liegt am Folgemonat).
         """
         nxt = _ym_add(ym, 1)
         u = self.unit(nxt)
@@ -1613,16 +1714,38 @@ class Ctx:
         try:
             self.raw_slice(u, nxt)
         except Quarantined as q:
-            fd = (q.check or {}).get("first_deviation_h")
-            if fd is not None and abs(fd) == 1:
-                fo = q.check.get("first_offset_h")
+            if (q.check or {}).get("switch_reaches_prev_month"):
+                runs = q.check.get("switch_runs") or [[]]
+                first = runs[0][0] if runs[0] else {}
                 raise Quarantined(q.unit, q.ym, (
-                    f"Folge-Rohmonat {_ymstr(nxt)} beginnt mit Offset {fo} h ({fd:+d} h Abweichung "
-                    f"von {RAW_TZ[self.mode]}): Uhrumstellung vermutlich am Ende von {_ymstr(ym)} "
-                    f"(nach dessen letztem Anker) - {_ymstr(ym)} nicht geschrieben. "
-                    f"Folgemonat: {q.reason}"), q.check)
+                    f"Folge-Rohmonat {_ymstr(nxt)}: Stempelungswechsel beginnt schon in {_ymstr(ym)} "
+                    f"({first.get('raw')} {first.get('kind')} {first.get('deviation_h', 0):+d} h) - "
+                    f"{_ymstr(ym)} nicht geschrieben. Folgemonat: {q.reason}"), q.check)
         except (CorruptZip, FormatError):
             return
+
+    def reverify(self, ym: tuple[int, int]) -> bool | None:
+        """
+        Rohmonate fuer UTC-Monat ym aus dem CACHE neu pruefen (kein Download).
+        None: Roh-Cache fehlt/kaputt (nicht pruefbar); sonst tz_right_padding.
+        Quarantined bei Fehler (Marker wie ueblich, ausser vorlaeufig/report_only).
+        """
+        pad = True
+        for r in needed(self.symbol, ym, self.mode):
+            u = self.unit(r)
+            st = self.state(u)[0]
+            if st == "empty":
+                continue
+            if st != "data":
+                return None
+            try:
+                _, tz = self.raw_slice(u, r)
+            except CorruptZip:
+                return None
+            if r == ym:
+                pad = bool((tz.get("padding") or {}).get("right_final", True))
+        self.check_following(ym)
+        return pad
 
     def _quarantine(self, u: Unit, ym, reason: str, check: dict | None, note: str | None = None):
         info = {"reason": reason, "check": check, "since": self.now().isoformat(),
@@ -1631,8 +1754,11 @@ class Ctx:
             info["note"] = note
             reason = f"{reason} [{note}]"
             info["reason"] = reason
-        dk.write_json_atomic(u.qmarker(self.data_root, ym), info)
-        log.error("QUARANTAENE %s Rohmonat %d-%02d: %s", u.key, *ym, reason)
+        if self.report_only:
+            log.error("QUARANTAENE (nur Bericht, kein Marker) %s Rohmonat %d-%02d: %s", u.key, *ym, reason)
+        else:
+            dk.write_json_atomic(u.qmarker(self.data_root, ym), info)
+            log.error("QUARANTAENE %s Rohmonat %d-%02d: %s", u.key, *ym, reason)
         raise Quarantined(u, ym, reason, check)
 
 
@@ -1656,7 +1782,7 @@ def build_month(ctx: Ctx, ym: tuple[int, int]) -> tuple[pd.DataFrame, dict]:
     """UTC-Monat aus den Rohmonaten M-1 und M (beide erledigt) bauen."""
     ms, me = (pd.Timestamp(datetime(*ym, 1, tzinfo=UTC)),
               pd.Timestamp(datetime(*_ym_add(ym, 1), 1, tzinfo=UTC)))
-    parts, stats = [], {"raw_months": {}, "histdata_status": {}}
+    parts, stats = [], {"raw_months": {}, "histdata_status": {}, "tz_right_padding": True}
     for r in needed(ctx.symbol, ym, ctx.mode):
         u = ctx.unit(r)
         info = {"file": u.name, "state": ctx.state(u)[0]}
@@ -1664,6 +1790,10 @@ def build_month(ctx: Ctx, ym: tuple[int, int]) -> tuple[pd.DataFrame, dict]:
         if info["state"] != "data":
             continue
         sel, tz = ctx.raw_slice(u, r)                 # mit utc_ms (RAW_TZ[mode] -> UTC)
+        if r == ym:
+            # rechter Nachbar (Rohmonat M+1) fehlte bei der Pruefung von M: Datei
+            # wird mit tz_right_padding=false geschrieben und spaeter nachgeprueft
+            stats["tz_right_padding"] = bool((tz.get("padding") or {}).get("right_final", True))
         utc_ms = sel["utc_ms"].to_numpy()
         sel = sel[(utc_ms >= ms.value // 1_000_000) & (utc_ms < me.value // 1_000_000)]
         info.update(file_rows=ctx.decode(u).stats, rows_in_month=int(len(sel)), timezone=tz)
@@ -1751,39 +1881,67 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
     in_range = set(dk.months(start, end))
     stale_out: dict[str, dict] = {}
     relabelled: list[tuple[int, int]] = []
+    retired_recheck: dict[str, dict] = {}
+    unverified: list[tuple[int, int]] = []
     # ALLE Monatsdateien des Symbols/Modus pruefen, nicht nur [start, end]:
-    # verschobene Altdateien nie im Store lassen
-    for ym, out in _store_months(data_root, sym, mode):
-        if stored_mode(out) != PARQUET_MODE[mode]:
-            continue                           # store_mode_conflict, unten bzw. nicht unsere Datei
-        st, old_tz = classify_store_file(out, mode, ym)
-        if st == "current":
-            continue
-        if st == "relabel":
-            # gleiche Umrechnung (z.B. m1-Datei der Vorversion): Inhalt richtig,
-            # nur Metadatum erneuern - nie verschieben, keine Requests
-            relabel_store_file(out, mode)
-            relabelled.append(ym)
-            log.info("%s: source_timezone %r -> %r (gleiche Umrechnung, nur Metadatum)",
-                     out.name, old_tz, SOURCE_TZ_META[mode])
-            continue
-        moved = None
-        if st == "stale_shifted":
-            # SOFORT aus dem Store nehmen (nicht erst nach erfolgreichem Neubau):
-            # scheitert der Neubau, sieht der Bot eine Luecke statt eines
-            # verschobenen Monats
-            moved = retire_stale_store_file(data_root, out)
-        log.warning("%s: source_timezone %r statt %r (andere Umrechnung%s) - %s", out.name,
-                    old_tz, SOURCE_TZ_META[mode],
-                    ", UTC-Zeiten verschoben" if moved else ", in diesem Monat gleiche UTC-Zeiten",
-                    (f"aus dem Store genommen ({moved}); " if moved else "bleibt bis zum Neubau; ")
-                    + ("wird aus dem Roh-Cache neu gebaut" if ym in in_range else
-                       "ausserhalb von --start/--end, nicht neu gebaut"))
-        if ym in in_range:
-            stale_tz[ym] = old_tz
-        else:
-            stale_out[_ymstr(ym)] = {"source_timezone": old_tz,
-                                     "retired_to": str(moved) if moved else None}
+    # verschobene Altdateien nie im Store lassen. only_padding: zweiter Durchgang
+    # am Laufende (Rohmonat M+1 evtl. erst in diesem Lauf geladen)
+    def scan_store(only_padding: bool = False) -> None:
+        for ym, out in _store_months(data_root, sym, mode):
+            if stored_mode(out) != PARQUET_MODE[mode]:
+                continue                           # store_mode_conflict, unten bzw. nicht unsere Datei
+            st, old_tz = classify_store_file(out, mode, ym)
+            if st == "current" or (only_padding and st != "recheck_padding"):
+                continue
+            if st == "recheck_padding":
+                nu = ctx.unit(_ym_add(ym, 1))
+                if not nu.path(data_root).exists() and ctx.state(nu)[0] != "empty":
+                    continue                       # Rohmonat M+1 noch nicht da: spaeter nachpruefen
+            if st in ("recheck", "recheck_padding"):
+                # gleiche Umrechnung: aus dem Roh-Cache neu pruefen (kein Download)
+                try:
+                    pad = ctx.reverify(ym)
+                except Quarantined as q:
+                    moved = retire_stale_store_file(data_root, out)
+                    retired_recheck[_ymstr(ym)] = {"reason": q.reason, "retired_to": str(moved)}
+                    log.error("%s: Nachpruefung (%s) durchgefallen - aus dem Store genommen (%s): %s",
+                              out.name, st, moved, q.reason)
+                    if ym in in_range:
+                        stale_tz[ym] = old_tz
+                    continue
+                if pad is None:
+                    if st == "recheck":
+                        unverified.append(ym)
+                        log.warning("%s: aeltere Pruefversion (%r), Roh-Cache fehlt - nicht nachgeprueft, "
+                                    "Datei bleibt", out.name, old_tz)
+                    continue
+                if st == "recheck_padding" and not pad:
+                    continue
+                relabel_store_file(out, mode, pad)
+                relabelled.append(ym)
+                log.info("%s: nachgeprueft (%s) und bestanden -> source_timezone %r, tz_right_padding=%s",
+                         out.name, st, SOURCE_TZ_META[mode], pad)
+                continue
+            moved = None
+            if st == "stale_shifted":
+                # SOFORT aus dem Store nehmen (nicht erst nach erfolgreichem Neubau):
+                # scheitert der Neubau, sieht der Bot eine Luecke statt eines
+                # verschobenen Monats
+                moved = retire_stale_store_file(data_root, out)
+            log.warning("%s: source_timezone %r statt %r (andere Umrechnung%s) - %s", out.name,
+                        old_tz, SOURCE_TZ_META[mode],
+                        ", UTC-Zeiten verschoben" if moved else ", in diesem Monat gleiche UTC-Zeiten",
+                        (f"aus dem Store genommen ({moved}); " if moved else "bleibt bis zum Neubau; ")
+                        + ("wird aus dem Roh-Cache neu gebaut" if ym in in_range else
+                           "ausserhalb von --start/--end, nicht neu gebaut"))
+            if ym in in_range:
+                stale_tz[ym] = old_tz
+            else:
+                stale_out[_ymstr(ym)] = {"source_timezone": old_tz,
+                                         "retired_to": str(moved) if moved else None}
+
+
+    scan_store()
 
     for ym in dk.months(start, end):
         if not _month_closed(ctx.now(), ym, mode):
@@ -1843,7 +2001,7 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
             return
         out = store_path(data_root, sym, *ym, mode)
         rep["file"] = str(out.relative_to(data_root))
-        write_parquet(out, df, mode)
+        write_parquet(out, df, mode, right_padding=stats.get("tz_right_padding", True))
         dk.write_json_atomic(report_path(data_root, sym, *ym, mode), rep)
         written.append(ym)
         log.info("%-15s %6d Bars  gekreuzt=%-3d spread_median=%g  mode=%s", label, rep["rows"],
@@ -1895,6 +2053,8 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
                                 outcomes.pop(u, None)
                     continue
                 break
+        if not client.halted:
+            scan_store(only_padding=True)
     except rl.RateLimitExhausted as e:
         state["status"] = "rate_limited"
         state["error"] = f"429-Wartebudget erschoepft: {e}"
@@ -1905,7 +2065,8 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
     finally:
         rep = _run_report(ctx, start, end, started, todo, outcomes, written, validation_errors,
                           quarantine, pending, unavailable, missing, conflicts, skipped_existing,
-                          state, reported_gaps, rebuild, stale_tz, stale_out, relabelled)
+                          state, reported_gaps, rebuild, stale_tz, stale_out, relabelled,
+                          retired_recheck, unverified)
         dk.write_json_atomic(run_report_path(data_root, sym, mode), rep)
         log.info("FERTIG %s: status=%s exit=%d, %d Monate geschrieben, %d Requests (Report %s)", sym,
                  rep["status"], rep["exit_code"], len(written), client.requests,
@@ -1915,7 +2076,8 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
 
 def _run_report(ctx, start, end, started, todo, outcomes, written, validation_errors, quarantine,
                 pending, unavailable, missing, conflicts, skipped_existing, state, reported_gaps,
-                rebuild, stale_tz=None, stale_out=None, relabelled=None) -> dict:
+                rebuild, stale_tz=None, stale_out=None, relabelled=None, retired_recheck=None,
+                unverified=None) -> dict:
     stale_tz, stale_out, relabelled = stale_tz or {}, stale_out or {}, relabelled or []
     client = ctx.client
     manual = [{"month": _ymstr(k), "kind": "quarantine", **{x: v[x] for x in ("reason", "path")}}
@@ -1994,8 +2156,14 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
         # dem Store genommen (retired_to), unverschobene bleiben bis zum Neubau
         "stale_retired_out_of_range": [k for k, v in sorted(stale_out.items()) if v["retired_to"]],
         "stale_out_of_range": stale_out,
-        # gleiche Umrechnung, nur source_timezone erneuert (kein Neubau, keine Requests)
+        # gleiche Umrechnung, aus dem Roh-Cache nachgeprueft und bestanden: nur
+        # Metadaten erneuert (kein Neubau, keine Requests)
         "relabelled_timezone": [_ymstr(k) for k in sorted(relabelled)],
+        # Nachpruefung (neue Pruefversion / rechter Nachbar jetzt da) durchgefallen:
+        # aus dem Store genommen, Quarantaene
+        "retired_after_recheck": retired_recheck or {},
+        # aeltere Pruefversion, Roh-Cache fehlt: Datei bleibt ungeprueft
+        "unverified_after_version_bump": [_ymstr(k) for k in sorted(unverified or [])],
         "started": started.isoformat(), "finished": dk.utc_now().isoformat(),
         "range": {"start": f"{start:%Y-%m}", "end": f"{end:%Y-%m}"},
         "options": {"pause": client.pause, "attempts": client.attempts,
@@ -2048,7 +2216,8 @@ def verify_month(symbol: str, ym: tuple[int, int], data_root: Path | None = None
     """
     Ein UTC-Monat: Rohmonate M-1 und M laden (max. 4 Requests, Cache wird
     genutzt), decodieren, Zeitzone pruefen, Bars bauen, validieren. Schreibt
-    nur den Verify-Report (kein Parquet). exit_code: 0 ok, 2 Validierung,
+    nur den Verify-Report (kein Parquet, keine Quarantaene-Marker; vorhandene
+    Marker werden nur ausgewertet). exit_code: 0 ok, 2 Validierung,
     3 Download/pending/429-Budget/Lock, 4 Zeitzone/Format (Quarantaene).
     """
     data_root = data_root or dk.default_data_root()
@@ -2062,7 +2231,8 @@ def verify_month(symbol: str, ym: tuple[int, int], data_root: Path | None = None
         return {"symbol": symbol, "month": _ymstr(ym), "status": "locked", "ok": False,
                 "exit_code": EXIT_GAPS}
     try:
-        ctx = Ctx(symbol, mode, data_root, Client(data_root, stop=stop, **client_kw), now)
+        ctx = Ctx(symbol, mode, data_root, Client(data_root, stop=stop, **client_kw), now,
+                  report_only=True)               # nur Bericht: keine Quarantaene-Marker schreiben/loeschen
         rep: dict = {"symbol": symbol, "month": _ymstr(ym), "source": SOURCE_BY_MODE[mode],
                      "mode": mode}
         out = store_path(data_root, symbol, *ym, mode)
@@ -2078,7 +2248,7 @@ def verify_month(symbol: str, ym: tuple[int, int], data_root: Path | None = None
                 if st != "current":
                     log.warning("VERIFY %s: Store-Datei %s hat source_timezone %r (%s) - der "
                                 "naechste normale Lauf %s", _ymstr(ym), out.name, old_tz, st,
-                                "erneuert nur das Metadatum" if st == "relabel" else
+                                "prueft sie aus dem Roh-Cache nach" if st.startswith("recheck") else
                                 "baut sie neu" + (" (vorher aus dem Store genommen)"
                                                   if st == "stale_shifted" else ""))
         try:

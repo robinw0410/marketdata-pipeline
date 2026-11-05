@@ -256,56 +256,50 @@ Time zone:
   hours in EST) and M; the raw months are computed from `RAW_TZ`. M is
   written only when both are present, or when M-1 is before the symbol's
   history or confirmed empty.
-- The time zone is **checked in code for every raw month**. Every market gap
-  gives a close anchor and an open anchor:
-  - weekend (gap of 24 h or more): close Friday 17:00 New York, open Sunday
-    18:00 for metals, 17:00 for EURUSD;
-  - for metals, the daily break (Mon–Thu, 17:00–18:00 New York): at most
-    one per day (the longest), only if its offset is unambiguous and within
-    3 h of the expected one. Thin markets such as silver have other gaps,
-    and those are ignored.
+- The time zone is **checked in code for every raw month** (check version 4).
+  Every market gap gives a close anchor and an open anchor:
+  - weekend (gap of 24 h or more, closing on Thursday/Friday and opening on
+    Sunday/Monday): close 17:00 New York, open 18:00 for metals, 17:00 for
+    EURUSD. Other gaps of 24 h or more are outages: reported, never anchors;
+  - for metals, the daily break (Mon–Thu, 17:00–18:00 New York): used only
+    if every break-like gap of that day gives the same unique deviation of
+    at most 1 h, so a random outage cannot replace the real break.
 
-  The last tick of the previous cached raw month and the first ticks of the
-  next one are added, so the weekend across the month edge is an anchor
-  too (EURUSD has no daily break and otherwise had no anchor there).
   Expected market times come from `zoneinfo` `America/New_York`. The
   expected offset is taken per anchor from `RAW_TZ[mode]` at that moment
   (tick: -4 h in EDT, -5 h in EST; m1: always -5 h). Decisions use the
   **deviation** = implied minus expected. A gap's deviation is estimated
-  from both sides together: the close may not lie before the last tick and
-  the open not after the first tick. This stays correct for thin data,
-  where the ticks are minutes away from 17:00/18:00. Ambiguous gaps do not
-  count. An anchor is **reliable** when its gap gives a unique deviation,
-  when the two sides of a weekend contradict each other, or when both
-  ticks sit within 2 minutes of the event while the market is active
-  around them.
-- The month passes only if all of these hold:
-  - at least 3 anchors
-  - median deviation 0
-  - at least 60 % of anchors with deviation 0
-  - no run of 3 consecutive gaps with the same non-zero deviation (that
-    means a shift in mid-month)
-  - **no reliable anchor with a deviation of exactly 1 h in the first or
-    last 72 h** of the raw month (a clock change at the month edge; holiday
-    early closes are off by 2 h or more and stay allowed)
-  - for zones with DST (tick): **no reliable anchor with any deviation
-    within 7 days of a New York clock change** (data stamped with another
-    DST rule, such as the EU rule or the US rule before 2007)
-  - no weekend across which the reliable deviation jumps by exactly 1 h
-  - no timestamp jumps back by 30 minutes or more in file order (that means
-    a clock change)
-- Tested on synthetic data for 2001–2026: correct New York stamping passes
-  every month; EU-rule and pre-2007-rule stamping never ends up in a
-  written UTC month (XAUUSD and EURUSD). Thin silver (about one tick per
-  20 minutes) passes every month and shifted stamping is never written.
-  Limit: EURUSD (weekend anchors only) at about one tick per 20 minutes
-  around the Sunday open can miss a shift that lasts one week; real EURUSD
-  ticks are dense. At about one tick per 50 minutes most months fail and
-  go to quarantine.
-- If the following raw month M+1 is cached and starts 1 h off, month M is
-  not written either: the switch probably happened after M's last anchor.
-  M+1 is fetched first whenever UTC month M+1 is due anyway, so this costs
-  no extra requests.
+  from both sides together: the close may not lie before the last tick (15
+  minutes tolerance for late ticks) and the open not after the first tick (5
+  minutes). This stays correct for thin data, where the ticks are minutes
+  away from 17:00/18:00. The ticks of the first/last 8 days of the cached
+  neighbouring raw months are added as context, so gaps across the month
+  edge count too.
+- **Hard failures** (quarantine) are only systematic or corroborated problems:
+  - median deviation not 0, or fewer than 60 % of unique anchors at 0
+  - **two or more independent gaps in a row with the same non-zero
+    deviation** and no zero in between (a stamping switch, e.g. a week with
+    the EU or pre-2007 US DST rule), at least one of them in this month;
+    context gaps from the neighbouring months count
+  - a timestamp jump back of 30 minutes or more in file order
+  - a local time that is ambiguous or does not exist
+- **Warnings only** (in the report, the month is written): a single
+  outlier such as a stray tick after the close or before the open, a feed
+  that stops at 16:00 or opens an hour late, a 17:15 close, a holiday early
+  close, an outage of 24 h or more during the week, an exact-hour outage,
+  and gaps whose sides contradict each other or are ambiguous.
+- **Run order.** A result computed without a neighbouring raw month that
+  should exist (closed, inside the history, not in the cache) is
+  *provisional*: it is neither cached nor saved as a marker; the next check
+  with the neighbour decides. A single deviating gap at the month edge with
+  no context behind it holds the month back until the neighbour is there.
+  For the newest month (raw M+1 not published yet) the file is written with
+  the parquet metadata `tz_right_padding=false`; once raw M+1 is in the
+  cache (at the start or the end of a later run), the file is re-checked
+  from the cache. If it passes, the flag is set; if not, the file is moved
+  to `metals/stale/` and the raw month is quarantined.
+- If a confirmed switch in raw month M+1 reaches back into month M (the run
+  includes a gap from M's context), month M is not written either.
 - A month with too few anchors, such as a short first month of the
   history, is checked together with its cached neighbouring raw months. If
   it still can't be checked, it goes to quarantine as "NICHT PRUEFBAR".
@@ -330,12 +324,16 @@ Time zone:
     `"accepted": true`) is kept, logged as ERROR and keeps blocking.
 - Monthly files carry the parquet metadata `source_timezone`, derived from
   `RAW_TZ` and the check version, e.g.
-  `America/New_York -> UTC, je Rohmonat geprueft (tz_check v3)`. At the start
+  `America/New_York -> UTC, je Rohmonat geprueft (tz_check v4)`. At the start
   of **every** run, all monthly files of the symbol and mode are checked,
   not only those in `--start`/`--end`:
-  - same conversion zone, old label only (e.g. m1 files of the previous
-    version): the metadata is rewritten, the file is never moved, no
-    requests (`relabelled_timezone` in the run report);
+  - same conversion zone but an older check version (e.g. m1 files of the
+    previous versions, tick files written by check v2/v3): the raw months
+    are re-checked from the cache, with no download. If they pass, only the
+    metadata is rewritten (`relabelled_timezone`). If they fail, the file
+    is moved to `metals/stale/` and quarantined (`retired_after_recheck`).
+    Without the raw cache the file stays and is listed under
+    `unverified_after_version_bump`;
   - different conversion that shifts UTC times in this month (tick months
     touching EDT, written by the fixed-UTC-5 code, 1 h off): the file is
     **moved to `metals/stale/` at once**, so the bot sees a gap rather than a
@@ -351,8 +349,9 @@ Time zone:
   lists the months written; `summary.months_stale_timezone_not_rebuilt` the
   ones whose rebuild failed. A shifted file has already left the store, so
   the bot sees a gap. A file that was not shifted stays in place, and the
-  next run retries. `--verify-month` reports the state of the month's file
-  (`store_file`) without changing it.
+  next run retries. `--verify-month` only reports: the state of the month's
+  file (`store_file`) and the check result. It neither changes the file nor
+  writes or deletes quarantine markers.
 
 Unpublished and missing data:
 
