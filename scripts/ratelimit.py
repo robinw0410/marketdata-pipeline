@@ -44,6 +44,8 @@ MIN_PAUSE_S = 900.0             # >= 15 min nach jedem 429
 MAX_TOTAL_WAIT_S = 6 * 3600.0   # Budget je Lauf, danach Exit 3
 CHUNK_S = 30.0                  # Schlafscheibe (Stop-Signal, fremde Sperren)
 MAX_RETRY_AFTER_S = 24 * 3600.0  # Deckel fuer Retry-After (Muell-Header sperrt nicht ewig)
+PROBE_TIMEOUT_S = 600.0         # Probe-Request ohne Rueckmeldung -> naechster darf proben
+PROBE_POLL_S = 1.0              # Abfrageintervall, solange eine Probe laeuft
 
 
 class RateLimitExhausted(Exception):
@@ -91,6 +93,8 @@ class RateLimitGate:
     `state_path` - von allen Prozessen auf dem Host.
 
     wait()  vor JEDEM Request aufrufen; True = weiter, False = Stop-Signal.
+            Nach einer Sperre laesst wait() genau EINEN Request durch (Probe).
+    release() nach jeder Antwort ohne 429 aufrufen (beendet die Probe).
             Wirft RateLimitExhausted, wenn das Budget nicht reicht.
     hit()   bei 429 aufrufen; setzt die Sperre, gibt die Pause zurueck.
     """
@@ -109,6 +113,12 @@ class RateLimitGate:
         self.last_retry_after: float | None = None
         self.exhausted: str | None = None     # gesetzt -> jedes wait() wirft sofort
         self._accountant: int | None = None   # Thread, der gerade Wartezeit zaehlt
+        # Nach einer Sperre darf genau EIN Request (Probe) los; die anderen
+        # warten, bis er ohne 429 zurueck ist (release) - sonst feuern alle
+        # Worker gleichzeitig und holen sich sofort die naechste Sperre.
+        self._probe_needed = False
+        self._prober: int | None = None
+        self._probe_since = 0.0
         self._load()
 
     # ------------------------------------------------------------ state ---
@@ -133,7 +143,10 @@ class RateLimitGate:
             v = float(json.loads(self.state_path.read_text())["blocked_until"])
         except (OSError, ValueError, KeyError, TypeError):
             return float("-inf")          # kaputter Zustand blockiert nicht ewig
-        return v if math.isfinite(v) else float("-inf")
+        if not math.isfinite(v):
+            return float("-inf")
+        # Zustand aus der Zukunft (Uhrsprung, Muell) sperrt hoechstens MAX_RETRY_AFTER_S
+        return min(v, self.wall() + MAX_RETRY_AFTER_S)
 
     def _load(self) -> None:
         with self._flock():
@@ -168,6 +181,7 @@ class RateLimitGate:
                 self.blocked_until = until
             self.hits += 1
             self.last_retry_after = retry_after
+            self._probe_needed, self._prober = True, None
             self._persist(retry_after, url)
         log.warning("HTTP 429 (Rate-Limit pro IP): Pause %.0f min fuer alle Requests%s (%s)",
                     pause / 60, f", Retry-After {retry_after:.0f}s" if retry_after else "", url)
@@ -196,26 +210,41 @@ class RateLimitGate:
                         self.blocked_until = max(self.blocked_until, self._read_state())
                     rem = self.blocked_until - self.wall()
                     if rem <= 0:
-                        return True
-                    if self.waited + rem > self.max_total_wait + 1e-9:
+                        if not self._probe_needed:
+                            return True
+                        if self._prober in (None, me) or \
+                                self.wall() - self._probe_since > PROBE_TIMEOUT_S:
+                            self._prober, self._probe_since = me, self.wall()
+                            return True            # dieser Request ist die Probe
+                        step = min(PROBE_POLL_S, self.chunk)   # zaehlt nicht zum Budget
+                    elif self.waited + rem > self.max_total_wait + 1e-9:
                         self.exhausted = (
                             f"429-Sperre noch {rem / 60:.0f} min, Wartebudget "
                             f"{self.max_total_wait / 3600:.1f} h (bereits {self.waited / 60:.0f} min "
                             "gewartet) reicht nicht")
                         raise RateLimitExhausted(self.exhausted, rem)
-                    step = min(rem, self.chunk)
-                    # Budget = Wartezeit des Laufs: nur EIN wartender Thread zaehlt
-                    # (sonst verbrauchen N Worker das Budget N-mal so schnell)
-                    if self._accountant is None:
-                        self._accountant = me
-                    if self._accountant == me:
-                        self.waited += step
+                    else:
+                        self._probe_needed = True   # auch Sperre eines anderen Prozesses
+                        step = min(rem, self.chunk)
+                        # Budget = Wartezeit des Laufs: nur EIN wartender Thread zaehlt
+                        # (sonst verbrauchen N Worker das Budget N-mal so schnell)
+                        if self._accountant is None:
+                            self._accountant = me
+                        if self._accountant == me:
+                            self.waited += step
                 if not self._sleep_chunk(step):
                     return False
         finally:
             with self.lock:
                 if self._accountant == me:
                     self._accountant = None
+
+    def release(self) -> None:
+        """Nach JEDER Antwort ohne 429 (auch Netzfehler) aufrufen: war das die
+        Probe nach einer Sperre, duerfen jetzt alle wieder."""
+        with self.lock:
+            if self._prober == threading.get_ident():
+                self._probe_needed, self._prober = False, None
 
     def summary(self) -> dict:
         return {"hits_429": self.hits, "waited_s": round(self.waited, 1),

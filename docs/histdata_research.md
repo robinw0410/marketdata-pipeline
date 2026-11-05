@@ -76,7 +76,7 @@ Daraus: `ts_utc = roh + 5 h`, ohne Sommerzeitlogik. Folge: UTC-Monat M = Rohmona
 Hypothese (unbewiesen): Die Rohzeit folgt zumindest zeitweise einer Uhr mit Sommerzeit (New York oder Europa minus fester Abstand), nicht durchgehend UTC-5. Wenn das stimmt, würden Sommermonate im Code-Check **durchfallen**.
 
 **Umsetzung: Prüfung je Rohmonat im Code** (`check_timezone`):
-- Ankerpunkte aus den Daten: Wochenschluss (letzter Tick vor Lücke ≥ 24 h, erwartet Freitag 17:00 New York), Wochenstart (erster Tick danach, erwartet 18:00 Metalle / 17:00 EURUSD), bei Metallen zusätzlich Tagespause Mo-Do (Lücke 45 min bis 3 h, Beginn 17:00, Ende 18:00 New York). Erwartete Zeiten über `zoneinfo("America/New_York")`, also mit Sommerzeit.
+- Ankerpunkte aus den Daten: Wochenschluss (letzter Tick vor Lücke ≥ 24 h, erwartet Freitag 17:00 New York), Wochenstart (erster Tick danach, erwartet 18:00 Metalle / 17:00 EURUSD), bei Metallen zusätzlich Tagespause Mo-Do (Lücke 45 min bis 3 h, Beginn 17:00, Ende 18:00 New York). Als Tagespause zählen nur Lücken, deren Beginn höchstens 3 h vom erwarteten Pausenbeginn entfernt ist. Dünne Märkte wie Silber haben nachts weitere Lücken, und die würden sonst als Anker falsche Offsets liefern. Erwartete Zeiten über `zoneinfo("America/New_York")`, also mit Sommerzeit.
 - Je Anker der implizite Offset (Rohzeit minus UTC, auf ganze Stunden gerundet). Erwartet -5.
 - Bestanden nur, wenn alle Bedingungen gelten:
   - mindestens 3 Anker
@@ -84,8 +84,14 @@ Hypothese (unbewiesen): Die Rohzeit folgt zumindest zeitweise einer Uhr mit Somm
   - Anteil -5 mindestens 60 %
   - weniger als 3 aufeinanderfolgende Anker mit gleichem abweichendem Offset (sonst Regimewechsel mitten im Monat)
   - kein Rücksprung ≥ 30 min in Dateireihenfolge (sonst Uhrumstellung)
+  - kein Anker mit genau ±1 h Abweichung in den ersten oder letzten 72 h des Rohmonats. Grund: Eine Umstellung kurz vor Monatsende (z.B. EU-Umstellung am letzten Märzsonntag) erzeugt sonst nur 1-2 abweichende Anker und fiele durch Median, Anteil und Lauf. Feiertage weichen um ≥ 2 h ab und bleiben erlaubt.
+- Beginnt der gecachte Folge-Rohmonat schon mit ±1 h, wird auch der Monat davor nicht geschrieben (Umstellung nach dessen letztem Anker). M+1 wird zuerst geholt, wenn es ohnehin gebraucht wird.
+- Zu wenige Anker (z.B. kurzer erster Historienmonat): Prüfung gemeinsam mit gecachten Nachbar-Rohmonaten. Bleibt das Ergebnis unentscheidbar, folgt Quarantäne mit dem Grund "NICHT PRUEFBAR".
 - Feiertage und frühe Schlüsse sind einzelne Ausreißer und kippen das Ergebnis nicht.
 - Sonst **Quarantäne** (`<zip>.quarantine` mit vollem Prüfbericht, Exit 4). Die UTC-Monate, die diesen Rohmonat brauchen, werden nicht geschrieben. Es wird nie verschoben geschrieben.
+  - Freigeben nach manueller Prüfung: `"accepted": true` im Marker.
+  - Marker löschen: erneute Prüfung ohne Download.
+  - ZIP löschen: neuer Download; dabei wird der Marker entfernt.
 - Tests (synthetisch): fest EST besteht im Januar und Juli (XAUUSD, XAGUSD, EURUSD). New-York-Ortszeit mit DST fällt im Juli durch (Median -4). UTC-gestempelt fällt durch. Ein Wechsel mitten im Monat fällt durch, ebenso eine wiederholte Stunde. Ein Feiertag (früher Schluss) besteht.
 - Grenzen: Im Winter sind New-York-Ortszeit und EST identisch und nicht unterscheidbar (korrekt). EURUSD hat nur 2 Anker pro Woche (keine Tagespause). Eine Verschiebung, die kürzer als etwa 1,5 Wochen dauert, kann dort unentdeckt bleiben. Eine Rückstellung erkennt der Rücksprung-Check trotzdem.
 

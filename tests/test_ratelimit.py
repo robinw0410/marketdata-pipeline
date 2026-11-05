@@ -1,3 +1,4 @@
+import json
 import threading
 from datetime import datetime, timezone
 
@@ -149,3 +150,52 @@ def test_exhausted_is_sticky():
     with pytest.raises(rl.RateLimitExhausted):
         g.wait()                              # trotzdem: keine weiteren Requests im Lauf
     assert g.summary()["exhausted"]
+
+
+def test_persisted_block_from_far_future_is_clamped(tmp_path):
+    c = Clock()
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"blocked_until": c.t + 10 * 365 * 86400}))
+    g = rl.RateLimitGate(p, wall=c, sleep=c.sleep)
+    assert g.remaining() == pytest.approx(rl.MAX_RETRY_AFTER_S)
+
+
+def test_after_block_only_one_probe_request_until_release():
+    c = Clock()
+    g = rl.RateLimitGate(min_pause=900, wall=c, sleep=c.sleep)
+    g.hit()
+    assert g.wait() is True                    # Probe (dieser Thread)
+    passed = []
+
+    def other():
+        g2_ok = g.wait()
+        passed.append((g2_ok, c.t))
+
+    t = threading.Thread(target=other)
+    lock_sleep = threading.Event()
+
+    # anderer "Worker": darf erst nach release() durch
+    real_sleep = g._sleep
+
+    def sleep_until_release(s):
+        lock_sleep.wait(0.001)
+        real_sleep(s)
+
+    g._sleep = sleep_until_release
+    t.start()
+    t.join(0.2)
+    assert t.is_alive() and passed == []       # wartet auf die Probe
+    g.release()                                # Probe kam ohne 429 zurueck
+    t.join(5)
+    assert passed and passed[0][0] is True
+    assert g.waited == pytest.approx(900)      # Probe-Warten zaehlt nicht zum Budget
+
+
+def test_probe_429_sets_new_block_for_everyone():
+    c = Clock()
+    g = rl.RateLimitGate(min_pause=900, wall=c, sleep=c.sleep)
+    g.hit()
+    assert g.wait() is True
+    g.hit()                                    # Probe bekam wieder 429
+    t0 = c.t
+    assert g.wait() is True and c.t - t0 >= 900

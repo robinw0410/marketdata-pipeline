@@ -158,7 +158,11 @@ Fault tolerance and throttling:
   restart), **3** gaps: failed downloads, unconfirmed "no data", interrupted,
   circuit breaker or lock busy (restart later is fine), **4** manual check
   needed: quarantined file or `--verify-day` mismatch (no restart), **0**
-  complete.
+  complete. Exit 3 deliberately wins over 4: the units restart on 3 but not
+  on 4, so returning 4 while gaps remain would stop the backfill. A
+  quarantine is still hard to miss: the run report `status` reads e.g.
+  `gaps+quarantine`, a top-level `quarantined` list names the months, and
+  every run logs an ERROR line while it lasts.
 
 Store and validation:
 
@@ -216,12 +220,18 @@ Two modes (`--mode`):
   it is the only one that keeps the spread. Parquet metadata:
   `histdata_mode=histdata_tick`, `spread_available=true`.
 - **`m1`**: Generic ASCII 1-minute bars `YYYYMMDD HHMMSS;o;h;l;c;v`, **bid
-  only**. Past years come as one yearly ZIP, the current year monthly. The
-  store gets `ask_* = bid_*` (spread 0) and `tick_count = 1`, and the
-  metadata says `histdata_mode=histdata_m1`, `spread_available=false`. The
-  bot's cost model must supply the spread. Exact duplicate minutes are
-  dropped; conflicting duplicates (observed in real HistData M1 files) are
-  merged and counted in the monthly report.
+  only**. Past years come as one yearly ZIP, the current year monthly.
+  - It writes to its **own partition** `metals/source=histdata_m1/...`, so
+    bid-only months never mix with tick months; the bot reads only
+    `source=histdata` and `source=dukascopy`.
+  - The store gets `ask_* = bid_*` (spread 0) and `tick_count = 1`. The
+    metadata says `histdata_mode=histdata_m1`, `spread_available=false`, and
+    the bot's cost model must supply the spread.
+  - A monthly file whose `histdata_mode` differs from the current mode is
+    never overwritten, not even with `--rebuild` (`store_mode_conflict`,
+    exit 4).
+  - Exact duplicate minutes are dropped; conflicting duplicates (observed in
+    real HistData M1 files) are merged and counted in the monthly report.
 
 Time zone:
 
@@ -231,21 +241,41 @@ Time zone:
   is written only when both are present, or when M-1 is before the symbol's
   history or confirmed empty.
 - The claim is **checked in code for every raw month**. Anchor points are
-  taken from the data: weekly close (expected Friday 17:00 New York), weekly
-  open (expected Sunday 18:00 New York for metals, 17:00 for EURUSD) and, for
-  metals, the daily break (17:00–18:00 New York, Mon–Thu). Expected times
-  come from `zoneinfo` `America/New_York`, so they include DST. Each anchor
-  gives an implied UTC offset.
+  taken from the data:
+  - weekly close (expected Friday 17:00 New York);
+  - weekly open (expected Sunday 18:00 New York for metals, 17:00 for
+    EURUSD);
+  - for metals, the daily break (17:00–18:00 New York, Mon–Thu). Only gaps
+    starting within 3 h of the expected break count; thin markets such as
+    silver have other night-time gaps, and those are ignored.
+
+  Expected times come from `zoneinfo` `America/New_York`, so they include
+  DST. Each anchor gives an implied UTC offset.
 - The month passes only if all of these hold:
   - at least 3 anchors
   - median offset -5 h
   - at least 60 % of anchors at -5 h
   - no run of 3 consecutive anchors with the same other offset (that means a
     shift in mid-month)
+  - **no anchor off by exactly 1 h in the first or last 72 h** of the raw
+    month (a clock change at the month edge; holiday early closes are off by
+    2 h or more and stay allowed)
   - no timestamp jumps back by 30 minutes or more in file order (that means
     a clock change)
+- If the following raw month M+1 is cached and starts 1 h off, month M is
+  not written either: the switch probably happened after M's last anchor.
+  M+1 is fetched first whenever UTC month M+1 is due anyway, so this costs
+  no extra requests.
+- A month with too few anchors, such as a short first month of the
+  history, is checked together with its cached neighbouring raw months. If
+  it still can't be checked, it goes to quarantine as "NICHT PRUEFBAR".
 - Otherwise the raw month goes to **quarantine** (`<zip>.quarantine` with the
   full check, exit 4). Nothing shifted is ever written.
+  - Deleting the marker re-checks the month without a download.
+  - Deleting the ZIP downloads it again; the new download removes the
+    marker and the month is checked again.
+  - Setting `"accepted": true` in the marker releases the month after a
+    manual check.
 - **Third-party data suggests the claim may not hold in summer**: one-hour
   regressions in late October and an August archive whose Sunday open is one
   hour late (see the research doc). Run `--verify-month` on a winter and a
@@ -258,22 +288,41 @@ Unpublished and missing data:
 - An empty answer within 45 days of month end is **pending** (exit 3). It is
   checked again at most every 24 h.
 - An older empty answer is "no data". It is unconfirmed (exit 3) until a
-  check at least 24 h later is empty again. Confirmed months are listed under
-  `months_unavailable` and do not cause exit 3.
-- Months before the symbol's history (XAUUSD 2009-03, XAGUSD 2009-05, EURUSD
-  2000-05: these are the M1 start dates; tick start dates are unverified)
-  need no request.
+  check at least 24 h later is empty again.
+- A confirmed empty month **before the first month that has data** (tick
+  history starting later than M1) is listed under `months_unavailable` and
+  does not cause exit 3 or 4.
+- A confirmed empty month **inside the known history** is suspicious. That
+  means any month after the first month with data, or any month at all if
+  the symbol has never returned data. Such a month is listed under
+  `months_missing_in_history` and gives exit 4 when nothing else is open.
+  It is checked again every 30 days, or at once with `--rebuild`. After a
+  manual check, `"accepted": true` in its `<zip>.empty` marker turns it
+  into "unavailable".
+- Three empty answers in a row inside the known history stop the run
+  (`status: aborted`, exit 3). This usually means a token, WAF or server
+  problem, not missing data.
+- Months before the symbol's history need no request. The history starts
+  used are XAUUSD 2009-03, XAGUSD 2009-05 and EURUSD 2000-05; these are the
+  M1 start dates, and the tick start dates are unverified.
 
 HTTP and errors:
 
 - `--pause` (5 s) is the minimum gap between two requests.
-- 5xx, timeouts, connection errors, 403 and non-ZIP answers each count as a
+- 5xx, timeouts, connection errors, 403 and truncated ZIPs each count as a
   failed attempt (`--attempts` 5). Each one sets an escalating cooldown of
   `--backoff-base` (10 s) × 2^k, capped at `--max-backoff` (600 s). After
   `--max-consecutive-failures` (10) failures in a row the run stops (exit 3).
-- An HTML or text answer (error page, captcha, WAF) is a failure with a text
-  excerpt in the report, never data.
-- A corrupt cached ZIP (bad ZIP, missing CSV) is moved aside as
+- **Permanent content errors** get one attempt per run and do not count
+  toward the circuit breaker. They are a page without the `file_down` form,
+  a form that does not match the request, an HTML or text answer instead of
+  a ZIP (error page, captcha, WAF), and a ZIP with a missing or wrong CSV.
+  - The file gets a `<zip>.failed` marker and is tried again after 24 h at
+    the earliest. Later months carry on.
+  - Content errors are listed under `content_errors` in the report (exit 3).
+  - Three of them in a row stop the run (`status: aborted`).
+  - Such an answer is never treated as data.
+- A corrupt cached ZIP (bad ZIP, CRC error) is moved aside as
   `<zip>.corrupt` and downloaded again.
 - **HTTP 429** goes through `scripts/ratelimit.py`:
   - `gate.wait()` runs before every request.
@@ -283,23 +332,26 @@ HTTP and errors:
     restarts and parallel symbols respect it.
   - A 429 does **not** use up an attempt, does not escalate the backoff and
     does not count toward the circuit breaker.
+  - A 429 on the POST restarts from the page GET after the pause, so the
+    form token is fresh.
   - Once `--max-rate-limit-wait` (21600 s) is used up, the run ends cleanly
     with exit 3 and a report.
 
-Resume, files and reports:
+Resume, files and reports (`SRC` = `histdata`, or `histdata_m1` in m1 mode):
 
 - Finished months and cached ZIPs are skipped and cost no requests.
 - `--rebuild` rebuilds months from the raw cache.
 - Raw cache:
   `metals/raw/source=histdata/symbol=SYM/mode={tick|m1}/HISTDATA_COM_ASCII_SYM_{T|M1}{period}.zip`.
 - Reports:
-  - `metals/reports/SYM-histdata-run.json`: always written, also on errors
-    and SIGTERM. It holds the summary, `gaps`, `pending`, `unconfirmed`,
-    `quarantine`, `validation_errors` and the gaps HistData reports in its
-    status `.txt` (`histdata_reported_gaps`).
-  - `SYM-histdata-1m-YYYY-MM.json` per month: `fetch_dukascopy.validate`
-    plus the time zone check of each raw month.
-  - `SYM-histdata-verify-YYYY-MM.json` from `--verify-month`.
+  - `metals/reports/SYM-SRC-run.json`: always written, also on errors and
+    SIGTERM. It holds the summary, `quarantined` at the top level, `gaps`,
+    `content_errors`, `pending`, `unconfirmed`, `quarantine`,
+    `validation_errors` and the gaps HistData reports in its status `.txt`
+    (`histdata_reported_gaps`).
+  - `SYM-SRC-1m-YYYY-MM.json` per month: `fetch_dukascopy.validate` plus the
+    time zone check of each raw month.
+  - `SYM-SRC-verify-YYYY-MM.json` from `--verify-month`.
 - Lock: `metals/.lock-histdata-SYM`, separate from the Dukascopy lock. If
   it is held, the run exits 3.
 - SIGTERM ends the run cleanly with a report and exit 3. Orphaned temp files
@@ -308,11 +360,19 @@ Resume, files and reports:
 Exit codes are the same as Dukascopy:
 
 - **2**: validation error.
-- **3**: gaps, pending months, unconfirmed "no data", 429 budget used up,
-  circuit breaker, SIGTERM or lock held. Restarting later is fine.
-- **4**: quarantine (time zone mismatch, unreadable format). Check by hand,
-  no restart.
+- **3**: gaps, content errors, pending months, unconfirmed "no data",
+  aborted run, 429 budget used up, circuit breaker, SIGTERM or lock held.
+  Restarting later is fine.
+- **4**: manual check needed. This covers quarantine (time zone mismatch,
+  not checkable, unreadable format), a confirmed empty month inside the
+  history, and a store mode conflict. No restart.
 - **0**: complete.
+
+Exit 3 deliberately wins over 4, for the same restart reason as above. The
+manual-check months are still visible: `status` reads e.g.
+`gaps+quarantine`, the `quarantined` list (month, kind, reason) sits at the
+top of the run report, and every run logs `MANUELLE PRUEFUNG NOETIG ...` as
+an ERROR.
 
 Request count: 2 requests per raw month in tick mode, so a full XAUUSD
 history (2009-03 to now, about 210 months) is about 420 requests, which is

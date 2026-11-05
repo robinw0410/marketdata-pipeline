@@ -171,6 +171,20 @@ Fehlertoleranz / Fortsetzen:
     4  manuelle Pruefung noetig: Quarantaene (bzw. --verify-day-Abweichung)
        -> kein Neustart (Units behandeln 4 wie 2)
     0  vollstaendig
+  3 geht BEWUSST vor 4: systemd startet bei 3 neu, bei 4 nicht; ein Exit 4
+  bei offenen Luecken wuerde den Backfill anhalten. Damit Quarantaene
+  trotzdem nicht untergeht: Laufreport status "<grund>+quarantine" (z.B.
+  gaps+quarantine), Liste "quarantined" (Monate) oben im Laufreport und
+  eine ERROR-Zeile "QUARANTAENE ..." in JEDEM Lauf, solange sie besteht.
+- --verify-day --candles-only: eine Seite da, Gegenseite unbestaetigt leer
+  -> Exit 3 (spaeter erneut). Ganztaegige Feiertage (25.12., 1.1.,
+  Karfreitag) wie Wochenende: keine Daten = sofort bestaetigt (Exit 4
+  "Handelstag waehlen"), Daten vorhanden = keine Mindest-Minutenzahl.
+- 429: nach Ablauf einer Sperre laesst die gemeinsame Sperre genau EINEN
+  Request durch (Probe); die anderen Worker warten, bis er ohne 429
+  zurueck ist (sonst feuern alle gleichzeitig und holen die naechste
+  Sperre). Ein persistierter Sperrzeitpunkt wird beim Lesen auf hoechstens
+  jetzt + 24 h begrenzt.
 
 Validierung: hart (Monat wird nicht geschrieben) bei Duplikaten, nicht
 monotoner Zeit, inkonsistentem Bid-/Ask-OHLC, Preisen <= 0, NaN,
@@ -189,32 +203,39 @@ abgeleitet) nicht weitergeben und nicht committen.
 Symbole:  XAUUSD, XAGUSD, EURUSD (1m, Bid- und Ask-OHLC)
 Stand:    noch nicht geladen (scripts/fetch_histdata.py)
 Quelle:   histdata.com, Generic ASCII; Default Ticks je Monat (--mode tick),
-          optional M1 nur Bid (--mode m1). Dukascopy liefert im Homelab
-          HTTP 429 je IP.
+          optional M1 nur Bid (--mode m1, EIGENE Partition). Dukascopy
+          liefert im Homelab HTTP 429 je IP.
 Format:   wie Dukascopy (Parquet/zstd, gleiche Spalten und dtypes), nur
-          Partition source=histdata
+          Partition source=histdata (Ticks) bzw. source=histdata_m1 (M1)
 Zeitzone: UTC; Rohzeit laut HistData fest UTC-5 (EST ohne Sommerzeit),
           JE ROHMONAT im Code geprueft (s. u.)
 Recherche, Quellen, Offenes: docs/histdata_research.md
 
-Store:
-    data/metals/source=histdata/symbol={SYM}/year={YYYY}/{SYM}-1m-{YYYY}-{MM}.parquet
-    data/metals/reports/{SYM}-histdata-1m-{YYYY}-{MM}.json   Validierungsreport je Monat
-                                                             (inkl. Zeitzonen-Pruefung je Rohmonat)
-    data/metals/reports/{SYM}-histdata-run.json              Laufreport (immer, auch bei Fehlern)
-    data/metals/reports/{SYM}-histdata-verify-{YYYY-MM}.json Ergebnis --verify-month
+Store (SRC = histdata im Tickmodus, histdata_m1 im M1-Modus):
+    data/metals/source={SRC}/symbol={SYM}/year={YYYY}/{SYM}-1m-{YYYY}-{MM}.parquet
+    data/metals/reports/{SYM}-{SRC}-1m-{YYYY}-{MM}.json   Validierungsreport je Monat
+                                                          (inkl. Zeitzonen-Pruefung je Rohmonat)
+    data/metals/reports/{SYM}-{SRC}-run.json              Laufreport (immer, auch bei Fehlern)
+    data/metals/reports/{SYM}-{SRC}-verify-{YYYY-MM}.json Ergebnis --verify-month
     data/metals/raw/source=histdata/symbol={SYM}/mode={tick|m1}/
-        HISTDATA_COM_ASCII_{SYM}_{T|M1}{YYYY[MM]}.zip         Roh-Cache (ZIP wie geladen)
-        <zip>.empty                  keine Daten (JSON: first_seen, last_checked, confirmed, checks)
-        <zip>[.YYYY-MM].quarantine   Zeitzone/Format passt nicht (JSON mit Pruefbericht);
-                                     loeschen = erneut pruefen, ZIP loeschen = neu laden
-        <zip>.corrupt                beiseitegelegtes kaputtes ZIP
+        HISTDATA_COM_ASCII_{SYM}_{T|M1}{YYYY[MM]}.zip      Roh-Cache (ZIP wie geladen)
+        <zip>.empty                keine Daten (JSON: first_seen, last_checked,
+                                   confirmed, confirmed_at, checks; "accepted": true
+                                   = Luecke in der Historie manuell akzeptiert)
+        <zip>[.YYYY-MM].quarantine Zeitzone/Format (JSON mit Pruefbericht):
+                                   loeschen = erneut pruefen (ohne Download);
+                                   "accepted": true = nach manueller Pruefung frei;
+                                   ZIP loeschen = neu laden, der Download entfernt
+                                   den Marker und es wird neu geprueft
+        <zip>.failed               dauerhafter Inhaltsfehler (JSON: error, count,
+                                   last_checked); naechster Versuch fruehestens 24 h
+        <zip>.corrupt              beiseitegelegtes kaputtes ZIP
     data/metals/state/histdata-ratelimit.json  429-Sperre (alle HistData-Prozesse)
     data/metals/.lock-histdata-{SYM}           Prozess-Lock je Symbol (unabhaengig von Dukascopy)
 
 Spalten: wie Dukascopy (ts UTC ms, Label links; bid_/ask_open/high/low/close
-float64; tick_count int64; bid_volume, ask_volume float64; source =
-"histdata"). Parquet-Metadaten: histdata_mode = histdata_tick|histdata_m1,
+float64; tick_count int64; bid_volume, ask_volume float64; source = SRC).
+Parquet-Metadaten: histdata_mode = histdata_tick|histdata_m1,
 spread_available = true|false, source_timezone.
 - tick: aus Ticks "YYYYMMDD HHMMSSmmm,bid,ask,volume" verdichtet
         (fetch_dukascopy.aggregate_1m, stabil sortiert: gleiche Zeitstempel
@@ -222,26 +243,40 @@ spread_available = true|false, source_timezone.
         Volumen: HistData liefert 0, bid_volume = ask_volume = 0.
 - m1:   "YYYYMMDD HHMMSS;o;h;l;c;v", NUR Bid -> ask_* = bid_*, Spread 0,
         tick_count = 1. Den Spread liefert das Kostenmodell des Bots.
-        Exakt doppelte Minuten verworfen, abweichende Doppelminuten
-        zusammengefasst (open erste, high max, low min, close letzte Zeile)
-        und gezaehlt (m1_conflicting_minutes_merged). Vergangene Jahre nur
+        Eigene Partition source=histdata_m1 (der Bot liest nur
+        source=histdata/dukascopy), damit Bid-only-Monate nie unter
+        Tick-Monate geraten. Eine vorhandene Monatsdatei mit anderem
+        histdata_mode wird nie ueberschrieben (auch nicht mit --rebuild):
+        store_mode_conflict, Exit 4. Exakt doppelte Minuten verworfen,
+        abweichende Doppelminuten zusammengefasst (open erste, high max,
+        low min, close letzte Zeile) und gezaehlt. Vergangene Jahre nur
         als Jahres-ZIP, laufendes Jahr monatlich.
 
 Zeitzone und Monatsgrenze:
 - ts_utc = roh + 5 h, keine Sommerzeitlogik. UTC-Monat M = letzte 5 h des
   Rohmonats M-1 + Rohmonat M ohne dessen letzte 5 h. Geschrieben wird M nur,
   wenn beide Rohmonate erledigt sind (Daten, bestaetigt leer oder vor
-  Historienbeginn); ist der Rohmonat M selbst bestaetigt leer, wird nichts
-  geschrieben (months_unavailable).
+  Historienbeginn).
 - Pruefung je Rohmonat (check_timezone): Ankerpunkte Wochenschluss
   (Fr 17:00 New York), Wochenstart (So 18:00 Metalle / 17:00 EURUSD),
-  Tagespause der Metalle Mo-Do (17:00-18:00 New York); erwartete Zeiten per
-  zoneinfo America/New_York (mit Sommerzeit). Impliziter Offset je Anker
-  (ganze Stunden). Bestanden nur bei: >= 3 Anker, Median -5 h, >= 60 % der
-  Anker bei -5 h, kein Lauf von 3 gleich abweichenden Ankern in Folge,
-  kein Ruecksprung >= 30 min in Dateireihenfolge. Sonst QUARANTAENE
-  (Exit 4), nichts verschoben geschrieben. Kleine Rueckspruenge (echte
-  Dateien haben Tausende, AIT) und einzelne Feiertage stoeren nicht.
+  Tagespause der Metalle Mo-Do (17:00-18:00 New York) - aber nur Luecken,
+  deren Beginn hoechstens 3 h vom erwarteten Pausenbeginn liegt (duenne
+  Maerkte wie Silber haben nachts weitere Luecken; die zaehlen nicht).
+  Erwartete Zeiten per zoneinfo America/New_York (mit Sommerzeit).
+  Impliziter Offset je Anker (ganze Stunden). Bestanden nur bei:
+    >= 3 Anker, Median -5 h, >= 60 % der Anker bei -5 h,
+    kein Lauf von 3 gleich abweichenden Ankern in Folge,
+    KEIN Anker mit genau +-1 h in den ersten/letzten 72 h des Rohmonats
+      (Uhrumstellung am Monatsrand, z.B. EU-Umstellung am letzten
+      Maerzsonntag; Feiertage weichen um >= 2 h ab und bleiben erlaubt),
+    kein Ruecksprung >= 30 min in Dateireihenfolge.
+  Zusaetzlich: beginnt der Folge-Rohmonat M+1 (im Cache; wird zuerst
+  geholt, wenn UTC-Monat M+1 ohnehin offen ist) mit 1 h Abweichung, wird
+  auch UTC-Monat M nicht geschrieben (Umstellung nach dem letzten Anker
+  von M). Zu wenige Anker (kurzer erster Historienmonat): Pruefung
+  gemeinsam mit gecachten Nachbar-Rohmonaten (joint_with im Report);
+  bleibt es unpruefbar -> Quarantaene "NICHT PRUEFBAR".
+  Sonst QUARANTAENE (Exit 4), nichts verschoben geschrieben.
 - Unverifiziert / Zweifel: Drittquellen sehen einstuendige Rueckspruenge
   Ende Oktober und einen August-Wochenstart eine Stunde zu spaet (passt zu
   Sommerzeit). Vor dem ersten Volllauf --verify-month auf einen Winter- und
@@ -256,31 +291,50 @@ Verfuegbarkeit / "keine Daten":
     bis 45 Tage nach Monatsende -> pending (Exit 3), erneute Pruefung
                                    fruehestens nach 24 h, nie bestaetigt
     danach                      -> unbestaetigt (Exit 3), bestaetigt, wenn
-                                   eine Pruefung >= 24 h spaeter wieder leer
-                                   ist -> months_unavailable, kein Exit 3
-- HTML/Text statt ZIP (Fehlerseite, Captcha, WAF), Seite ohne Formular
-  file_down: Fehlschlag mit Textausschnitt im Report, nie Daten.
-- Kaputtes Cache-ZIP (BadZipFile, CSV fehlt/falscher Name) -> <zip>.corrupt,
-  neu geladen. Unlesbare CSV (Spalten, Trenner, Zeitstempel) -> Quarantaene.
+                                   eine Pruefung >= 24 h spaeter wieder leer ist
+- Bestaetigt leer VOR dem ersten Monat mit Daten (Tick-Historie beginnt
+  spaeter als M1) -> months_unavailable, kein Exit 3/4.
+- Bestaetigt leer INNERHALB der Historie (nach dem ersten Monat mit Daten,
+  oder ueberhaupt noch nie Daten fuer das Symbol) -> verdaechtig:
+  months_missing_in_history, Exit 4 (wenn sonst keine Luecken), erneute
+  Pruefung alle 30 Tage bzw. sofort mit --rebuild. Nach manueller
+  Pruefung "accepted": true im .empty-Marker -> unavailable, Exit 0.
+- 3 leere Antworten in Folge innerhalb der Historie in EINEM Lauf ->
+  Lauf beendet (status aborted, Exit 3, Hinweis Token/WAF/Server).
+- Dauerhafte Inhaltsfehler (Seite ohne Formular file_down, Formular passt
+  nicht, HTML/Text statt ZIP, ZIP ohne/mit falscher CSV): EIN Versuch je
+  Lauf, kein Schutzschalter, Marker <zip>.failed, naechster Versuch
+  fruehestens nach 24 h; spaetere Monate laufen weiter (Report
+  content_errors, Exit 3). 3 Inhaltsfehler in Folge -> Lauf beendet
+  (status aborted).
+- Kaputtes Cache-ZIP (BadZipFile/CRC) -> <zip>.corrupt, neu geladen.
+  Unlesbare CSV (Spalten, Trenner, Zeitstempel) -> Quarantaene.
 
 Drosselung (ein Request zur Zeit, je Datei 2 Requests: Seite + POST):
 - --pause 5 s Mindestabstand, --attempts 5, Abkuehlung --backoff-base 10 s
   x 2^k (Deckel --max-backoff 600 s) bei 5xx/403/408/425/Timeout/
-  Verbindungsfehler/Nicht-ZIP, Schutzschalter nach
+  Verbindungsfehler/abgeschnittenem ZIP, Schutzschalter nach
   --max-consecutive-failures 10 Fehlschlaegen in Folge (Exit 3).
 - HTTP 429 ueber scripts/ratelimit.py: vor jedem Request gate.wait(); bei
   429 Pause fuer alle max(Retry-After, --rate-limit-pause) (Default 900 s,
   kleiner abgelehnt), persistiert in metals/state/histdata-ratelimit.json;
-  KEIN Versuch verbraucht, keine Eskalation, kein Schutzschalter. Nach
+  KEIN Versuch verbraucht, keine Eskalation, kein Schutzschalter. 429 auf
+  den POST: nach der Pause wieder ab Seiten-GET (frisches Token). Nach
   --max-rate-limit-wait (21600 s) Lauf sauber beendet (Exit 3, Report).
 - Requests: XAUUSD-Gesamthistorie im Tickmodus ca. 210 Monate x 2 = 420.
 
 Exit-Codes (Vorrang wie Dukascopy):
     2  Validierungsfehler (fetch_dukascopy.validate) in mindestens einem Monat
-    3  Luecken, pending, unbestaetigt, 429-Budget erschoepft, Schutzschalter,
-       SIGTERM, Lock belegt -> spaeter erneut
-    4  Quarantaene (Zeitzone passt nicht, Format unlesbar) -> manuell pruefen
+    3  Luecken, Inhaltsfehler, pending, unbestaetigt, Lauf abgebrochen
+       (leer/Inhaltsfehler in Folge), 429-Budget, Schutzschalter, SIGTERM,
+       Lock belegt -> spaeter erneut
+    4  manuelle Pruefung: Quarantaene (Zeitzone, Format, nicht pruefbar),
+       bestaetigt leerer Monat innerhalb der Historie, store_mode_conflict
     0  vollstaendig
+  3 geht BEWUSST vor 4 (systemd startet bei 3 neu, bei 4 nicht; sonst
+  stoppt der Backfill). Sichtbar bleibt die manuelle Pruefung trotzdem:
+  status "<grund>+quarantine", Liste "quarantined" (Monat, Art, Grund) oben
+  im Laufreport, ERROR-Zeile "MANUELLE PRUEFUNG NOETIG ..." in jedem Lauf.
 
 Pruefen auf dem LXC (max. 4 Requests, schreibt nur den Verify-Report):
     runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \

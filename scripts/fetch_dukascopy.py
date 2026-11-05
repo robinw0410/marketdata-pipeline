@@ -401,13 +401,13 @@ def month_files(symbol: str, mode: str, y: int, m: int) -> list[RawFile]:
 
 def needs_confirmation(f: RawFile, kind: str) -> bool:
     """
-    "Keine Daten" an einem Werktag (Mo-Fr des Datentags, ausser 25.12. und
-    1.1.) ist verdaechtig (Drosselung, noch nicht erzeugt) und muss in einem
-    spaeteren Request bestaetigt werden. Tickmodus: nur 404 (leere Stunden
-    sind werktags normal, z.B. Tagespause).
+    "Keine Daten" an einem Werktag (Mo-Fr des Datentags, ausser ganztaegigen
+    Feiertagen 25.12., 1.1., Karfreitag) ist verdaechtig (Drosselung, noch
+    nicht erzeugt) und muss in einem spaeteren Request bestaetigt werden.
+    Tickmodus: nur 404 (leere Stunden sind werktags normal, z.B. Tagespause).
     """
     d = f.t.date()
-    if d.weekday() >= 5 or (d.month, d.day) in ((12, 25), (1, 1)):
+    if d.weekday() >= 5 or full_holiday(d):
         return False
     return f.kind == "candles" or kind == "404"
 
@@ -638,6 +638,8 @@ def download_bi5(url: str, *, attempts: int = ATTEMPTS, backoff_base: float = BA
             r = get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
         except requests.RequestException as e:
             err, status, overload = f"{type(e).__name__}: {e}", None, True
+            if gate is not None:
+                gate.release()          # Antwort ohne 429: Probe nach Sperre beendet
             if on_response:
                 on_response(None)
         else:
@@ -652,6 +654,10 @@ def download_bi5(url: str, *, attempts: int = ATTEMPTS, backoff_base: float = BA
                 log.info("429 %s: gleiche Datei nach %.0f min Pause erneut (Versuch %d/%d "
                          "nicht verbraucht)", url, pause / 60, n + 1, attempts)
                 continue
+            if gate is not None:
+                # nach einer Sperre laesst gate.wait() nur EINEN Worker durch
+                # (Probe); kommt die ohne 429 zurueck, duerfen alle wieder
+                gate.release()
             if status == 404:
                 if throttle is not None:
                     throttle.success()
@@ -1655,6 +1661,11 @@ def _run_report(symbol, mode, start, end, started, data_root, fetcher, months_to
         f for ym in months_todo for f in files_by_month[ym]
         if f not in gaps and f not in unconfirmed
         and fetcher.state(f)[0] in ("missing", "recheck")]
+    # Vorrang 3 vor 4 BEWUSST: die systemd-Units starten bei 3 neu, bei 4
+    # nicht - ein Exit 4 bei offenen Luecken wuerde den Backfill anhalten.
+    # Damit die Quarantaene trotzdem nicht untergeht: status "...+quarantine",
+    # Liste "quarantined" oben im Report und eine ERROR-Zeile in JEDEM Lauf.
+    quarantined = sorted({ymstr(f.month) for f in quarantine})
     if state["status"] == "error":
         status, code = "error", 1
     elif validation_errors:
@@ -1667,6 +1678,11 @@ def _run_report(symbol, mode, start, end, started, data_root, fetcher, months_to
         status, code = "quarantine", EXIT_MANUAL
     else:
         status, code = "complete", EXIT_OK
+    if quarantined and code != EXIT_MANUAL:
+        status += "+quarantine"
+    if quarantined:
+        log.error("QUARANTAENE %s (%s): Monate %s - %d Datei(en), manuelle Pruefung noetig "
+                  "(Report: quarantine)", symbol, mode, ", ".join(quarantined), len(quarantine))
 
     hints = []
     n403 = fetcher.status_counts.get("403", 0)
@@ -1690,6 +1706,7 @@ def _run_report(symbol, mode, start, end, started, data_root, fetcher, months_to
 
     return {
         "symbol": symbol, "mode": mode, "status": status, "exit_code": code,
+        "quarantined": quarantined,
         "started": started.isoformat(), "finished": utc_now().isoformat(),
         "range": {"start": f"{start:%Y-%m}", "end": f"{end:%Y-%m}"},
         "options": options,
@@ -1825,8 +1842,28 @@ def verify_day(symbol: str, day: date, data_root: Path | None = None, today: dat
         lock.close()
 
 
+def _good_friday(y: int) -> date:
+    """Karfreitag (gregorianische Osterformel, Meeus/Jones/Butcher)."""
+    a, b, c = y % 19, y // 100, y % 100
+    d, e = b // 4, b % 4
+    g = (8 * b + 13) // 25
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = c // 4, c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month, day = divmod(h + l - 7 * m + 114, 31)
+    return date(y, month, day + 1) - timedelta(days=2)
+
+
+def full_holiday(d: datetime | date) -> bool:
+    """Ganztaegige Handelsfeiertage der Metalle: 25.12., 1.1., Karfreitag."""
+    dd = d.date() if isinstance(d, datetime) else d
+    return (dd.month, dd.day) in ((12, 25), (1, 1)) or dd == _good_friday(dd.year)
+
+
 def _is_trading_weekday(d: datetime) -> bool:
-    return d.weekday() < 5 and (d.month, d.day) not in ((12, 25), (1, 1))
+    """Mo-Fr ohne ganztaegige Feiertage (dort keine Mindest-Minutenzahl)."""
+    return d.weekday() < 5 and not full_holiday(d)
 
 
 def _day_checks(symbol: str, d0: datetime, bars: pd.DataFrame) -> tuple[dict, list[str], bool]:
@@ -1912,9 +1949,13 @@ def _verify_locked(symbol, day, d0, data_root, today, now, tol_points, max_share
         rep.update(st)
         info, problems, store_ok = _day_checks(symbol, d0, candle_bars)
         present = [s for s in SIDES if not sides[s].empty]
+        one_side_unconfirmed = False
         if len(present) == 1:
             problems.insert(0, f"Daten nur auf {present[0]}-Seite")
             store_ok = False
+            other = next(f for f in candle_files if f.side != present[0])
+            # fehlende Seite nur unbestaetigt leer -> Luecke (spaeter erneut), keine Abweichung
+            one_side_unconfirmed = outs[other].status == "unconfirmed"
         rep["plausibility"] = info
         rep["plausibility_problems"] = problems
         if candles_only:
@@ -1924,8 +1965,14 @@ def _verify_locked(symbol, day, d0, data_root, today, now, tol_points, max_share
                 rep.update(ok=False, status="no_data",
                            exit_code=EXIT_GAPS if unconf else EXIT_VERIFY,
                            note=("keine Daten an einem Werktag, unbestaetigt - spaeter erneut"
-                                 if unconf else "keine Daten an diesem Tag (Wochenende/"
+                                 if unconf else
+                                 "keine Daten: ganztaegiger Feiertag - Handelstag waehlen"
+                                 if full_holiday(d0) else "keine Daten an diesem Tag (Wochenende/"
                                  "Feiertag?) - Werktag waehlen"))
+            elif one_side_unconfirmed:
+                rep.update(ok=False, status="one_side_unconfirmed", exit_code=EXIT_GAPS,
+                           note=f"nur {present[0]}-Seite, Gegenseite unbestaetigt leer - "
+                                "spaeter erneut (>= 24 h)")
             else:
                 rep["ok"] = not problems
                 rep["status"] = "ok" if rep["ok"] else "implausible"

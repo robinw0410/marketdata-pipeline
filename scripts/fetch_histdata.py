@@ -11,11 +11,14 @@ Partition source=histdata.
 - Modus "tick" (Default): Generic-ASCII-Ticks je Monat
   ("YYYYMMDD HHMMSSmmm,bid,ask,volume"), selbst zu 1m-Bid/Ask-OHLC verdichtet
   (fetch_dukascopy.aggregate_1m), tick_count = echte Tickzahl. Spread bleibt
-  erhalten.
+  erhalten. Partition source=histdata.
 - Modus "m1": Generic-ASCII-Minutenbars ("YYYYMMDD HHMMSS;o;h;l;c;v"), NUR
   Bid. ask_* = bid_* (Spread 0), tick_count = 1; Parquet-Metadatum
   spread_available = false - den Spread liefert dann das Kostenmodell des
-  Bots. Vergangene Jahre gibt es nur als Jahres-ZIP, das laufende Jahr monatlich.
+  Bots. EIGENE Partition source=histdata_m1 (der Bot liest nur
+  source=histdata/dukascopy), damit Bid-only-Monate nie mit Tick-Monaten
+  gemischt werden. Vergangene Jahre nur als Jahres-ZIP, laufendes Jahr monatlich.
+  Eine vorhandene Monatsdatei mit anderem histdata_mode wird nie ueberschrieben.
 
 Download (keine offizielle API; Ablauf wie PyPI histdata 1.1, histdatacom,
 histdata-fetcher, s. docs/histdata_research.md): GET der Periodenseite
@@ -24,7 +27,8 @@ histdata-fetcher, s. docs/histdata_research.md): GET der Periodenseite
 -> verstecktes Formular id="file_down" (tk, date, datemonth, platform,
 timeframe, fxpair) -> POST https://www.histdata.com/get.php mit Referer =
 Periodenseite -> ZIP (CSV + Status-.txt mit Lueckenliste). Leerer Body =
-keine Daten. Je Datei 2 Requests, immer nur einer gleichzeitig.
+keine Daten. Je Datei 2 Requests, immer nur einer gleichzeitig. 429 auf den
+POST -> nach der Pause wieder ab dem Seiten-GET (frisches Token).
 
 Zeitzone: laut HistData "EST WITHOUT Day Light Savings", also fest UTC-5:
 ts_utc = roh + 5 h, OHNE Sommerzeitlogik. Folge: UTC-Monat M braucht die
@@ -33,32 +37,52 @@ wenn beide da sind (oder M-1 vor Historienbeginn bzw. bestaetigt leer ist).
 Die Angabe wird JE ROHMONAT aus den Daten geprueft (check_timezone):
 Wochenschluss Freitag 17:00 New York, Wochenstart Sonntag 18:00 (Metalle)
 bzw. 17:00 (EURUSD), bei Metallen zusaetzlich die Tagespause 17:00-18:00
-New York (zoneinfo America/New_York). Daraus der implizite UTC-Offset je
-Ankerpunkt; Median, Anteil und Laengster-Abweichungs-Lauf muessen zu fest -5 h
-passen, und kein Zeitstempel darf in Dateireihenfolge um >= 30 min
-zurueckspringen (Uhrumstellung). Sonst QUARANTAENE (Exit 4), es wird nichts
+New York (zoneinfo America/New_York; nur Luecken, die hoechstens 3 h vom
+erwarteten Pausenbeginn entfernt liegen - duenne Maerkte haben nachts
+weitere Luecken). Daraus der implizite UTC-Offset je Ankerpunkt; Median,
+Anteil und Laengster-Abweichungs-Lauf muessen zu fest -5 h passen, in den
+ersten/letzten 72 h des Rohmonats darf KEIN Anker um genau 1 h abweichen
+(Uhrumstellung am Monatsrand), und kein Zeitstempel darf in
+Dateireihenfolge um >= 30 min zurueckspringen. Zu wenige Anker -> gemeinsam
+mit dem Nachbar-Rohmonat pruefen. Beginnt der (gecachte) Folge-Rohmonat
+bereits mit 1 h Abweichung, wird auch Monat M nicht geschrieben (Umstellung
+nach dem letzten Anker von M). Sonst QUARANTAENE (Exit 4), es wird nichts
 verschoben geschrieben.
 
-Ablage (DATA_ROOT = $MARKETDATA_DATA_ROOT, sonst <repo>/data):
-    metals/source=histdata/symbol={SYM}/year={YYYY}/{SYM}-1m-{YYYY}-{MM}.parquet
+Ablage (DATA_ROOT = $MARKETDATA_DATA_ROOT, sonst <repo>/data), SRC =
+histdata (tick) bzw. histdata_m1 (m1):
+    metals/source={SRC}/symbol={SYM}/year={YYYY}/{SYM}-1m-{YYYY}-{MM}.parquet
     metals/raw/source=histdata/symbol={SYM}/mode={tick|m1}/HISTDATA_COM_ASCII_{SYM}_{T|M1}{YYYY[MM]}.zip
-        Roh-Cache; daneben Marker <zip>.empty (JSON: keine Daten, first_seen,
-        last_checked, confirmed), <zip>[.YYYY-MM].quarantine (JSON: Zeitzone/
-        Format; loeschen = erneut pruefen), <zip>.corrupt (beiseitegelegt)
-    metals/reports/{SYM}-histdata-1m-{YYYY}-{MM}.json   Validierungsreport je Monat
-    metals/reports/{SYM}-histdata-run.json              Laufreport (immer)
-    metals/reports/{SYM}-histdata-verify-{YYYY-MM}.json Ergebnis --verify-month
-    metals/state/histdata-ratelimit.json                429-Sperre (alle Prozesse)
-    metals/.lock-histdata-{SYM}                         Prozess-Lock je Symbol
+        Roh-Cache; daneben Marker (JSON):
+        <zip>.empty       keine Daten (first_seen, last_checked, confirmed,
+                          confirmed_at; "accepted": true = Luecke innerhalb der
+                          Historie nach manueller Pruefung akzeptiert)
+        <zip>[.YYYY-MM].quarantine  Zeitzone/Format; loeschen = erneut pruefen
+                          (ohne Download); "accepted": true = nach manueller
+                          Pruefung freigeben; ein neuer Download (ZIP loeschen)
+                          entfernt den Marker und prueft neu
+        <zip>.failed      dauerhafter Inhaltsfehler (kein Formular, HTML statt
+                          ZIP, falsche CSV); erneuter Versuch fruehestens 24 h spaeter
+        <zip>.corrupt     beiseitegelegtes kaputtes ZIP
+    metals/reports/{SYM}-{SRC}-1m-{YYYY}-{MM}.json   Validierungsreport je Monat
+    metals/reports/{SYM}-{SRC}-run.json              Laufreport (immer)
+    metals/reports/{SYM}-{SRC}-verify-{YYYY-MM}.json Ergebnis --verify-month
+    metals/state/histdata-ratelimit.json             429-Sperre (alle Prozesse)
+    metals/.lock-histdata-{SYM}                      Prozess-Lock je Symbol
 
 Exit-Codes (Vorrang in dieser Reihenfolge, wie fetch_dukascopy.py):
   2  Validierungsfehler (mindestens ein Monat; uebrige Monate liefen weiter)
-  3  Luecken: Download gescheitert, Monat noch nicht veroeffentlicht
-     (pending), unbestaetigte "keine Daten", 429-Wartebudget erschoepft,
-     Schutzschalter, SIGTERM, Symbol-Lock belegt -> spaeter erneut
-  4  manuelle Pruefung noetig: Quarantaene (Zeitzone passt nicht, Format
-     nicht lesbar)
+  3  Luecken: Download gescheitert, Inhaltsfehler (24 h zurueckgestellt),
+     Monat noch nicht veroeffentlicht (pending), unbestaetigte "keine
+     Daten", 3 leere Antworten in Folge innerhalb der Historie, 429-Budget
+     erschoepft, Schutzschalter, SIGTERM, Symbol-Lock belegt -> spaeter erneut
+  4  manuelle Pruefung noetig: Quarantaene (Zeitzone, Format), bestaetigt
+     leerer Monat INNERHALB der Historie, Monatsdatei mit anderem Modus
   0  vollstaendig
+  3 geht bewusst vor 4: die systemd-Units starten bei 3 neu, bei 4 nicht -
+  ein Exit 4 bei offenen Luecken wuerde den Backfill anhalten. Quarantaene
+  ist trotzdem nicht zu uebersehen: ERROR-Zeile in jedem Lauf, Laufreport
+  status "...+quarantine" und Liste "quarantined" auf oberster Ebene.
 
 Lizenz: HistData-Nutzungsbedingungen selbst pruefen. Daten (roh wie
 abgeleitet) nicht weitergeben und nicht committen (data/ ist git-ignored).
@@ -99,6 +123,7 @@ import fetch_dukascopy as dk
 import ratelimit as rl
 
 SOURCE = "histdata"
+SOURCE_BY_MODE = {"tick": "histdata", "m1": "histdata_m1"}   # Partition + Spalte source
 BASE = "https://www.histdata.com"
 PAGE_URL = BASE + "/download-free-forex-historical-data/?/ascii/{tf}/{pair}/{year}"
 GET_URL = BASE + "/get.php"
@@ -136,12 +161,18 @@ RETRY_STATUS = {403, 408, 425}   # + alle 5xx; 403 vermutlich WAF
 SETTLE_S = dk.SETTLE_S           # Rohmonatsende muss so lange her sein
 CONFIRM_AFTER_S = dk.CONFIRM_AFTER_S
 PUBLICATION_LAG_DAYS = 45        # bis dahin: leer = "noch nicht veroeffentlicht"
+CONTENT_RETRY_S = 24 * 3600      # dauerhafter Inhaltsfehler: erst danach erneut
+MAX_CONTENT_ERRORS_IN_ROW = 3    # so viele Inhaltsfehler in Folge -> Lauf beenden
+MAX_EMPTY_IN_ROW = 3             # so viele leere Antworten in Folge (in der Historie) -> Lauf beenden
+EMPTY_RECHECK_DAYS = 30          # bestaetigt leere Monate in der Historie danach erneut pruefen
 
 # ---- Zeitzonen-Pruefung -----------------------------------------------------
 TZ_EXPECTED_H = -5         # Rohzeit - UTC in Stunden
 TZ_MIN_ANCHORS = 3
 TZ_MIN_SHARE = 0.6         # Anteil der Ankerpunkte mit -5 h
 TZ_MAX_RUN = 3             # so viele aufeinanderfolgende gleich abweichende Anker = Regimewechsel
+TZ_EDGE_MS = 72 * HOUR_MS  # Monatsrand: hier ist schon EIN Anker mit +-1 h fatal
+TZ_BREAK_WINDOW_H = 3      # Tagespausen-Anker nur hoechstens so weit vom erwarteten Beginn
 REGRESSION_MAX_MS = 30 * MIN_MS  # Ruecksprung in Dateireihenfolge ab dem -> Uhrumstellung
 WEEKEND_GAP_MS = 24 * HOUR_MS
 BREAK_GAP_MS = (45 * MIN_MS, 3 * HOUR_MS)
@@ -159,11 +190,28 @@ class FormatError(Exception):
 
 
 class CorruptZip(Exception):
-    """Kaputtes ZIP (BadZipFile, CSV fehlt) -> beiseitelegen, neu laden."""
+    """Kaputtes ZIP (BadZipFile, CRC) -> beiseitelegen, neu laden."""
+
+
+class WrongContent(CorruptZip):
+    """ZIP ohne die erwartete CSV (fehlt, mehrere, falscher Name) - dauerhaft."""
 
 
 class ContentError(Exception):
-    """Antwort ist kein ZIP (HTML-Fehlerseite, Captcha, WAF) - nie Daten."""
+    """Antwort ist kein brauchbares ZIP (HTML-Fehlerseite, Captcha, WAF,
+    fehlendes/falsches Formular) - nie Daten, dauerhafter Fehler."""
+
+
+class ContentFailure(dk.DownloadError):
+    """Dauerhafter Inhaltsfehler einer Datei: 1 Versuch je Lauf, kein Schutzschalter."""
+
+
+class RetryableError(Exception):
+    pass
+
+
+class Restart(Exception):
+    """429 auf den POST: Token womoeglich abgelaufen -> ab Seiten-GET neu (kein Versuch)."""
 
 
 class Quarantined(Exception):
@@ -173,28 +221,28 @@ class Quarantined(Exception):
 
 
 # ------------------------------------------------------------------ pfade ---
-def store_dir(data_root: Path, symbol: str) -> Path:
-    return data_root / "metals" / f"source={SOURCE}" / f"symbol={symbol}"
+def store_dir(data_root: Path, symbol: str, mode: str = "tick") -> Path:
+    return data_root / "metals" / f"source={SOURCE_BY_MODE[mode]}" / f"symbol={symbol}"
 
 
-def store_path(data_root: Path, symbol: str, y: int, m: int) -> Path:
-    return store_dir(data_root, symbol) / f"year={y}" / f"{symbol}-1m-{y}-{m:02d}.parquet"
+def store_path(data_root: Path, symbol: str, y: int, m: int, mode: str = "tick") -> Path:
+    return store_dir(data_root, symbol, mode) / f"year={y}" / f"{symbol}-1m-{y}-{m:02d}.parquet"
 
 
 def raw_dir(data_root: Path, symbol: str, mode: str) -> Path:
     return data_root / "metals" / "raw" / f"source={SOURCE}" / f"symbol={symbol}" / f"mode={mode}"
 
 
-def report_path(data_root: Path, symbol: str, y: int, m: int) -> Path:
-    return dk.reports_dir(data_root) / f"{symbol}-histdata-1m-{y}-{m:02d}.json"
+def report_path(data_root: Path, symbol: str, y: int, m: int, mode: str = "tick") -> Path:
+    return dk.reports_dir(data_root) / f"{symbol}-{SOURCE_BY_MODE[mode]}-1m-{y}-{m:02d}.json"
 
 
-def run_report_path(data_root: Path, symbol: str) -> Path:
-    return dk.reports_dir(data_root) / f"{symbol}-histdata-run.json"
+def run_report_path(data_root: Path, symbol: str, mode: str = "tick") -> Path:
+    return dk.reports_dir(data_root) / f"{symbol}-{SOURCE_BY_MODE[mode]}-run.json"
 
 
-def verify_report_path(data_root: Path, symbol: str, y: int, m: int) -> Path:
-    return dk.reports_dir(data_root) / f"{symbol}-histdata-verify-{y}-{m:02d}.json"
+def verify_report_path(data_root: Path, symbol: str, y: int, m: int, mode: str = "tick") -> Path:
+    return dk.reports_dir(data_root) / f"{symbol}-{SOURCE_BY_MODE[mode]}-verify-{y}-{m:02d}.json"
 
 
 def lock_path(data_root: Path, symbol: str) -> Path:
@@ -217,6 +265,10 @@ def _naive_ms(y: int, m: int, d: int = 1) -> int:
 def raw_month_bounds_ms(ym: tuple[int, int]) -> tuple[int, int]:
     """Rohmonat [start, ende) in Rohzeit-ms (Ziffern wie in der Datei, als UTC gelesen)."""
     return _naive_ms(*ym), _naive_ms(*_ym_add(ym, 1))
+
+
+def raw_month_end_utc(ym: tuple[int, int]) -> datetime:
+    return datetime.fromtimestamp((raw_month_bounds_ms(ym)[1] + RAW_OFFSET_MS) / 1000, UTC)
 
 
 def before_history(symbol: str, ym: tuple[int, int]) -> bool:
@@ -252,8 +304,8 @@ class Unit:
         return f"{self.symbol} {self.mode} {self.period}"
 
     @property
-    def raw_months(self) -> list[tuple[int, int]]:
-        return [(self.year, self.month)] if self.month else [(self.year, k) for k in range(1, 13)]
+    def first_month(self) -> tuple[int, int]:
+        return self.year, self.month or 1
 
     def raw_bounds_ms(self) -> tuple[int, int]:
         if self.month:
@@ -313,15 +365,26 @@ def write_parquet(out: Path, df: pd.DataFrame, mode: str) -> None:
     dk._fsync_dir(out.parent)
 
 
+def stored_mode(path: Path) -> str | None:
+    """histdata_mode einer vorhandenen Monatsdatei (None: fehlt/unlesbar)."""
+    try:
+        meta = pq.read_schema(path).metadata or {}
+    except (OSError, pa.ArrowException):
+        return None
+    v = meta.get(b"histdata_mode")
+    return v.decode() if v else None
+
+
 def cleanup_orphans(data_root: Path, symbol: str) -> int:
-    """Verwaiste Temp-Dateien (.*.part) in Partition, Roh-Cache und eigenen Reports."""
+    """Verwaiste Temp-Dateien (.*.part) in Partitionen, Roh-Cache und eigenen Reports."""
     cands: list[Path] = []
-    for d in (store_dir(data_root, symbol), *(raw_dir(data_root, symbol, m) for m in MODES)):
+    for d in (*(store_dir(data_root, symbol, m) for m in MODES),
+              *(raw_dir(data_root, symbol, m) for m in MODES)):
         if d.exists():
             cands += list(d.rglob(".*.part"))
     rd = dk.reports_dir(data_root)
     if rd.exists():
-        cands += list(rd.glob(f".{symbol}-histdata-*.part"))
+        cands += list(rd.glob(f".{symbol}-histdata*-*.part"))
     for p in cands:
         p.unlink(missing_ok=True)
     if cands:
@@ -363,17 +426,14 @@ class _FormParser:
         return out
 
 
-class RetryableError(Exception):
-    pass
-
-
 class Client:
     """
     Ein Request zur Zeit (kein Worker-Pool): vor JEDEM Request gate.wait()
     (429-Sperre, persistiert), Throttle.wait() (eskalierende Abkuehlung nach
     5xx/Timeout/Verbindungsfehler/403) und Mindestabstand `pause`.
-    429: gate.hit(Retry-After) und erneut - kein Versuch verbraucht, keine
-    Eskalation, kein Schutzschalter.
+    429: gate.hit(Retry-After) - kein Versuch verbraucht, keine Eskalation,
+    kein Schutzschalter; beim POST danach wieder ab Seiten-GET (Token).
+    Dauerhafte Inhaltsfehler: EIN Versuch, ContentFailure, kein Schutzschalter.
     """
 
     def __init__(self, data_root: Path, *, pause: float = PAUSE_S, attempts: int = ATTEMPTS,
@@ -397,11 +457,12 @@ class Client:
         self.session = session
         self.requests = 0
         self.status_counts: Counter = Counter()
+        self.abort: str | None = None       # Lauf vorzeitig beenden (Grund)
         self._last = float("-inf")
 
     @property
     def halted(self) -> bool:
-        return self.stop.is_set() or self.throttle.tripped.is_set()
+        return self.stop.is_set() or self.throttle.tripped.is_set() or self.abort is not None
 
     def _session(self):
         if self.session is None:
@@ -410,7 +471,8 @@ class Client:
         return self.session
 
     def _request(self, method: str, url: str, **kw):
-        """Ein HTTP-Request; 429 wird hier (ohne Versuchsverbrauch) abgewartet."""
+        """Ein HTTP-Request; 429 wird hier abgewartet (GET: gleicher Request
+        erneut; POST: Restart, damit ein frisches Token geholt wird)."""
         while True:
             if self.halted:
                 raise dk.Interrupted(url)
@@ -425,6 +487,7 @@ class Client:
             try:
                 r = getattr(self._session(), method)(url, timeout=self.timeout, **kw)
             except requests.RequestException as e:
+                self.gate.release()
                 self._last = self.clock()
                 self.requests += 1
                 self.status_counts["netzfehler"] += 1
@@ -434,7 +497,10 @@ class Client:
             self.status_counts[str(r.status_code)] += 1
             if r.status_code == 429:
                 self.gate.hit(rl.parse_retry_after((r.headers or {}).get("Retry-After")), url)
+                if method == "post":
+                    raise Restart(url)
                 continue
+            self.gate.release()
             if r.status_code == 200:
                 return r
             if r.status_code in RETRY_STATUS or r.status_code >= 500:
@@ -443,8 +509,8 @@ class Client:
 
     def fetch(self, unit: Unit) -> bytes:
         """Periodenseite + POST. Rueckgabe: ZIP-Bytes (geprueft) oder b"" (keine Daten)."""
-        err = None
-        for n in range(self.attempts):
+        err, n = None, 0
+        while n < self.attempts:
             try:
                 page = self._request("get", unit.page_url())
                 fields = _FormParser.parse(page.text or "")
@@ -467,15 +533,27 @@ class Client:
                                            f"Fehlerseite/Captcha/WAF?): {head!r}")
                     try:
                         read_zip(blob, unit)
-                    except CorruptZip as e:
-                        raise ContentError(f"ZIP unbrauchbar: {e}")
+                    except WrongContent as e:
+                        raise ContentError(f"ZIP mit falschem Inhalt: {e}")
+                    except CorruptZip as e:          # abgeschnittene Uebertragung: wiederholbar
+                        raise RetryableError(f"ZIP defekt: {e}")
                 self.throttle.success()
                 return blob
-            except (RetryableError, ContentError) as e:
+            except Restart:
+                log.info("429 auf POST %s: nach der Pause neu ab Seiten-GET (frisches Token, "
+                         "kein Versuch verbraucht)", unit.key)
+                continue
+            except ContentError as e:
+                # dauerhaft: kein Wiederholen in diesem Lauf, kein Schutzschalter,
+                # nur eine kurze Abkuehlung (nicht eskalierend)
+                self.throttle.cooldown(self.throttle.base, str(e))
+                raise ContentFailure(f"{unit.key}: {e}", attempts=n + 1)
+            except RetryableError as e:
                 err = str(e)
+                n += 1
                 wait = self.throttle.failure(err)
-                if n + 1 < self.attempts:
-                    log.info("retry %d/%d nach %.0fs %s (%s)", n + 1, self.attempts - 1, wait,
+                if n < self.attempts:
+                    log.info("retry %d/%d nach %.0fs %s (%s)", n, self.attempts - 1, wait,
                              unit.key, err)
         raise dk.DownloadError(f"{unit.key}: {self.attempts} Versuche fehlgeschlagen ({err})",
                                attempts=self.attempts)
@@ -492,9 +570,9 @@ def read_zip(blob: bytes, unit: Unit) -> tuple[bytes, str | None]:
             names = [n for n in zf.namelist() if not n.endswith("/")]
             csvs = [n for n in names if n.lower().endswith(".csv")]
             if len(csvs) != 1:
-                raise CorruptZip(f"erwartet genau eine CSV, gefunden {names}")
+                raise WrongContent(f"erwartet genau eine CSV, gefunden {names}")
             if Path(csvs[0]).name.upper() != unit.member.upper():
-                raise CorruptZip(f"CSV {csvs[0]} statt {unit.member}")
+                raise WrongContent(f"CSV {csvs[0]} statt {unit.member}")
             txts = [n for n in names if n.lower().endswith(".txt")]
             txt = zf.read(txts[0]).decode("latin-1") if txts else None
             return zf.read(csvs[0]), txt
@@ -577,20 +655,33 @@ def _expected_ms(r_ms: int, hour_ny: int) -> int:
     return int(datetime(d.year, d.month, d.day, hour_ny, tzinfo=NY).timestamp() * 1000)
 
 
-def check_timezone(raw_ms: np.ndarray, symbol: str) -> dict:
+def _offset_h(r_ms: int, hour_ny: int) -> int:
+    return math.floor((r_ms - _expected_ms(r_ms, hour_ny)) / HOUR_MS + 0.5)
+
+
+def check_timezone(raw_ms: np.ndarray, symbol: str,
+                   bounds: tuple[int, int] | None = None) -> dict:
     """
     Impliziten Offset (Rohzeit - UTC, ganze Stunden) aus Marktzeiten schaetzen:
       Wochenschluss  letzter Tick vor einer Luecke >= 24 h ~ 17:00 New York
       Wochenstart    erster Tick danach ~ 18:00 (Metalle) / 17:00 (EURUSD) New York
-      Tagespause     (nur Metalle, Mo-Do) Luecke 45 min..3 h: Beginn ~ 17:00,
-                     Ende ~ 18:00 New York
-    New York mit Sommerzeit (zoneinfo); erwartet fest -5 h. ok nur wenn:
-    genug Anker, Median -5, Anteil -5 >= TZ_MIN_SHARE, kein Lauf von
-    TZ_MAX_RUN aufeinanderfolgenden gleich abweichenden Ankern (Regimewechsel
-    mitten im Monat), kein Ruecksprung >= 30 min in Dateireihenfolge.
-    Einzelne Feiertage/fruehe Schluesse sind Ausreisser und stoeren nicht.
+      Tagespause     (nur Metalle, Mo-Do) Luecke 45 min..3 h, deren Beginn
+                     hoechstens TZ_BREAK_WINDOW_H vom erwarteten Beginn (17:00
+                     New York bei -5 h) liegt; Ende ~ 18:00 New York. Andere
+                     Luecken (duenner Markt nachts) sind keine Anker.
+    New York mit Sommerzeit (zoneinfo); erwartet fest -5 h. status:
+      ok             genug Anker, Median -5, Anteil -5 >= TZ_MIN_SHARE, kein
+                     Lauf von TZ_MAX_RUN gleich abweichenden Ankern, kein Anker
+                     mit genau +-1 h in den ersten/letzten 72 h von `bounds`
+                     (Uhrumstellung am Monatsrand; Feiertage weichen um >= 2 h
+                     ab und bleiben erlaubt), kein Ruecksprung >= 30 min
+      failed         eine dieser Bedingungen verletzt
+      not_checkable  zu wenige Anker (und sonst kein Fehler)
     """
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
+    if bounds is None and len(raw_ms):        # Rohmonat des Medians als Monatsrand
+        mid = datetime.fromtimestamp(float(np.median(raw_ms)) / 1000, UTC)
+        bounds = raw_month_bounds_ms((mid.year, mid.month))
     rep: dict = {"expected_offset_h": TZ_EXPECTED_H, "rows": int(len(raw_ms))}
     d0 = np.diff(raw_ms)
     rep["reversals"] = int((d0 < 0).sum())
@@ -606,14 +697,19 @@ def check_timezone(raw_ms: np.ndarray, symbol: str) -> dict:
     for i in np.nonzero(d >= WEEKEND_GAP_MS)[0]:
         anchors += [(int(t[i]), "wochenschluss", CLOSE_H_NY),
                     (int(t[i + 1]), "wochenstart", OPEN_H_NY[symbol])]
+    ignored_breaks = 0
     if symbol in METALS:
         lo, hi = BREAK_GAP_MS
         for i in np.nonzero((d >= lo) & (d <= hi))[0]:
-            if (int(t[i]) // DAY_MS + 3) % 7 < 4:        # Mo-Do (1.1.1970 = Do)
-                anchors += [(int(t[i]), "pause_beginn", CLOSE_H_NY),
-                            (int(t[i + 1]), "pause_ende", 18)]
+            if (int(t[i]) // DAY_MS + 3) % 7 >= 4:       # nur Mo-Do (1.1.1970 = Do)
+                continue
+            if abs(_offset_h(int(t[i]), CLOSE_H_NY) - TZ_EXPECTED_H) > TZ_BREAK_WINDOW_H:
+                ignored_breaks += 1                       # z.B. naechtliche Luecke
+                continue
+            anchors += [(int(t[i]), "pause_beginn", CLOSE_H_NY),
+                        (int(t[i + 1]), "pause_ende", 18)]
     anchors.sort()
-    offs = [math.floor((r - _expected_ms(r, h)) / HOUR_MS + 0.5) for r, _, h in anchors]
+    offs = [_offset_h(r, h) for r, _, h in anchors]
 
     run, best = 0, 0                     # laengster Lauf gleich abweichender Offsets
     for k, o in enumerate(offs):
@@ -622,11 +718,20 @@ def check_timezone(raw_ms: np.ndarray, symbol: str) -> dict:
         else:
             run = run + 1 if k and offs[k - 1] == o else 1
         best = max(best, run)
+    edge = []
+    if bounds is not None:
+        blo, bhi = bounds
+        edge = [(r, k, h, o) for (r, k, h), o in zip(anchors, offs)
+                if abs(o - TZ_EXPECTED_H) == 1 and (r < blo + TZ_EDGE_MS or r >= bhi - TZ_EDGE_MS)]
     n = len(offs)
     share = offs.count(TZ_EXPECTED_H) / n if n else 0.0
     med = float(np.median(offs)) if n else None
-    rep.update(anchors=n, share_expected=round(share, 3), median_offset_h=med,
-               offsets=dict(sorted(Counter(offs).items())), longest_deviating_run=best,
+    rep.update(anchors=n, ignored_break_gaps=ignored_breaks, share_expected=round(share, 3),
+               median_offset_h=med, offsets=dict(sorted(Counter(offs).items())),
+               first_offset_h=offs[0] if n else None, last_offset_h=offs[-1] if n else None,
+               longest_deviating_run=best,
+               edge_violations=[{"raw": _raw_iso(r), "kind": k, "implied_offset_h": o}
+                                for r, k, h, o in edge],
                deviating_examples=[{"raw": _raw_iso(r), "kind": k, "expected_ny": f"{h}:00",
                                     "implied_offset_h": o}
                                    for (r, k, h), o in zip(anchors, offs)
@@ -635,9 +740,11 @@ def check_timezone(raw_ms: np.ndarray, symbol: str) -> dict:
     if len(large):
         reasons.append(f"{len(large)} Ruecksprung/Rueckspruenge >= {REGRESSION_MAX_MS // MIN_MS} min "
                        f"in Dateireihenfolge (max {rep['max_reversal_s'] / 60:.0f} min, Uhrumstellung?)")
-    if n < TZ_MIN_ANCHORS:
-        reasons.append(f"nur {n} Ankerpunkte (< {TZ_MIN_ANCHORS}), Zeitzone nicht pruefbar")
-    else:
+    if edge:
+        reasons.append(f"{len(edge)} Anker am Monatsrand (erste/letzte 72 h) mit genau 1 h "
+                       f"Abweichung, z.B. {_raw_iso(edge[0][0])} {edge[0][1]} -> "
+                       f"{edge[0][3]} h (Uhrumstellung am Monatsrand?)")
+    if n >= TZ_MIN_ANCHORS:
         if med != TZ_EXPECTED_H:
             reasons.append(f"Median-Offset {med:g} h statt {TZ_EXPECTED_H} h")
         if share < TZ_MIN_SHARE:
@@ -645,7 +752,10 @@ def check_timezone(raw_ms: np.ndarray, symbol: str) -> dict:
         if best >= TZ_MAX_RUN:
             reasons.append(f"{best} aufeinanderfolgende Anker mit gleichem abweichendem Offset "
                            "(Wechsel mitten im Monat?)")
-    rep["ok"] = not reasons
+    rep["status"] = "failed" if reasons else ("ok" if n >= TZ_MIN_ANCHORS else "not_checkable")
+    if rep["status"] == "not_checkable":
+        reasons.append(f"nur {n} Ankerpunkte (< {TZ_MIN_ANCHORS}), Zeitzone nicht pruefbar")
+    rep["ok"] = rep["status"] == "ok"
     rep["reason"] = "; ".join(reasons) or None
     return rep
 
@@ -663,7 +773,7 @@ def ticks_to_bars(ticks: pd.DataFrame) -> pd.DataFrame:
         "bid_volume": ticks["volume"].to_numpy(), "ask_volume": ticks["volume"].to_numpy(),
     })
     bars = dk.aggregate_1m(t)
-    bars["source"] = SOURCE
+    bars["source"] = SOURCE_BY_MODE["tick"]
     return bars
 
 
@@ -687,7 +797,7 @@ def m1_to_bars(m1: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     b["tick_count"] = np.ones(len(b), dtype="int64")
     b["bid_volume"] = b["vol"].astype(np.float64)
     b["ask_volume"] = b["vol"].astype(np.float64)
-    b["source"] = SOURCE
+    b["source"] = SOURCE_BY_MODE["m1"]
     b["ts"] = b["ts"].dt.as_unit("ms")
     return b[dk.COLUMNS].reset_index(drop=True), merged
 
@@ -695,12 +805,14 @@ def m1_to_bars(m1: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 # --------------------------------------------------------------- kontext ---
 @dataclass
 class Outcome:
-    # cached | ok | empty (bestaetigt) | pending | unconfirmed | failed | skipped
+    # cached | ok | empty (bestaetigt) | pending | unconfirmed | failed |
+    # content_error (dauerhaft, 24 h zurueckgestellt) | deferred | skipped
     status: str
     error: str | None = None
     first_seen: str | None = None
     attempts: int = 0
     http_status: int | None = None
+    accepted: bool = False
 
 
 @dataclass
@@ -710,31 +822,78 @@ class Decoded:
     stats: dict
 
 
+UNRESOLVED = ("failed", "skipped", "pending", "unconfirmed", "content_error", "deferred")
+
+
 class Ctx:
     """Cache, Client und Zustand je Datei fuer einen Lauf (ein Symbol, ein Modus)."""
 
-    def __init__(self, symbol: str, mode: str, data_root: Path, client: Client, now):
+    def __init__(self, symbol: str, mode: str, data_root: Path, client: Client, now,
+                 rebuild: bool = False):
         self.symbol, self.mode, self.data_root, self.client, self.now = symbol, mode, data_root, client, now
+        self.rebuild = rebuild
         self.decoded: OrderedDict[Unit, Decoded] = OrderedDict()
         self.tz: dict[tuple[Unit, tuple[int, int]], dict] = {}
         self.downloaded = 0
+        self.empty_streak = self.content_streak = 0
+        self.first_data = self._first_cached_month()
+
+    def _first_cached_month(self) -> tuple[int, int] | None:
+        """Fruehester Rohmonat mit gecachten Daten = Beginn der bekannten Historie."""
+        d = raw_dir(self.data_root, self.symbol, self.mode)
+        pat = re.compile(rf"HISTDATA_COM_ASCII_{self.symbol}_{TF_CODE[self.mode]}(\d{{4}})(\d{{2}})?\.zip$")
+        found = []
+        for p in d.glob("*.zip") if d.exists() else []:
+            m = pat.match(p.name)
+            if m:
+                found.append((int(m.group(1)), int(m.group(2) or 1)))
+        return min(found) if found else None
+
+    def inside_history(self, u: Unit) -> bool:
+        """
+        Hier ist ein bestaetigtes "keine Daten" verdaechtig (Exit 4, Neupruefung
+        nach 30 Tagen): nach dem ersten Monat mit Daten - oder ueberall ab
+        HISTORY_START, solange noch NIE Daten kamen (sonst wuerde eine
+        systematisch leere Antwort, z.B. WAF/Token, still als "nicht
+        verfuegbar" mit Exit 0 enden). Leere Monate VOR dem ersten Monat mit
+        Daten gelten als vor Beginn der Tick-Historie.
+        """
+        if before_history(self.symbol, u.first_month) and u.month:
+            return False
+        return self.first_data is None or u.first_month > self.first_data
+
+    def _streak_zone(self, u: Unit) -> bool:
+        """Leere Antworten zaehlen fuer den Abbruch erst nach bekannten Daten
+        (sonst stockt der erste Backfill vor Beginn der Tick-Historie)."""
+        return self.first_data is not None and u.first_month > self.first_data
 
     def unit(self, ym: tuple[int, int]) -> Unit:
         # Jahresdatei erst, wenn das Rohjahr (UTC-5) samt SETTLE_S vorbei ist
         cur = (self.now() - timedelta(milliseconds=RAW_OFFSET_MS, seconds=SETTLE_S)).year
         return unit_for(self.symbol, self.mode, ym, cur, self.data_root)
 
+    def _since(self, iso: str | None) -> float:
+        return (self.now() - datetime.fromisoformat(iso)).total_seconds() if iso else float("inf")
+
     def state(self, u: Unit) -> tuple[str, dict | None]:
-        """data | empty (bestaetigt) | wait (< 24 h seit letzter Pruefung) | recheck | missing"""
+        """data | deferred (Inhaltsfehler < 24 h) | empty (bestaetigt) |
+        wait (< 24 h seit letzter Pruefung) | recheck | missing"""
         if u.path(self.data_root).exists():
             return "data", None
+        failed = dk.read_marker(u.marker(self.data_root, "failed"))
+        if failed is not None and self._since(failed.get("last_checked")) < CONTENT_RETRY_S:
+            return "deferred", failed
         info = dk.read_marker(u.marker(self.data_root, "empty"))
         if info is None:
             return "missing", None
         if info.get("confirmed"):
+            if info.get("accepted") or not self.inside_history(u):
+                return "empty", info
+            if self.rebuild or self._since(info.get("confirmed_at") or info.get("last_checked")) \
+                    >= EMPTY_RECHECK_DAYS * 86400:
+                return "recheck", info          # Luecke in der Historie: periodisch erneut
             return "empty", info
-        last = datetime.fromisoformat(info.get("last_checked") or info["first_seen"])
-        if (self.now() - last).total_seconds() < CONFIRM_AFTER_S:
+        if self._since(info.get("last_checked") or info["first_seen"]) < CONFIRM_AFTER_S:
             return "wait", info
         return "recheck", info
 
@@ -751,6 +910,14 @@ class Ctx:
         return Outcome("unconfirmed", f"keine Daten, unbestaetigt; erneute Pruefung ab "
                        f"{after:%Y-%m-%d %H:%M} UTC", info["first_seen"])
 
+    def _clear_markers(self, u: Unit) -> None:
+        """Neue Rohdatei: alte Marker (auch Quarantaene) gelten nicht mehr."""
+        for kind in ("empty", "failed"):
+            u.marker(self.data_root, kind).unlink(missing_ok=True)
+        for q in u.path(self.data_root).parent.glob(f"{u.name}*.quarantine"):
+            q.unlink(missing_ok=True)
+        self.tz = {k: v for k, v in self.tz.items() if k[0] != u}
+
     def get(self, u: Unit) -> Outcome:
         if self.now() < u.end_utc + timedelta(seconds=SETTLE_S):
             raise ValueError(f"{u.key}: Periode nicht abgeschlossen (Ende + {SETTLE_S / 3600:g} h)")
@@ -758,32 +925,65 @@ class Ctx:
         if st == "data":
             return Outcome("cached")
         if st == "empty":
-            return Outcome("empty")
+            return Outcome("empty", accepted=bool(info.get("accepted")))
         if st == "wait":
             return self._unresolved(u, info)
+        if st == "deferred":
+            after = datetime.fromisoformat(info["last_checked"]) + timedelta(seconds=CONTENT_RETRY_S)
+            return Outcome("deferred", f"{info.get('error')} - erneuter Versuch ab "
+                           f"{after:%Y-%m-%d %H:%M} UTC", info.get("first_seen"))
         if self.client.halted:
             return Outcome("skipped")
         t0 = time.monotonic()
+        now = self.now().isoformat()
         try:
             blob = self.client.fetch(u)
         except dk.Interrupted:
             return Outcome("skipped")
+        except ContentFailure as e:
+            old = dk.read_marker(u.marker(self.data_root, "failed")) or {}
+            dk.write_json_atomic(u.marker(self.data_root, "failed"), {
+                "first_seen": old.get("first_seen") or now, "last_checked": now,
+                "error": str(e), "count": int(old.get("count", 0)) + 1})
+            log.error("INHALTSFEHLER %s: %s (naechster Versuch fruehestens in %g h)", u.key, e,
+                      CONTENT_RETRY_S / 3600)
+            self.content_streak += 1
+            if self.content_streak >= MAX_CONTENT_ERRORS_IN_ROW:
+                self.client.abort = (f"{self.content_streak} Inhaltsfehler in Folge (Formular/HTML/"
+                                     f"falsche CSV) - HistData-Seite geaendert oder blockiert?")
+            return Outcome("content_error", str(e), now, attempts=e.attempts)
         except dk.DownloadError as e:
             log.warning("FEHLSCHLAG %s: %s (spaeter erneut)", u.key, e)
             return Outcome("failed", str(e), attempts=e.attempts, http_status=e.status)
-        now = self.now().isoformat()
+        self.content_streak = 0
         if not blob:
             first = (info or {}).get("first_seen") or now
             done = (st == "recheck" and not self.recent(u)
-                    and (self.now() - datetime.fromisoformat(first)).total_seconds() >= CONFIRM_AFTER_S)
+                    and self._since(first) >= CONFIRM_AFTER_S)
             new = {"first_seen": first, "last_checked": now, "confirmed": "repeat" if done else None,
+                   "confirmed_at": now if done else None,
                    "checks": int((info or {}).get("checks", 0)) + 1}
+            if (info or {}).get("accepted"):
+                new["accepted"] = info["accepted"]
             dk.write_json_atomic(u.marker(self.data_root, "empty"), new)
+            u.marker(self.data_root, "failed").unlink(missing_ok=True)
             log.info("leer  %s (keine Daten%s)", u.key, ", bestaetigt" if done else ", unbestaetigt")
-            return Outcome("empty") if done else self._unresolved(u, new)
+            if self._streak_zone(u) and not self.recent(u):
+                self.empty_streak += 1
+                if self.empty_streak >= MAX_EMPTY_IN_ROW:
+                    self.client.abort = (
+                        f"{self.empty_streak} leere Antworten in Folge innerhalb der bekannten "
+                        f"Historie (ab {self.first_data[0]}-{self.first_data[1]:02d}) - Token-/WAF-/"
+                        "Serverproblem? Lauf beendet, nichts als 'keine Daten' gewertet ausser "
+                        "den schon markierten Dateien")
+            return Outcome("empty", accepted=bool(new.get("accepted"))) if done \
+                else self._unresolved(u, new)
         dk._atomic_write(u.path(self.data_root), blob)
-        u.marker(self.data_root, "empty").unlink(missing_ok=True)
+        self._clear_markers(u)
+        self.empty_streak = 0
         self.downloaded += 1
+        if self.first_data is None or u.first_month < self.first_data:
+            self.first_data = u.first_month
         log.info("ok    %s (%d B, %.1fs)", u.key, len(blob), time.monotonic() - t0)
         return Outcome("ok")
 
@@ -795,7 +995,7 @@ class Ctx:
         log.warning("Cache-Datei %s defekt (%s), beiseitegelegt (.corrupt), wird neu geladen", u.name, why)
 
     def decode(self, u: Unit) -> Decoded:
-        """ZIP aus dem Cache -> Decoded (gecached, max. 2 Dateien im Speicher)."""
+        """ZIP aus dem Cache -> Decoded (gecached, max. 3 Dateien im Speicher: M-1, M, M+1)."""
         if u in self.decoded:
             self.decoded.move_to_end(u)
             return self.decoded[u]
@@ -811,33 +1011,97 @@ class Ctx:
             df = df[~dup.to_numpy()].reset_index(drop=True)
         dec = Decoded(df, parse_status(txt), stats)
         self.decoded[u] = dec
-        while len(self.decoded) > 2:          # M-1 und M genuegen (Speicher: Tickmonate sind gross)
+        while len(self.decoded) > 3:
             self.decoded.popitem(last=False)
         return dec
+
+    def _month_rows(self, u: Unit, ym: tuple[int, int]) -> pd.DataFrame:
+        dec = self.decode(u)
+        lo, hi = raw_month_bounds_ms(ym)
+        return dec.df[(dec.df["raw_ms"] >= lo).to_numpy() & (dec.df["raw_ms"] < hi).to_numpy()]
+
+    def _neighbour_ms(self, ym: tuple[int, int]) -> np.ndarray | None:
+        """raw_ms eines gecachten Nachbar-Rohmonats (ohne eigene Pruefung) oder None."""
+        if before_history(self.symbol, ym):
+            return None
+        u = self.unit(ym)
+        if not u.path(self.data_root).exists():
+            return None
+        try:
+            return self._month_rows(u, ym)["raw_ms"].to_numpy()
+        except (CorruptZip, FormatError):
+            return None
 
     def raw_slice(self, u: Unit, ym: tuple[int, int]) -> tuple[pd.DataFrame, dict]:
         """Rohmonat ym aus Datei u, zeitzonengeprueft; Quarantined wenn nicht."""
         q = u.qmarker(self.data_root, ym)
+        accepted = False
         if q.exists():
             info = dk.read_marker(q) or {}
-            raise Quarantined(u, ym, info.get("reason") or "Quarantaene", info.get("check"))
+            if not info.get("accepted"):
+                raise Quarantined(u, ym, info.get("reason") or "Quarantaene", info.get("check"))
+            accepted = True
         try:
-            dec = self.decode(u)
+            sel = self._month_rows(u, ym)
         except FormatError as e:
+            if accepted:
+                raise Quarantined(u, ym, f"Format nicht lesbar: {e}", None)
             self._quarantine(u, ym, f"Format nicht lesbar: {e}", None)
-        lo, hi = raw_month_bounds_ms(ym)
-        sel = dec.df[(dec.df["raw_ms"] >= lo).to_numpy() & (dec.df["raw_ms"] < hi).to_numpy()]
         key = (u, ym)
+        if accepted:
+            return sel, {"accepted_manually": True, "marker": str(q)}
         if key not in self.tz and len(sel):
-            self.tz[key] = check_timezone(sel["raw_ms"].to_numpy(), self.symbol)
-            if not self.tz[key]["ok"]:
-                self._quarantine(u, ym, "Zeitzone passt nicht zu fest UTC-5: " + self.tz[key]["reason"],
-                                 self.tz[key])
+            bounds = raw_month_bounds_ms(ym)
+            chk = check_timezone(sel["raw_ms"].to_numpy(), self.symbol, bounds)
+            if chk["status"] == "not_checkable":
+                # zu wenige Anker (kurzer erster Historienmonat, duenner Monat):
+                # gemeinsam mit gecachten Nachbar-Rohmonaten pruefen
+                parts = [self._neighbour_ms(_ym_add(ym, -1)), sel["raw_ms"].to_numpy(),
+                         self._neighbour_ms(_ym_add(ym, 1))]
+                used = [_ymstr(_ym_add(ym, k)) for k, p in zip((-1, 0, 1), parts) if p is not None]
+                if len(used) > 1:
+                    joint = check_timezone(np.concatenate([p for p in parts if p is not None]),
+                                           self.symbol, bounds)
+                    joint["joint_with"] = used
+                    joint["alone"] = {k: chk[k] for k in ("anchors", "reason")}
+                    chk = joint
+                if chk["status"] == "not_checkable":
+                    chk["reason"] = (f"Zeitzone NICHT PRUEFBAR: {chk['reason']} (auch gemeinsam mit "
+                                     f"Nachbarmonaten {used}) - manuell pruefen, dann im Marker "
+                                     "\"accepted\": true setzen")
+            self.tz[key] = chk
+            if not chk["ok"]:
+                self._quarantine(u, ym, ("" if chk["status"] == "not_checkable" else
+                                         "Zeitzone passt nicht zu fest UTC-5: ") + chk["reason"], chk)
         return sel, self.tz.get(key, {})
+
+    def check_following(self, ym: tuple[int, int]) -> None:
+        """
+        Folge-Rohmonat ym+1 (falls gecached) beginnt mit 1 h Abweichung ->
+        Umstellung vermutlich nach dem letzten Anker von ym: UTC-Monat ym
+        nicht schreiben (Quarantined, Marker liegt am Folgemonat).
+        """
+        nxt = _ym_add(ym, 1)
+        u = self.unit(nxt)
+        if not u.path(self.data_root).exists():
+            return
+        try:
+            self.raw_slice(u, nxt)
+        except Quarantined as q:
+            fo = (q.check or {}).get("first_offset_h")
+            if fo is not None and abs(fo - TZ_EXPECTED_H) == 1:
+                raise Quarantined(q.unit, q.ym, (
+                    f"Folge-Rohmonat {_ymstr(nxt)} beginnt mit Offset {fo} h statt "
+                    f"{TZ_EXPECTED_H} h: Uhrumstellung vermutlich am Ende von {_ymstr(ym)} "
+                    f"(nach dessen letztem Anker) - {_ymstr(ym)} nicht geschrieben. "
+                    f"Folgemonat: {q.reason}"), q.check)
+        except (CorruptZip, FormatError):
+            return
 
     def _quarantine(self, u: Unit, ym, reason: str, check: dict | None):
         dk.write_json_atomic(u.qmarker(self.data_root, ym),
-                             {"reason": reason, "check": check, "since": self.now().isoformat()})
+                             {"reason": reason, "check": check, "since": self.now().isoformat(),
+                              "accepted": False})
         log.error("QUARANTAENE %s Rohmonat %d-%02d: %s", u.key, *ym, reason)
         raise Quarantined(u, ym, reason, check)
 
@@ -856,7 +1120,7 @@ def build_month(ctx: Ctx, ym: tuple[int, int]) -> tuple[pd.DataFrame, dict]:
     for r in needed(ctx.symbol, ym):
         u = ctx.unit(r)
         info = {"file": u.name, "state": ctx.state(u)[0]}
-        stats["raw_months"][f"{r[0]}-{r[1]:02d}"] = info
+        stats["raw_months"][_ymstr(r)] = info
         if info["state"] != "data":
             continue
         sel, tz = ctx.raw_slice(u, r)
@@ -865,6 +1129,7 @@ def build_month(ctx: Ctx, ym: tuple[int, int]) -> tuple[pd.DataFrame, dict]:
         info.update(file_rows=ctx.decode(u).stats, rows_in_month=int(len(sel)), timezone=tz)
         stats["histdata_status"][u.name] = ctx.decode(u).status
         parts.append(sel)
+    ctx.check_following(ym)
     raw = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
     if raw.empty:
         return pd.DataFrame(columns=dk.COLUMNS), stats
@@ -881,7 +1146,7 @@ def month_report(df: pd.DataFrame, symbol: str, ym, mode: str, stats: dict) -> d
     ms = pd.Timestamp(datetime(*ym, 1, tzinfo=UTC))
     rep = dk.validate(df, symbol, f"{symbol} {ym[0]}-{ym[1]:02d}", ms, ms + pd.offsets.MonthBegin(1))
     rep.update(stats)
-    rep.update(source=SOURCE, mode=PARQUET_MODE[mode], spread_available=mode == "tick")
+    rep.update(source=SOURCE_BY_MODE[mode], mode=PARQUET_MODE[mode], spread_available=mode == "tick")
     if mode == "m1":
         rep["note"] = ("M1 enthaelt nur Bid: ask = bid, Spread 0 - Spread kommt aus dem "
                        "Kostenmodell; tick_count = 1 je Bar (kein Tick-Zaehler)")
@@ -908,19 +1173,18 @@ def run(symbol: str, start: date, end: date, data_root: Path | None = None, *,
     if lock is None:
         log.error("%s: Lock %s belegt (anderer Lauf aktiv) - spaeter erneut", symbol,
                   lock_path(data_root, symbol))
-        return {"symbol": symbol, "source": SOURCE, "mode": mode, "status": "locked",
+        return {"symbol": symbol, "source": SOURCE_BY_MODE[mode], "mode": mode, "status": "locked",
                 "exit_code": EXIT_GAPS}
     try:
         cleanup_orphans(data_root, symbol)
-        ctx = Ctx(symbol, mode, data_root, Client(data_root, stop=stop, **client_kw), now)
+        ctx = Ctx(symbol, mode, data_root, Client(data_root, stop=stop, **client_kw), now, rebuild)
         return _run_locked(ctx, start, end, rebuild)
     finally:
         lock.close()
 
 
 def _month_closed(now: datetime, ym: tuple[int, int]) -> bool:
-    end = datetime(*_ym_add(ym, 1), 1, tzinfo=UTC) + timedelta(milliseconds=RAW_OFFSET_MS)
-    return now >= end + timedelta(seconds=SETTLE_S)
+    return now >= raw_month_end_utc(ym) + timedelta(seconds=SETTLE_S)
 
 
 def _ymstr(ym) -> str:
@@ -928,9 +1192,20 @@ def _ymstr(ym) -> str:
 
 
 def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
-    sym, data_root, client = ctx.symbol, ctx.data_root, ctx.client
+    sym, data_root, client, mode = ctx.symbol, ctx.data_root, ctx.client, ctx.mode
     started = dk.utc_now()
-    todo, skipped_existing, unavailable = [], 0, {}
+    todo, skipped_existing, unavailable, conflicts = [], 0, {}, {}
+
+    def mode_conflict(ym) -> str | None:
+        out = store_path(data_root, sym, *ym, mode)
+        if not out.exists():
+            return None
+        have = stored_mode(out)
+        if have == PARQUET_MODE[mode]:
+            return None
+        return (f"{out} hat histdata_mode={have!r}, Lauf ist {PARQUET_MODE[mode]!r} - "
+                "nicht ueberschrieben (Datei pruefen/verschieben)")
+
     for ym in dk.months(start, end):
         if not _month_closed(ctx.now(), ym):
             log.info("skip %s %s (Monat nicht abgeschlossen: Ende + 5 h + %g h)", sym, _ymstr(ym),
@@ -939,15 +1214,19 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
         if before_history(sym, ym):
             unavailable[ym] = f"vor Historienbeginn {HISTORY_START[sym][0]}-{HISTORY_START[sym][1]:02d}"
             continue
-        if store_path(data_root, sym, *ym).exists() and not rebuild:
+        c = mode_conflict(ym)
+        if c:
+            conflicts[ym] = c
+            continue
+        if store_path(data_root, sym, *ym, mode).exists() and not rebuild:
             skipped_existing += 1
             continue
         todo.append(ym)
     log.info("START %s mode=%s: %d Monate offen (%d fertig uebersprungen, %d vor Historienbeginn)",
-             sym, ctx.mode, len(todo), skipped_existing, len(unavailable))
+             sym, mode, len(todo), skipped_existing, len(unavailable))
 
     outcomes: dict[Unit, Outcome] = {}
-    written, validation_errors, quarantine, pending = [], {}, {}, {}
+    written, validation_errors, quarantine, pending, missing = [], {}, {}, {}, {}
     state = {"status": None, "error": None}
     reported_gaps: dict[str, dict] = {}
 
@@ -969,19 +1248,24 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
             unavailable[ym] = "HistData-Datei ohne Zeilen in diesem Monat"
             return
         try:
-            rep = month_report(df, sym, ym, ctx.mode, stats)
+            rep = month_report(df, sym, ym, mode, stats)
         except dk.ValidationError as e:
             validation_errors[ym] = str(e)
             log.error("VALIDIERUNG FEHLGESCHLAGEN %s: %s", label, e)
             return
-        out = store_path(data_root, sym, *ym)
+        c = mode_conflict(ym)
+        if c:
+            conflicts[ym] = c
+            return
+        out = store_path(data_root, sym, *ym, mode)
         rep["file"] = str(out.relative_to(data_root))
-        write_parquet(out, df, ctx.mode)
-        dk.write_json_atomic(report_path(data_root, sym, *ym), rep)
+        write_parquet(out, df, mode)
+        dk.write_json_atomic(report_path(data_root, sym, *ym, mode), rep)
         written.append(ym)
         log.info("%-15s %6d Bars  gekreuzt=%-3d spread_median=%g  mode=%s", label, rep["rows"],
-                 rep["crossed"], rep["spread_median"], ctx.mode)
+                 rep["crossed"], rep["spread_median"], mode)
 
+    todo_set = set(todo)
     try:
         for ym in todo:
             if client.halted:
@@ -989,16 +1273,28 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
             raws = needed(sym, ym)
             for attempt in range(2):            # 2. Durchgang nur nach beiseitegelegtem ZIP
                 outs = {r: resolve(ctx.unit(r)) for r in raws}
+                # Rohmonat M+1 zuerst holen, wenn er ohnehin gebraucht wird (UTC-Monat
+                # M+1 offen): check_following prueft dann vor dem Schreiben von M,
+                # ob M+1 schon mit 1 h Abweichung beginnt. Keine Extra-Requests.
+                nxt = _ym_add(ym, 1)
+                if nxt in todo_set and not client.halted:
+                    resolve(ctx.unit(nxt))
                 if client.halted and any(o.status == "skipped" for o in outs.values()):
                     break
-                bad = [o for o in outs.values()
-                       if o.status in ("failed", "skipped", "pending", "unconfirmed")]
+                bad = [o for o in outs.values() if o.status in UNRESOLVED]
                 if bad:
                     if any(o.status == "pending" for o in bad):
                         pending[ym] = "; ".join(o.error or "" for o in bad if o.status == "pending")
                     break
-                if outs[ym].status == "empty":
-                    unavailable[ym] = "HistData hat keine Daten (bestaetigt, wiederholt leer)"
+                cur = outs[ym]
+                if cur.status == "empty":
+                    if ctx.inside_history(ctx.unit(ym)) and not cur.accepted:
+                        missing[ym] = ("HistData liefert wiederholt keine Daten, obwohl der Monat "
+                                       "innerhalb der bekannten Historie liegt - manuell pruefen; "
+                                       "akzeptieren: \"accepted\": true in "
+                                       f"{ctx.unit(ym).marker(data_root, 'empty')}")
+                    else:
+                        unavailable[ym] = "HistData hat keine Daten (bestaetigt, wiederholt leer)"
                     break
                 try:
                     finish(ym)
@@ -1024,42 +1320,70 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
         raise
     finally:
         rep = _run_report(ctx, start, end, started, todo, outcomes, written, validation_errors,
-                          quarantine, pending, unavailable, skipped_existing, state, reported_gaps,
-                          rebuild)
-        dk.write_json_atomic(run_report_path(data_root, sym), rep)
+                          quarantine, pending, unavailable, missing, conflicts, skipped_existing,
+                          state, reported_gaps, rebuild)
+        dk.write_json_atomic(run_report_path(data_root, sym, mode), rep)
         log.info("FERTIG %s: status=%s exit=%d, %d Monate geschrieben, %d Requests (Report %s)", sym,
                  rep["status"], rep["exit_code"], len(written), client.requests,
-                 run_report_path(data_root, sym))
+                 run_report_path(data_root, sym, mode))
     return rep
 
 
 def _run_report(ctx, start, end, started, todo, outcomes, written, validation_errors, quarantine,
-                pending, unavailable, skipped_existing, state, reported_gaps, rebuild) -> dict:
+                pending, unavailable, missing, conflicts, skipped_existing, state, reported_gaps,
+                rebuild) -> dict:
     client = ctx.client
-    done = set(written) | set(validation_errors) | set(quarantine) | set(unavailable)
+    manual = [{"month": _ymstr(k), "kind": "quarantine", **{x: v[x] for x in ("reason", "path")}}
+              for k, v in quarantine.items()]
+    manual += [{"month": _ymstr(k), "kind": "missing_in_history", "reason": v}
+               for k, v in missing.items()]
+    manual += [{"month": _ymstr(k), "kind": "store_mode_conflict", "reason": v}
+               for k, v in conflicts.items()]
+    manual.sort(key=lambda r: r["month"])
+    done = set(written) | set(validation_errors) | set(quarantine) | set(unavailable) | \
+        set(missing) | set(conflicts)
     incomplete = [ym for ym in todo if ym not in done]
     gaps = {u: o for u, o in outcomes.items() if o.status in ("failed", "skipped")}
+    content = {u: o for u, o in outcomes.items() if o.status in ("content_error", "deferred")}
     unconfirmed = {u: o for u, o in outcomes.items() if o.status == "unconfirmed"}
     pend_units = {u: o for u, o in outcomes.items() if o.status == "pending"}
     tripped = client.throttle.tripped.is_set()
+    # Vorrang 3 vor 4 BEWUSST: systemd startet bei 3 neu, bei 4 nicht. Ein
+    # Exit 4 bei offenen Luecken wuerde den Backfill anhalten. Damit die
+    # Quarantaene trotzdem nicht untergeht: status "...+quarantine",
+    # Liste "quarantined" oben im Report, ERROR-Zeile in jedem Lauf.
     if state["status"] == "error":
         status, code = "error", 1
     elif validation_errors:
         status, code = "validation_error", EXIT_VALIDATION
-    elif state["status"] == "rate_limited" or gaps or unconfirmed or pend_units or incomplete:
+    elif (state["status"] == "rate_limited" or client.abort or gaps or content or unconfirmed
+          or pend_units or incomplete):
         status = ("rate_limited" if state["status"] == "rate_limited" else
+                  "aborted" if client.abort else
                   "circuit_breaker" if tripped else "interrupted" if client.stop.is_set() else
-                  "pending" if pend_units and not (gaps or unconfirmed) else "gaps")
+                  "pending" if pend_units and not (gaps or unconfirmed or content) else "gaps")
         code = EXIT_GAPS
-    elif quarantine:
+    elif manual:
         status, code = "quarantine", EXIT_MANUAL
     else:
         status, code = "complete", EXIT_OK
+    if manual and code != EXIT_MANUAL:
+        status += "+quarantine"
     hints = []
-    if quarantine:
-        hints.append("Quarantaene (Zeitzone/Format): Zeitzonen-Pruefung im Report ansehen, "
-                     "--verify-month fuer den Monat; .quarantine loeschen = erneut pruefen, "
-                     "ZIP loeschen = neu laden.")
+    if manual:
+        log.error("MANUELLE PRUEFUNG NOETIG %s (%s): %s", ctx.symbol, ctx.mode,
+                  "; ".join(f"{r['month']} {r['kind']}" for r in manual))
+        hints.append("Quarantaene/manuelle Pruefung: Zeitzonen-Pruefung im Report ansehen, "
+                     "--verify-month fuer den Monat. <zip>.quarantine loeschen = erneut pruefen "
+                     "(ohne Download); ZIP loeschen = neu laden und neu pruefen (Marker wird "
+                     "dabei entfernt); nach manueller Pruefung \"accepted\": true im Marker "
+                     "(.quarantine bzw. .empty) = freigeben.")
+    if client.abort:
+        hints.append(f"Lauf abgebrochen: {client.abort}")
+    if content:
+        hints.append(f"{len(content)} Datei(en) mit Inhaltsfehler (kein Formular/HTML statt ZIP/"
+                     f"falsche CSV): je Lauf 1 Versuch, erneut fruehestens nach "
+                     f"{CONTENT_RETRY_S / 3600:g} h; Marker <zip>.failed.")
     if tripped:
         hints.append(f"Schutzschalter: {client.throttle.consecutive} Fehlschlaege in Folge - Lauf "
                      "beendet, Neustart spaeter (systemd) setzt fort.")
@@ -1076,8 +1400,9 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
                 for u, o in sorted(d.items(), key=lambda kv: kv[0].period)]
 
     return {
-        "symbol": ctx.symbol, "source": SOURCE, "mode": ctx.mode, "status": status,
-        "exit_code": code, "started": started.isoformat(), "finished": dk.utc_now().isoformat(),
+        "symbol": ctx.symbol, "source": SOURCE_BY_MODE[ctx.mode], "mode": ctx.mode,
+        "status": status, "exit_code": code, "quarantined": manual,
+        "started": started.isoformat(), "finished": dk.utc_now().isoformat(),
         "range": {"start": f"{start:%Y-%m}", "end": f"{end:%Y-%m}"},
         "options": {"pause": client.pause, "attempts": client.attempts,
                     "connect_timeout": client.timeout[0], "read_timeout": client.timeout[1],
@@ -1091,15 +1416,19 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
             "months_skipped_existing": skipped_existing,
             "months_written": [_ymstr(k) for k in sorted(written)],
             "months_unavailable": {_ymstr(k): v for k, v in sorted(unavailable.items())},
+            "months_missing_in_history": {_ymstr(k): v for k, v in sorted(missing.items())},
             "months_pending": {_ymstr(k): v for k, v in sorted(pending.items())},
             "months_incomplete": [_ymstr(k) for k in incomplete],
             "months_quarantine": [_ymstr(k) for k in sorted(quarantine)],
+            "months_store_conflict": [_ymstr(k) for k in sorted(conflicts)],
             "months_validation_error": [_ymstr(k) for k in sorted(validation_errors)],
+            "history_known_from": _ymstr(ctx.first_data) if ctx.first_data else None,
             "files_downloaded": ctx.downloaded,
             "requests": client.requests,
             "http_status_counts": dict(sorted(client.status_counts.items())),
             "global_cooldowns": client.throttle.cooldowns,
             "circuit_breaker": tripped,
+            "aborted": client.abort,
             "rate_limit": client.gate.summary(),
             "interrupted": client.stop.is_set(),
         },
@@ -1107,6 +1436,7 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
         "error": state["error"],
         "validation_errors": [{"month": _ymstr(k), "error": v} for k, v in sorted(validation_errors.items())],
         "gaps": unit_rows(gaps),
+        "content_errors": unit_rows(content),
         "pending": unit_rows(pend_units),
         "unconfirmed": unit_rows(unconfirmed),
         "quarantine": [{"month": _ymstr(k), **v} for k, v in sorted(quarantine.items())],
@@ -1136,13 +1466,14 @@ def verify_month(symbol: str, ym: tuple[int, int], data_root: Path | None = None
                 "exit_code": EXIT_GAPS}
     try:
         ctx = Ctx(symbol, mode, data_root, Client(data_root, stop=stop, **client_kw), now)
-        rep: dict = {"symbol": symbol, "month": _ymstr(ym), "source": SOURCE, "mode": mode}
+        rep: dict = {"symbol": symbol, "month": _ymstr(ym), "source": SOURCE_BY_MODE[mode],
+                     "mode": mode}
         try:
             outs = {_ymstr(r): ctx.get(ctx.unit(r)) for r in needed(symbol, ym)}
             rep["files"] = {k: {"status": o.status, "error": o.error} for k, o in outs.items()}
             if any(o.status != "cached" and o.status != "ok" for o in outs.values()):
                 rep.update(ok=False, exit_code=EXIT_GAPS,
-                           note="Rohdatei(en) fehlen/leer/pending - nichts zu pruefen")
+                           note="Rohdatei(en) fehlen/leer/pending/Inhaltsfehler - nichts zu pruefen")
             else:
                 df, stats = build_month(ctx, ym)
                 rep.update(stats)
@@ -1159,7 +1490,7 @@ def verify_month(symbol: str, ym: tuple[int, int], data_root: Path | None = None
             rep.update(ok=False, exit_code=EXIT_GAPS, reason=f"429-Wartebudget erschoepft: {e}")
         rep["requests"] = ctx.client.requests
         rep["rate_limit"] = ctx.client.gate.summary()
-        dk.write_json_atomic(verify_report_path(data_root, symbol, *ym), rep)
+        dk.write_json_atomic(verify_report_path(data_root, symbol, *ym, mode), rep)
         tzs = {k: (v.get("timezone") or {}).get("median_offset_h")
                for k, v in rep.get("raw_months", {}).items()}
         log.info("VERIFY %s %s: ok=%s exit=%d Bars=%s Spread-Median=%s Offset(Median, h)=%s "
@@ -1184,7 +1515,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--start", help="YYYY-MM (default: Historienbeginn des Symbols)")
     p.add_argument("--end", default=None, help="YYYY-MM (default: laufender Monat)")
     p.add_argument("--mode", choices=MODES, default="tick",
-                   help="tick: Bid+Ask aus Ticks (default); m1: nur Bid, ask = bid")
+                   help="tick: Bid+Ask aus Ticks (default, source=histdata); m1: nur Bid, "
+                        "ask = bid (eigene Partition source=histdata_m1)")
     p.add_argument("--pause", type=float, default=PAUSE_S,
                    help=f"Mindestabstand zwischen Requests in s (default {PAUSE_S})")
     p.add_argument("--attempts", type=int, default=ATTEMPTS,
@@ -1202,7 +1534,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--connect-timeout", type=float, default=CONNECT_TIMEOUT_S)
     p.add_argument("--read-timeout", type=float, default=READ_TIMEOUT_S)
     p.add_argument("--rebuild", action="store_true",
-                   help="vorhandene Monatsdateien neu bauen (aus dem Roh-Cache)")
+                   help="vorhandene Monatsdateien neu bauen (aus dem Roh-Cache); bestaetigt "
+                        "leere Monate innerhalb der Historie erneut anfragen")
     p.add_argument("--verify-month", metavar="YYYY-MM",
                    help="einen Monat laden, decodieren, Zeitzone pruefen, validieren (Report)")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -1237,9 +1570,10 @@ def main(argv: list[str] | None = None) -> int:
     rep = run(a.symbol, date(*start, 1), date(*end, 1), mode=a.mode, rebuild=a.rebuild, **kw)
     if rep["exit_code"] == EXIT_GAPS and rep.get("summary"):
         s = rep["summary"]
-        log.error("LUECKEN: %d Dateien gescheitert, %d pending, %d unbestaetigt, %d Monate "
-                  "unvollstaendig - Folgelauf holt nur Fehlendes nach", len(rep["gaps"]),
-                  len(rep["pending"]), len(rep["unconfirmed"]), len(s["months_incomplete"]))
+        log.error("LUECKEN: %d Dateien gescheitert, %d Inhaltsfehler, %d pending, %d unbestaetigt, "
+                  "%d Monate unvollstaendig - Folgelauf holt nur Fehlendes nach", len(rep["gaps"]),
+                  len(rep["content_errors"]), len(rep["pending"]), len(rep["unconfirmed"]),
+                  len(s["months_incomplete"]))
     return rep["exit_code"]
 
 

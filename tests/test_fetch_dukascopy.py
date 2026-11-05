@@ -1445,3 +1445,48 @@ def test_cleanup_orphans_leaves_histdata_temp_files_alone(tmp_path):
         p.write_text("x")
     assert fd.cleanup_orphans(tmp_path, SYM) == 2
     assert foreign.exists() and not any(p.exists() for p in own)
+
+
+# ===================================================== Review-Regressionen ---
+def test_review5_quarantine_visible_when_gaps_win(tmp_path, candle_net, caplog):
+    """3 geht vor 4 (Neustart), Quarantaene aber in status, Liste und ERROR-Zeile."""
+    candle_net["special"]["/2026/06/03/BID"] = raw_none_fit()
+    candle_net["fail"]["/2026/06/05/ASK"] = -1                    # dauerhafte Luecke
+    with caplog.at_level("ERROR", logger="dukascopy"):
+        rep = run_c(tmp_path, final_retries=0)
+    assert rep["exit_code"] == 3 and rep["status"] == "gaps+quarantine"
+    assert rep["quarantined"] == ["2026-07"]
+    assert any("QUARANTAENE" in r.getMessage() and "2026-07" in r.getMessage()
+               for r in caplog.records)
+    saved = json.loads(fd.run_report_path(tmp_path, SYM).read_text())
+    assert saved["quarantined"] == ["2026-07"]
+    # Luecke behoben -> reine Quarantaene -> Exit 4
+    del candle_net["fail"]["/2026/06/05/ASK"]
+    rep = run_c(tmp_path)
+    assert rep["exit_code"] == 4 and rep["status"] == "quarantine" and rep["quarantined"] == ["2026-07"]
+
+
+def test_review_verify_candles_only_one_side_unconfirmed_is_exit_3(tmp_path, fake_get):
+    _, answers = fake_get
+    answers += [FakeResp(200, full_day("BID")), FakeResp(404)]   # Werktag: ASK fehlt (unbestaetigt)
+    rep = fd.verify_day(SYM, VDAY, data_root=tmp_path, today=date(2024, 3, 7), pause=0,
+                        candles_only=True)
+    assert rep["exit_code"] == 3 and rep["status"] == "one_side_unconfirmed"
+    assert rep["sample_path"] is None
+
+
+def test_review_verify_candles_only_full_holidays(tmp_path, fake_get):
+    _, answers = fake_get
+    gf = date(2024, 3, 29)                                       # Karfreitag
+    assert fd.full_holiday(gf) and fd.full_holiday(date(2025, 12, 25))
+    assert not fd.full_holiday(date(2024, 3, 28))
+    answers += [FakeResp(200, full_day("BID", minutes=300)), FakeResp(200, full_day("ASK", minutes=300))]
+    rep = fd.verify_day(SYM, gf, data_root=tmp_path, today=date(2024, 4, 2), pause=0,
+                        candles_only=True)
+    assert rep["exit_code"] == 0 and rep["plausibility"]["trading_weekday"] is False
+    # Feiertag ohne Daten: wie Wochenende (sofort bestaetigt) -> Exit 4 "Handelstag waehlen"
+    xmas = date(2024, 12, 25)
+    answers += [FakeResp(404), FakeResp(404)]
+    rep = fd.verify_day(SYM, xmas, data_root=tmp_path, today=date(2024, 12, 30), pause=0,
+                        candles_only=True)
+    assert rep["exit_code"] == 4 and "Feiertag" in rep["note"]

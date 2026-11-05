@@ -397,14 +397,17 @@ def test_m1_mode_bid_only_yearly_zip(tmp_path, clock):
     assert rep["exit_code"] == 0, rep
     assert site.requests == 2                                # eine Jahresdatei
     assert "1-minute-bar-quotes/xauusd/2024" in site.calls[0][1]
-    t = pq.read_table(hd.store_path(tmp_path, "XAUUSD", 2024, 7))
+    t = pq.read_table(hd.store_path(tmp_path, "XAUUSD", 2024, 7, "m1"))
+    assert "source=histdata_m1" in str(hd.store_path(tmp_path, "XAUUSD", 2024, 7, "m1"))
+    assert not hd.store_path(tmp_path, "XAUUSD", 2024, 7).exists()      # Tick-Partition unberuehrt
     assert t.schema.metadata[b"histdata_mode"] == b"histdata_m1"
     assert t.schema.metadata[b"spread_available"] == b"false"
     df = t.to_pandas()
     for k in ("open", "high", "low", "close"):
         assert (df[f"ask_{k}"] == df[f"bid_{k}"]).all()
     assert (df["tick_count"] == 1).all()
-    mrep = json.loads(hd.report_path(tmp_path, "XAUUSD", 2024, 7).read_text())
+    mrep = json.loads(hd.report_path(tmp_path, "XAUUSD", 2024, 7, "m1").read_text())
+    assert (df["source"] == "histdata_m1").all()
     assert mrep["mode"] == "histdata_m1" and mrep["spread_available"] is False
     assert mrep["raw_months"]["2024-06"]["file_rows"]["m1_exact_duplicates_dropped"] == 1
     assert mrep["m1_conflicting_minutes_merged"] == 1
@@ -458,17 +461,18 @@ def test_html_instead_of_zip_is_failure_not_data(tmp_path, clock):
     site.post_override = b"<html><body>Please complete the captcha</body></html>"
     rep = run(tmp_path, clock, site, attempts=2)
     assert rep["exit_code"] == 3
-    assert "HTML/Text statt ZIP" in rep["gaps"][0]["error"]
+    assert "HTML/Text statt ZIP" in rep["content_errors"][0]["error"]
     assert not any(hd.raw_dir(tmp_path, "XAUUSD", "tick").glob("*.zip"))
     assert not hd.store_path(tmp_path, "XAUUSD", 2024, 2).exists()
-    assert rep["summary"]["global_cooldowns"] >= 2
+    assert site.requests == 4                    # je Datei 1 Versuch (dauerhafter Fehler)
+    assert hd.Unit("XAUUSD", "tick", 2024, 2).marker(tmp_path, "failed").exists()
 
 
 def test_page_without_form_is_failure(tmp_path, clock):
     site = feb_site(clock)
     site.queue = [Resp(200, b"<html>Access denied</html>")] * 3
     rep = run(tmp_path, clock, site, attempts=3)
-    assert rep["exit_code"] == 3 and "Download-Formular" in rep["gaps"][0]["error"]
+    assert rep["exit_code"] == 3 and "Download-Formular" in rep["content_errors"][0]["error"]
 
 
 # ------------------------------------------------------------------ 429 ---
@@ -535,13 +539,15 @@ def test_recent_empty_month_is_pending(tmp_path, clock):
 
 
 def test_old_empty_month_confirmed_after_24h(tmp_path, clock):
-    site = Site(clock)
-    rep = run(tmp_path, clock, site, start=(2023, 5))
+    # Ticks erst ab Rohmonat 2023-06: leere Monate davor = vor Beginn der Tick-Historie
+    site = Site(clock, {("T", "202306"): tick_zip("XAUUSD", 2023, 6, price=1950.0)})
+    rep = run(tmp_path, clock, site, start=(2023, 5), end=(2023, 6))
     assert rep["exit_code"] == 3 and rep["status"] == "gaps"
     assert len(rep["unconfirmed"]) == 2
-    rep = run(tmp_path, clock, site, start=(2023, 5), now=NOW + timedelta(hours=25))
+    rep = run(tmp_path, clock, site, start=(2023, 5), end=(2023, 6), now=NOW + timedelta(hours=25))
     assert rep["exit_code"] == 0, rep
     assert "2023-05" in rep["summary"]["months_unavailable"]
+    assert rep["summary"]["months_written"] == ["2023-06"]
     info = json.loads(hd.Unit("XAUUSD", "tick", 2023, 5).marker(tmp_path, "empty").read_text())
     assert info["confirmed"] == "repeat" and info["checks"] == 2
 
@@ -671,3 +677,220 @@ def test_cli_verify_month(tmp_path, clock, monkeypatch):
     assert code == 0 and site.requests == 4
     assert "@" not in site.headers["User-Agent"]
     assert hd.verify_report_path(tmp_path, "XAUUSD", 2024, 2).exists()
+
+
+# ===================================================== Review-Regressionen ---
+def _zip_from(df, sym, y, m, status="HistData.com status report\n"):
+    return make_zip(sym, "T", f"{y}{m:02d}", tick_csv(df), status)
+
+
+def eu_dst_march(sym="XAUUSD"):
+    """Rohmonat 2024-03: UTC-5, ab EU-Umstellung 31.3. 01:00 UTC aber UTC-4 (Hypothese)."""
+    utc = market_utc(sym, pd.Timestamp("2024-02-29", tz="UTC"), pd.Timestamp("2024-04-02", tz="UTC"))
+    off = np.where(utc >= pd.Timestamp("2024-03-31 01:00", tz="UTC"), 4, 5)
+    raw = (utc - pd.to_timedelta(off, unit="h")).tz_localize(None)
+    keep = (raw >= pd.Timestamp("2024-03-01")) & (raw < pd.Timestamp("2024-04-01"))
+    i = (utc[keep].as_unit("ms").asi8 // 60_000).astype(float)
+    bid = np.round(BASE_PRICE[sym] * (1 + 0.002 * np.sin(i / 97.0)), 5)
+    return pd.DataFrame({"raw": raw[keep], "utc": utc[keep], "bid": bid, "ask": bid + SPREAD[sym]})
+
+
+def test_review1_dst_switch_at_month_end_is_caught():
+    df = eu_dst_march()
+    ms = _raw_ms(df)
+    rep = hd.check_timezone(ms, "XAUUSD", hd.raw_month_bounds_ms((2024, 3)))
+    assert hd.check_timezone(ms, "XAUUSD")["edge_violations"]     # Rand auch ohne bounds
+    assert not rep["ok"] and rep["edge_violations"] and "Monatsrand" in rep["reason"]
+    # Feiertag am Monatsrand (frueher Schluss, >= 2 h) bleibt erlaubt
+    hol = raw_month_ticks("XAUUSD", 2024, 7, early_close={date(2024, 7, 3): 13})
+    assert hd.check_timezone(_raw_ms(hol), "XAUUSD", hd.raw_month_bounds_ms((2024, 7)))["ok"]
+
+
+def test_review1_dst_switch_at_month_end_not_written(tmp_path, clock):
+    site = Site(clock, {("T", "202402"): tick_zip("XAUUSD", 2024, 2),
+                        ("T", "202403"): _zip_from(eu_dst_march(), "XAUUSD", 2024, 3)})
+    rep = run(tmp_path, clock, site, start=(2024, 3))
+    assert rep["exit_code"] == 4 and not hd.store_path(tmp_path, "XAUUSD", 2024, 3).exists()
+
+
+def test_review1_following_month_starting_shifted_blocks_month(tmp_path, clock):
+    files = {("T", "202402"): tick_zip("XAUUSD", 2024, 2), ("T", "202403"): tick_zip("XAUUSD", 2024, 3),
+             ("T", "202404"): tick_zip("XAUUSD", 2024, 4, stamping="ny")}
+    site = Site(clock, files)
+    rep = run(tmp_path, clock, site, start=(2024, 3), end=(2024, 4))
+    assert rep["exit_code"] == 4 and rep["summary"]["months_written"] == []
+    q = {r["month"]: r for r in rep["quarantined"]}
+    assert "Folge-Rohmonat 2024-04" in q["2024-03"]["reason"] and "2024-04" in q
+    # nur Maerz angefragt: April nicht im Cache -> keine Nachbarpruefung, Maerz geschrieben
+    rep = run(tmp_path / "b", clock, Site(clock, files), start=(2024, 3))
+    assert rep["exit_code"] == 0 and rep["summary"]["months_written"] == ["2024-03"]
+
+
+def test_review6_thin_market_night_gaps_are_no_break_anchors():
+    df = raw_month_ticks("XAGUSD", 2024, 1, stamping="est")
+    raw = pd.DatetimeIndex(df["raw"])
+    thin = df[~((raw.hour == 2) & (raw.dayofweek <= 3))]     # 02-03 Uhr roh ohne Ticks
+    rep = hd.check_timezone(_raw_ms(thin), "XAGUSD", hd.raw_month_bounds_ms((2024, 1)))
+    assert rep["ok"], rep["reason"]
+    assert rep["ignored_break_gaps"] > 0 and rep["share_expected"] == 1.0
+    ny = raw_month_ticks("XAGUSD", 2024, 7, stamping="ny")
+    raw = pd.DatetimeIndex(ny["raw"])
+    thin_ny = ny[~((raw.hour == 2) & (raw.dayofweek <= 3))]
+    assert not hd.check_timezone(_raw_ms(thin_ny), "XAGUSD", hd.raw_month_bounds_ms((2024, 7)))["ok"]
+
+
+def test_review2_429_on_post_restarts_with_fresh_token(tmp_path, clock):
+    site = feb_site(clock)
+    orig, n = site.post, {"k": 0}
+
+    def post(url, data=None, **k):
+        n["k"] += 1
+        if n["k"] == 1:
+            site.calls.append(("POST", url, clock.t))
+            return Resp(429, headers={"Retry-After": "1200"})
+        return orig(url, data=data, **k)
+
+    site.post = post
+    rep = run(tmp_path, clock, site, attempts=1)
+    assert rep["exit_code"] == 0, rep
+    methods = [m for m, _, _ in site.calls]
+    assert methods[:4] == ["GET", "POST", "GET", "POST"]          # neues Token nach der Pause
+    assert site.calls[2][2] - site.calls[1][2] >= 1200
+    assert rep["summary"]["global_cooldowns"] == 0 and rep["content_errors"] == []
+
+
+def _no_form_site(clock, bad_months, months=range(1, 7)):
+    site = Site(clock, {("T", f"2024{m:02d}"): tick_zip("XAUUSD", 2024, m) for m in months})
+    og = site.get
+
+    def get(url, **k):
+        if any(url.endswith(f"/2024/{m}") for m in bad_months):
+            site.calls.append(("GET", url, clock.t))
+            return Resp(200, b"<html>no form</html>")
+        return og(url, **k)
+
+    site.get = get
+    return site
+
+
+def test_review3_permanent_content_error_does_not_stall_backfill(tmp_path, clock):
+    site = _no_form_site(clock, bad_months=(1, 2))
+    rep = run(tmp_path, clock, site, start=(2024, 2), end=(2024, 6), attempts=5,
+              max_consecutive_failures=10)
+    assert rep["exit_code"] == 3 and not rep["summary"]["circuit_breaker"]
+    assert rep["summary"]["months_written"] == ["2024-04", "2024-05", "2024-06"]
+    assert sorted(r["file"] for r in rep["content_errors"]) == [
+        "HISTDATA_COM_ASCII_XAUUSD_T202401.zip", "HISTDATA_COM_ASCII_XAUUSD_T202402.zip"]
+    bad_calls = [c for c in site.calls if c[1].endswith(("/2024/1", "/2024/2"))]
+    assert len(bad_calls) == 2                                    # 1 Versuch je Datei
+    n = site.requests
+    rep = run(tmp_path, clock, site, start=(2024, 2), end=(2024, 6))
+    assert site.requests == n and rep["exit_code"] == 3          # < 24 h: zurueckgestellt
+    assert {r["status"] for r in rep["content_errors"]} == {"deferred"}
+    rep = run(tmp_path, clock, site, start=(2024, 2), end=(2024, 6), now=NOW + timedelta(hours=25))
+    assert site.requests == n + 2                                 # nach 24 h genau 1 Versuch je Datei
+
+
+def test_review3_content_errors_in_a_row_abort_run(tmp_path, clock):
+    site = _no_form_site(clock, bad_months=range(1, 7))
+    rep = run(tmp_path, clock, site, start=(2024, 2), end=(2024, 6))
+    assert rep["exit_code"] == 3 and rep["status"] == "aborted"
+    assert "Inhaltsfehler in Folge" in rep["summary"]["aborted"] and site.requests == 3
+
+
+def test_review4_systematic_empty_answers_in_history_abort(tmp_path, clock):
+    site = Site(clock, {("T", "202401"): tick_zip("XAUUSD", 2024, 1)})
+    rep = run(tmp_path, clock, site, start=(2024, 2), end=(2024, 6))
+    assert rep["exit_code"] == 3 and rep["status"] == "aborted"
+    assert "leere Antworten in Folge" in rep["summary"]["aborted"]
+    assert rep["summary"]["history_known_from"] == "2024-01"
+    assert site.requests == 2 + 3 * 2                             # Jan + 3 leere Monate, dann Stopp
+
+
+def test_review4_empties_before_first_data_do_not_abort(tmp_path, clock):
+    site = Site(clock, {("T", f"2009{m:02d}"): tick_zip("XAUUSD", 2009, m, price=950.0)
+                        for m in (8, 9)})                         # Ticks erst ab 2009-08
+    rep = run(tmp_path, clock, site, start=(2009, 3), end=(2009, 9))
+    assert rep["status"] != "aborted" and rep["summary"]["months_written"] == ["2009-09"]
+
+
+def test_review4_confirmed_empty_inside_history_is_exit_4_until_accepted(tmp_path, clock):
+    site = Site(clock, {("T", "202401"): tick_zip("XAUUSD", 2024, 1)})
+    assert run(tmp_path, clock, site)["exit_code"] == 3            # Feb leer, unbestaetigt
+    t1 = NOW + timedelta(hours=25)
+    rep = run(tmp_path, clock, site, now=t1)
+    assert rep["exit_code"] == 4 and rep["status"] == "quarantine"
+    assert rep["quarantined"][0]["kind"] == "missing_in_history"
+    assert "2024-02" in rep["summary"]["months_missing_in_history"]
+    marker = hd.Unit("XAUUSD", "tick", 2024, 2).marker(tmp_path, "empty")
+    info = json.loads(marker.read_text())
+    assert info["confirmed"] == "repeat" and info["confirmed_at"]
+    n = site.requests
+    assert run(tmp_path, clock, site, now=t1 + timedelta(days=1))["exit_code"] == 4
+    assert site.requests == n                                     # keine Anfrage vor 30 Tagen
+    run(tmp_path, clock, site, now=t1 + timedelta(days=31))
+    assert site.requests == n + 2                                 # nach 30 Tagen erneut geprueft
+    run(tmp_path, clock, site, now=t1 + timedelta(days=32), rebuild=True)
+    assert site.requests == n + 4                                 # --rebuild: sofort erneut
+    info = json.loads(marker.read_text())
+    marker.write_text(json.dumps({**info, "accepted": True}))
+    rep = run(tmp_path, clock, site, now=t1 + timedelta(days=33))
+    assert rep["exit_code"] == 0 and "2024-02" in rep["summary"]["months_unavailable"]
+
+
+def test_review5_quarantine_visible_when_gaps_win(tmp_path, clock, caplog):
+    site = Site(clock, {("T", "202401"): tick_zip("XAUUSD", 2024, 1),
+                        ("T", "202402"): tick_zip("XAUUSD", 2024, 2, stamping="utc")})
+    with caplog.at_level("ERROR", logger="histdata"):
+        rep = run(tmp_path, clock, site, start=(2024, 2), end=(2024, 3),
+                  now=datetime(2024, 4, 2, tzinfo=UTC))
+    assert rep["exit_code"] == 3 and rep["status"] == "pending+quarantine"
+    assert [r["month"] for r in rep["quarantined"]] == ["2024-02"]
+    assert any("MANUELLE PRUEFUNG" in r.getMessage() and "2024-02" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_review7_m1_never_overwrites_or_mixes_with_tick_store(tmp_path, clock):
+    out = hd.store_path(tmp_path, "XAUUSD", 2024, 2)              # Tick-Partition
+    bars = hd.ticks_to_bars(hd.parse_csv(tick_csv(raw_month_ticks("XAUUSD", 2024, 2).head(50)), "tick"))
+    hd.write_parquet(out, bars, "m1")                              # Altlast: m1 in Tick-Partition
+    before = out.read_bytes()
+    rep = run(tmp_path, clock, feb_site(clock), rebuild=True)
+    assert rep["exit_code"] == 4 and rep["quarantined"][0]["kind"] == "store_mode_conflict"
+    assert out.read_bytes() == before
+
+
+def test_review_low_short_first_month_checked_jointly(tmp_path, clock):
+    may = raw_month_ticks("XAGUSD", 2009, 5, price=14.0)
+    may = may[may["raw"] >= pd.Timestamp("2009-05-29 10:00")]       # nur ein Freitag
+    files = {("T", "200905"): _zip_from(may, "XAGUSD", 2009, 5),
+             ("T", "200906"): tick_zip("XAGUSD", 2009, 6, price=14.0)}
+    rep = run(tmp_path, clock, Site(clock, files), sym="XAGUSD", start=(2009, 5), end=(2009, 6))
+    assert rep["exit_code"] == 0, rep["quarantined"]
+    mrep = json.loads(hd.report_path(tmp_path, "XAGUSD", 2009, 5).read_text())
+    tz = mrep["raw_months"]["2009-05"]["timezone"]
+    assert tz["joint_with"] == ["2009-05", "2009-06"] and tz["alone"]["anchors"] < hd.TZ_MIN_ANCHORS
+    # ohne Nachbarmonat: nicht pruefbar -> Quarantaene mit klarer Meldung
+    rep = run(tmp_path / "b", clock, Site(clock, files), sym="XAGUSD", start=(2009, 5))
+    assert rep["exit_code"] == 4 and "NICHT PRUEFBAR" in rep["quarantined"][0]["reason"]
+
+
+def test_review_low_new_download_clears_quarantine(tmp_path, clock):
+    bad = {("T", "202406"): tick_zip("XAUUSD", 2024, 6, stamping="ny"),
+           ("T", "202407"): tick_zip("XAUUSD", 2024, 7, stamping="ny")}
+    assert run(tmp_path, clock, Site(clock, bad), start=(2024, 7))["exit_code"] == 4
+    for m in (6, 7):                                                # ZIP loeschen = neu laden
+        hd.Unit("XAUUSD", "tick", 2024, m).path(tmp_path).unlink()
+    good = Site(clock, {("T", "202406"): tick_zip("XAUUSD", 2024, 6),
+                        ("T", "202407"): tick_zip("XAUUSD", 2024, 7)})
+    rep = run(tmp_path, clock, good, start=(2024, 7))
+    assert rep["exit_code"] == 0 and good.requests == 4
+    assert not list(hd.raw_dir(tmp_path, "XAUUSD", "tick").glob("*.quarantine"))
+
+
+def test_review4_no_data_ever_is_not_silently_unavailable(tmp_path, clock):
+    site = Site(clock)                                            # immer leer (WAF/Token?)
+    assert run(tmp_path, clock, site)["exit_code"] == 3
+    rep = run(tmp_path, clock, site, now=NOW + timedelta(hours=25))
+    assert rep["exit_code"] == 4 and rep["summary"]["months_unavailable"] == {}
+    assert rep["quarantined"][0]["kind"] == "missing_in_history"
