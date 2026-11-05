@@ -64,8 +64,9 @@ verschoben geschrieben.
 Parquet-Metadatum source_timezone = SOURCE_TZ_META[mode]. Vorhandene
 Monatsdateien desselben Modus mit anderem source_timezone (alte Version: fest
 UTC-5 auch fuer Ticks, Sommermonate um 1 h verschoben) werden im naechsten
-Lauf automatisch aus dem Roh-Cache neu gebaut (WARNING, Laufreport
-"rebuilt_timezone"). Quarantaene-Marker tragen raw_tz und tz_check_version;
+Lauf sofort nach metals/stale/ verschoben (der Bot sieht eher eine Luecke als
+einen verschobenen Monat) und automatisch aus dem Roh-Cache neu gebaut
+(WARNING, Laufreport "rebuilt_timezone"). Quarantaene-Marker tragen raw_tz und tz_check_version;
 Marker einer aelteren Pruefversion (ohne diese Felder) werden entfernt und der
 Rohmonat ohne Download neu geprueft - ausser sie sind "accepted": true.
 
