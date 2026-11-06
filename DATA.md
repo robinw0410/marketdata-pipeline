@@ -362,6 +362,20 @@ Zeitzone und Monatsgrenze:
   min in diese Stunde trennt -4 h (davor) von -5 h (ab ihm); ohne ihn ->
   TimezoneError (Quarantaene), nie geraten, nie verworfen. check_timezone
   erwartet ihn (expected_reversals; kein large_reversal, nie freigebbar).
+  ">= 30 min" ist ueberall derselbe Vergleich, der Faltensprung kommt ueberall
+  aus fold_reversal; die Aufloesung muss in Dateireihenfolge monotone UTC
+  ergeben (Toleranz 5 s), sonst unaufgeloest.
+- Unaufgeloeste Herbststunde (duenne Daten, keine Ticks auf einer Seite,
+  Sprung < 30 min, nicht monoton): Marker traegt fold_unresolved (date,
+  ticks, first_raw, last_raw); "accepted" und Wochenend-Freigabe helfen nicht.
+  Nach Pruefung: fetch_histdata.py --symbol SYM --resolve-fold YYYY-MM --side
+  pre|post|split-at ROHZEIT (pre: alle Ticks der Stunde vor der Umstellung,
+  post: alle danach, split-at: in Dateireihenfolge ab dem ersten Tick mit
+  dieser Rohzeit danach). Zeigt jeden Tick mit UTC, prueft Monotonie, setzt
+  nur fold_resolution im Marker (kein Download; sonst Exit 2 mit Grund). Der
+  naechste Lauf rechnet damit, prueft neu (Nacht ok, resolved_manually) und
+  schreibt bei Erfolg; der Marker bleibt. Gilt nur fuer genau diese Ticks
+  (Anzahl, erste/letzte Rohzeit), sonst ungueltig -> Quarantaene.
 - Fruehjahr: roh So 18:59:59 -> 20:00:00 (23:59:59 UTC -> Mo 00:00 UTC), roh
   So 19:00-19:59:59.999 existiert nicht (Tick dort -> TimezoneError). Noch an
   den Daten zu bestaetigen: der Survey berichtet je Umstellungsnacht.
@@ -656,10 +670,14 @@ Ergebnis lesen:
   der Dateireihenfolge mit Rohzeit, Minuten, Tick-Zahl und ob er im
   geschlossenen Wochenendmarkt liegt.
 - Kontroll-Ausschluss: faellt eine Regel in einem Kontrollmonat (Januar,
-  Juli oder jeder Monat ohne Fenster zwischen den Sommerzeit-Regeln) eines
-  Jahres durch, zaehlt sie in den Umstellungsmonaten DESSELBEN Jahres nicht
-  mit. Tabelle: "fixed_est ausgeschlossen (2019-07: +1.0 h)" (Abweichung der
-  Regel im Kontrollmonat); Liste "Ausgeschlossen fuer die Umstellungsmonate".
+  Juli oder jeder Monat ohne Fenster zwischen den Sommerzeit-Regeln) TRENNEND
+  durch - eine andere Regel besteht denselben Monat desselben Metalls und die
+  Median-Abweichung ist nicht 0 -, zaehlt sie in den Umstellungsmonaten
+  DESSELBEN Jahres fuer DIESES Metall nicht mit. Tabelle: "fixed_est
+  ausgeschlossen (2019-07: +1.0 h)"; Liste "Ausgeschlossen fuer die
+  Umstellungsmonate" je Jahr und Metall. Scheitern in einem Kontrollmonat alle
+  Regeln (Datenfehler, z.B. ein Werktags-Ruecksprung), steht er als
+  "Kontrolle unbrauchbar" da (JSON unusable_controls) und schliesst nichts aus.
 - Regelfamilien: berlin_minus_6 und berlin_minus_6_utc_midnight
   unterscheiden sich nur an den EU-Sonntagen (je Jahr ca. 46 h).
 - Entscheidend ist ein Rohmonat, in dem alle bestehenden, nicht

@@ -425,10 +425,18 @@ def test_jan_jul_and_apr_sep_raw_months_convert_identically(year):
         assert (fh.raw_to_utc_ms(raw[ok], rule(NYL)) != fh.raw_to_utc_ms(raw[ok], rule(B6))).any()
 
 
-def test_v6_schedule_config():
+def test_v6_schedule_config(v6_config_file):
     """Der v6-Fahrplan (explizit, s. _v6_config) wird weiter geladen: undecided-Eintrag."""
-    assert fh.TZ_CHECK_VERSION >= 6
+    assert fh.TZ_CHECK_VERSION == 7                  # aktuelle Version (v6-Mechanik bleibt)
     cfg = fh.load_tz_config()
+    assert Path(cfg.path) == v6_config_file
+    sched = cfg.schedule["tick"]
+    assert [ym for ym, _ in sched] == [(2000, 1), (2018, 12), (2021, 3)]
+    assert sched[0][1] == rule(NYL) and sched[2][1] == rule(B6)
+    assert isinstance(sched[1][1], fh.UndecidedRule)
+    assert sched[1][1].name == "undecided" and sched[1][1].candidates == (rule(NYL), rule(B6))
+    assert [ym for ym, _ in cfg.schedule["m1"]] == [(2000, 1)]
+    assert cfg.schedule["m1"][0][1] == rule("fixed_est")
     for ym in ((2000, 1), (2009, 3), (2015, 3), (2018, 11)):
         assert fh.rule_for("tick", ym, cfg) == rule(NYL), ym
     for ym in ((2018, 12), (2019, 3), (2019, 7), (2020, 10), (2021, 2)):

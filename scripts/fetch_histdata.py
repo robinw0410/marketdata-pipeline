@@ -53,7 +53,12 @@ Rohmonatsgrenzen.
   Herbst: roh So 19:00-19:59:59.999 kommt ZWEIMAL vor (Markt offen, 23:00-
   01:00 UTC); raw_to_utc_ms loest nach DATEIREIHENFOLGE auf: der erste
   Ruecksprung >= 30 min in diese Stunde trennt -4 h (davor) von -5 h (ab
-  ihm); fehlt er -> TimezoneError (nie raten, nie verwerfen). check_timezone
+  ihm; fold_reversal, gemeinsam fuer Umrechnung, Pruefung und Bericht; die
+  UTC muss danach in Dateireihenfolge monoton sein, Toleranz FOLD_JITTER_MS);
+  fehlt er -> TimezoneError (nie raten, nie verwerfen), Marker mit
+  fold_unresolved; dann nur von Hand: --resolve-fold YYYY-MM --side
+  pre|post|split-at ROHZEIT setzt fold_resolution im Marker (gilt nur fuer
+  genau diese Ticks: Anzahl, erste/letzte Rohzeit). check_timezone
   erwartet diesen Ruecksprung (expected_reversals, kein large_reversal, nie
   verwerfbar) und berichtet je Umstellung transition_nights (status ok |
   no_data | unexpected; unexpected = Fehler). Fruehjahr: roh So 18:59:59 ->
@@ -205,6 +210,7 @@ Usage:
     python fetch_histdata.py --symbol XAGUSD --start 2024-01 --end 2024-06 --mode m1
     python fetch_histdata.py --symbol XAUUSD --verify-month 2024-03
     python fetch_histdata.py --symbol XAUUSD --accept-weekend-ticks 2024-10   # Exit 0/2
+    python fetch_histdata.py --symbol XAUUSD --resolve-fold 2024-10 --side pre   # Exit 0/2
     python fetch_histdata.py --symbol XAUUSD --mode m1 --verify-month 2024-07   # M1-Zeitzone pruefen
 """
 from __future__ import annotations
@@ -327,7 +333,8 @@ TZ_TIGHT_MS = 10 * MIN_MS  # Einzelseite: Tick so nah an einer vollen Stunde ...
 TZ_ACTIVE_MS = 5 * MIN_MS  # ... und Markt dort aktiv (Nachbartick so nah)
 TZ_TRANSITION_MS = 7 * DAY_MS   # Umstellungsfenster (nur Bericht)
 TZ_PAD_MS = 8 * DAY_MS     # so viele Tage der Nachbar-Rohmonate als Kontext (Laeufe ueber den Monatsrand)
-REGRESSION_MAX_MS = 30 * MIN_MS  # Ruecksprung in Dateireihenfolge ab dem -> Uhrumstellung
+REGRESSION_MAX_MS = 30 * MIN_MS  # Ruecksprung in Dateireihenfolge ab dem (>=) -> Uhrumstellung
+FOLD_JITTER_MS = 5_000           # Toleranz: UTC in der aufgeloesten Herbstnacht monoton bis auf Tick-Jitter
 WEEKEND_GAP_MS = 24 * HOUR_MS
 BREAK_GAP_MS = (45 * MIN_MS, 3 * HOUR_MS)
 CLOSE_H_NY = 17
@@ -885,7 +892,7 @@ def _raw_to_utc_undecided(raw_ms: np.ndarray, rule: "UndecidedRule") -> np.ndarr
     return conv.ref
 
 
-def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
+def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule, fold_resolution: dict | None = None) -> np.ndarray:
     """
     Rohzeit-ms (Wanduhr-Ziffern, als UTC gelesen) -> UTC-ms nach `rule`
     (int64, gleiche Reihenfolge/Laenge): roh - shift_h ist Ortszeit in
@@ -900,6 +907,10 @@ def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
     19:00-19:59:59.999 (berlin_minus_6_utc_midnight) -> TimezoneError; doppelte
     Herbststunde nach DATEIREIHENFOLGE aufgeloest (_resolve_fold), ohne
     Ruecksprung -> TimezoneError. raw_ms muss daher in Dateireihenfolge sein.
+    fold_resolution: menschliche Aufloesung einer Herbstnacht ohne erkennbaren
+    Ruecksprung (Marker, --resolve-fold): gilt nur fuer genau die Ticks, die
+    sie beschreibt (Anzahl, erste/letzte Rohzeit), sonst TimezoneError.
+    TimezoneError traegt bad_mask und fold_unresolved (dict oder None).
     """
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
     if not len(raw_ms):
@@ -920,12 +931,14 @@ def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
         late[ok] = u[ok]
         n_ok += ok
     unresolved = n_ok > 1
+    fold_info = None
     if rule.kind == "dst_daily_utc" and unresolved.any():
-        unresolved = _resolve_fold(raw_ms, unresolved, out, late)
+        unresolved, fold_info = _resolve_fold(raw_ms, unresolved, out, late, rule, fold_resolution)
     if (n_ok == 0).any() or unresolved.any():
         bad = (n_ok == 0) | unresolved
         msg = []
-        amb_what = ("mehrdeutiger Rohzeit (doppelte Stunde) OHNE Ruecksprung in Dateireihenfolge"
+        amb_what = ("mehrdeutiger Rohzeit (doppelte Stunde) OHNE Ruecksprung (eindeutig, >= 30 min) in "
+                    "Dateireihenfolge (oder UTC danach nicht monoton)"
                     if rule.kind == "dst_daily_utc" else "mehrdeutiger Ortszeit (Sommerzeitende)")
         for mask, what in ((n_ok == 0, "nicht existierender Ortszeit (Sommerzeitbeginn)"),
                            (unresolved, amb_what)):
@@ -933,34 +946,137 @@ def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
             if len(idx):
                 ex = ", ".join(_raw_iso(int(raw_ms[i]), ms_digits=True) for i in idx[:5])
                 msg.append(f"{len(idx)} Zeitstempel (roh) in {what} nach {rule.describe()}, z.B. {ex}")
+        if fold_info and fold_info.get("resolution_mismatch"):
+            msg.append(f"Faltenaufloesung im Marker passt nicht (mehr) zu den Daten: "
+                       f"{fold_info['resolution_mismatch']}")
         err = TimezoneError("; ".join(msg) + " - nie geraten, nicht umgerechnet")
         err.bad_mask = bad
+        err.fold_unresolved = fold_info
         raise err
     return out
 
 
-def _resolve_fold(raw_ms: np.ndarray, amb: np.ndarray, early: np.ndarray, late: np.ndarray) -> np.ndarray:
+def _big_drops(raw_ms: np.ndarray) -> np.ndarray:
+    """Indizes j (Tick NACH dem Sprung) mit raw[j] <= raw[j-1] - REGRESSION_MAX_MS:
+    Ruecksprung >= 30 min in Dateireihenfolge. EINZIGE Definition (Pruefung,
+    Faltenaufloesung, Bericht)."""
+    raw_ms = np.asarray(raw_ms, dtype=np.int64)
+    if len(raw_ms) < 2:
+        return np.array([], dtype=np.int64)
+    return np.nonzero(raw_ms[1:] <= raw_ms[:-1] - REGRESSION_MAX_MS)[0] + 1
+
+
+def _fold_monotone(raw_ms: np.ndarray, w: dict, is_post: np.ndarray) -> bool:
+    """UTC in Dateireihenfolge ueber die Herbstnacht (erster bis letzter Tick der
+    doppelten Stunde, je ein Nachbar) monoton bis auf FOLD_JITTER_MS, wenn die
+    Ticks der Stunde mit is_post den Offset danach, sonst den davor bekommen."""
+    inf = (raw_ms >= w["lo"]) & (raw_ms < w["hi"])
+    idx = np.nonzero(inf)[0]
+    if not len(idx):
+        return True
+    a, b = max(int(idx[0]) - 1, 0), int(idx[-1]) + 2
+    r, f, p = raw_ms[a:b], inf[a:b], is_post[a:b]
+    off = np.where(f, np.where(p, w["post_ms"], w["pre_ms"]),
+                   np.where(r < w["lo"], w["pre_ms"], w["post_ms"]))
+    return bool((np.diff(r - off) >= -FOLD_JITTER_MS).all())
+
+
+def fold_reversal(raw_ms: np.ndarray, w: dict, drops: np.ndarray | None = None) -> int | None:
+    """Der Ruecksprung einer Herbstnacht (dst_daily_utc, Fenster w aus rule_windows):
+    erster Index j (Dateireihenfolge) mit Ruecksprung >= 30 min (_big_drops), bei
+    dem raw[j-1] UND raw[j] in der doppelten Rohstunde [lo, hi) liegen, und nur
+    wenn die Aufloesung (davor Offset vor, ab j Offset nach der Umstellung) eine
+    in Dateireihenfolge monotone UTC ergibt (_fold_monotone). Sonst None.
+    Gemeinsame Quelle fuer raw_to_utc_ms, check_timezone (expected_reversals)
+    und transition_nights."""
+    raw_ms = np.asarray(raw_ms, dtype=np.int64)
+    drops = _big_drops(raw_ms) if drops is None else drops
+    if not len(drops):
+        return None
+    lo, hi = w["lo"], w["hi"]
+    ok = drops[(raw_ms[drops] >= lo) & (raw_ms[drops] < hi) & (raw_ms[drops - 1] >= lo) & (raw_ms[drops - 1] < hi)]
+    if not len(ok):
+        return None
+    j = int(ok[0])
+    is_post = np.arange(len(raw_ms)) >= j
+    return j if _fold_monotone(raw_ms, w, is_post) else None
+
+
+def fold_info(raw_ms: np.ndarray, w: dict) -> dict:
+    """Beschreibung der Ticks einer Herbstnacht (fold_unresolved / fold_resolution)."""
+    sub = raw_ms[(raw_ms >= w["lo"]) & (raw_ms < w["hi"])]
+    return {"date": w["date"], "ticks": int(len(sub)),
+            "first_raw": _raw_iso(int(sub.min()), ms_digits=True) if len(sub) else None,
+            "last_raw": _raw_iso(int(sub.max()), ms_digits=True) if len(sub) else None}
+
+
+def _manual_fold(raw_ms: np.ndarray, w: dict, res: dict) -> tuple[np.ndarray | None, str | None]:
+    """Menschliche Aufloesung (fold_resolution) anwenden -> (is_post je Tick, Fehler).
+    Gilt nur, wenn Datum, Anzahl und erste/letzte Rohzeit der Ticks genau passen."""
+    info = fold_info(raw_ms, w)
+    want = {k: res.get(k) for k in ("date", "ticks", "first_raw", "last_raw")}
+    if want != info:
+        return None, f"Marker {want} != Daten {info}"
+    inf = (raw_ms >= w["lo"]) & (raw_ms < w["hi"])
+    side = res.get("side")
+    if side == "pre":
+        is_post = np.zeros(len(raw_ms), dtype=bool)
+    elif side == "post":
+        is_post = np.ones(len(raw_ms), dtype=bool)
+    elif side == "split-at":
+        at = res.get("split_at_raw")
+        hit = np.nonzero(inf & (raw_ms == _parse_raw_ts(at)))[0] if at else []
+        if not len(hit):
+            return None, f"split-at {at!r} ist kein Tick der doppelten Stunde"
+        is_post = np.arange(len(raw_ms)) >= int(hit[0])
+    else:
+        return None, f"unbekannte Seite {side!r}"
+    if not _fold_monotone(raw_ms, w, is_post):
+        return None, f"Aufloesung {side} ergibt keine monotone UTC in Dateireihenfolge"
+    return is_post, None
+
+
+def _parse_raw_ts(s: str) -> int:
+    """Rohzeit 'YYYY-MM-DD HH:MM:SS[.mmm]' (auch mit T) -> Rohzeit-ms."""
+    s = str(s).replace("T", " ")
+    fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in s else "%Y-%m-%d %H:%M:%S"
+    return int(datetime.strptime(s, fmt).replace(tzinfo=UTC).timestamp() * 1000)
+
+
+def _resolve_fold(raw_ms: np.ndarray, amb: np.ndarray, early: np.ndarray, late: np.ndarray,
+                  rule: TzRule, fold_resolution: dict | None = None) -> tuple[np.ndarray, dict | None]:
     """dst_daily_utc, doppelte Rohstunde (Herbst, roh So 19:00-19:59:59.999 bei
-    berlin_minus_6_utc_midnight): nach DATEIREIHENFOLGE aufloesen. Je Rohtag der
-    erste Index i mit raw[i] < raw[i-1] - 30 min und raw[i] in der doppelten
-    Stunde: mehrdeutige Ticks davor bekommen den Offset VOR der Umstellung
-    (fruehere UTC, in `early`), ab i den danach (`late`, wird nach early
-    kopiert). Ohne solchen Ruecksprung bleiben sie unaufgeloest (Rueckgabe-
-    Maske) -> TimezoneError; nie verworfen, nie geraten."""
-    idx = np.nonzero(amb)[0]
-    days = raw_ms[idx] // DAY_MS
-    jumps = np.nonzero((raw_ms[1:] < raw_ms[:-1] - REGRESSION_MAX_MS) & amb[1:])[0] + 1
+    berlin_minus_6_utc_midnight): nach DATEIREIHENFOLGE aufloesen (fold_reversal):
+    mehrdeutige Ticks vor dem Ruecksprung bekommen den Offset VOR der Umstellung
+    (fruehere UTC, in `early`), ab ihm den danach (`late`, nach early kopiert).
+    Ohne eindeutigen Ruecksprung (duenne Daten, Sprung < 30 min, nicht monoton)
+    nur mit passender menschlicher fold_resolution; sonst bleiben sie
+    unaufgeloest -> (Maske, fold_info der ersten offenen Nacht) -> TimezoneError.
+    Nie verworfen, nie geraten."""
     unresolved = amb.copy()
-    for d in np.unique(days):
-        mine = idx[days == d]
-        j = jumps[raw_ms[jumps] // DAY_MS == d]
-        if not len(j):
+    first_open = None
+    drops = _big_drops(raw_ms)
+    for w in rule_windows(rule, int(raw_ms.min()), int(raw_ms.max()) + 1):
+        if w["kind"] != "fall":
             continue
-        i = int(j[0])
-        after = mine[mine >= i]
-        early[after] = late[after]
+        mine = np.nonzero(amb & (raw_ms >= w["lo"]) & (raw_ms < w["hi"]))[0]
+        if not len(mine):
+            continue
+        j = fold_reversal(raw_ms, w, drops)
+        if j is not None:
+            is_post = np.arange(len(raw_ms)) >= j
+        elif fold_resolution and fold_resolution.get("date") == w["date"]:
+            is_post, why = _manual_fold(raw_ms, w, fold_resolution)
+            if is_post is None:
+                first_open = first_open or {**fold_info(raw_ms, w), "resolution_mismatch": why}
+                continue
+        else:
+            first_open = first_open or fold_info(raw_ms, w)
+            continue
+        post = mine[is_post[mine]]
+        early[post] = late[post]
         unresolved[mine] = False
-    return unresolved
+    return unresolved, first_open
 
 
 # Geschlossener Wochenendmarkt nach ROHuhr, konservativ ueber alle Regeln und
@@ -984,14 +1100,17 @@ def weekend_closed_raw(raw_ms: np.ndarray) -> np.ndarray:
     return (pos >= wa * DAY_MS + ha * HOUR_MS) & (pos < wb * DAY_MS + hb * HOUR_MS)
 
 
-def _rules_in(raw_ms: np.ndarray, mode: str, rule=None) -> list:
-    """Konkrete Regeln der Rohmonate in raw_ms (oder nur `rule`)."""
+def _rules_in(raw_ms: np.ndarray, mode: str, rule=None, all_candidates: bool = False) -> list:
+    """Konkrete Regeln der Rohmonate in raw_ms (oder nur `rule`); "undecided": der
+    erste Kandidat bzw. mit all_candidates alle (erwartete Herbstsprung-Ticks)."""
+    def pick(r):
+        return list(rule_candidates(r)) if all_candidates else [concrete_rule(r)]
     if rule is not None:
-        return [concrete_rule(rule)]
+        return pick(rule)
     if not len(raw_ms):
         return []
     ks = np.unique(_raw_month_index(np.asarray(raw_ms, dtype=np.int64)))
-    return list(dict.fromkeys(concrete_rule(rule_for(mode, (int(k) // 12, int(k) % 12 + 1))) for k in ks))
+    return list(dict.fromkeys(c for k in ks for c in pick(rule_for(mode, (int(k) // 12, int(k) % 12 + 1)))))
 
 
 def rule_windows(rule, raw_lo: int, raw_hi: int) -> list[dict]:
@@ -1011,34 +1130,28 @@ def rule_windows(rule, raw_lo: int, raw_hi: int) -> list[dict]:
             continue
         day = (t - 1 if rule.kind == "dst_daily_utc" else t) // DAY_MS
         out.append({"kind": "fall" if post < pre else "spring", "t_utc": t, "lo": lo, "hi": hi,
-                    "pre_h": pre / HOUR_MS, "post_h": post / HOUR_MS,
+                    "pre_h": pre / HOUR_MS, "post_h": post / HOUR_MS, "pre_ms": pre, "post_ms": post,
                     "date": str(np.datetime64(int(day), "D"))})
     return out
 
 
 def expected_fold_jumps(raw_ms: np.ndarray, mode: str = "tick", rule=None) -> dict[int, dict]:
-    """dst_daily_utc: der ERWARTETE Ruecksprung je Herbst-Umstellung (erster Index j
-    mit raw[j] < raw[j-1] - 30 min, raw[j] in der doppelten Rohstunde und raw[j-1]
-    vor ihrem Ende) -> {j-1 (Index in np.diff): Fenster}. Derselbe, den
-    raw_to_utc_ms zur Aufloesung nach Dateireihenfolge nimmt."""
+    """dst_daily_utc: der ERWARTETE Ruecksprung je Herbst-Umstellung (fold_reversal,
+    derselbe, den raw_to_utc_ms zur Aufloesung nimmt) -> {j-1 (Index in np.diff): Fenster}."""
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
     out: dict[int, dict] = {}
-    if len(raw_ms) < 2:
-        return out
-    jumps = np.nonzero(raw_ms[1:] < raw_ms[:-1] - REGRESSION_MAX_MS)[0] + 1
-    if not len(jumps):
+    drops = _big_drops(raw_ms)
+    if not len(drops):
         return out
     lo_all, hi_all = int(raw_ms.min()), int(raw_ms.max()) + 1
-    for r in _rules_in(raw_ms, mode, rule):
+    # "undecided": alle Kandidaten (ist die Tagesregel darunter, ist ihr Sprung erwartet)
+    for r in _rules_in(raw_ms, mode, rule, all_candidates=True):
         if r.kind != "dst_daily_utc":
             continue
         for w in rule_windows(r, lo_all, hi_all):
-            if w["kind"] != "fall":
-                continue
-            ok = jumps[(raw_ms[jumps] >= w["lo"]) & (raw_ms[jumps] < w["hi"])]
-            if len(ok):
-                j = int(ok[0])
-                if w["lo"] - HOUR_MS <= raw_ms[j - 1] < w["hi"]:
+            if w["kind"] == "fall":
+                j = fold_reversal(raw_ms, w, drops)
+                if j is not None:
                     out[j - 1] = w
     return out
 
@@ -1052,8 +1165,7 @@ def _reversal_mask(raw_ms: np.ndarray, skip=()) -> tuple[np.ndarray, list[dict]]
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
     mask = np.zeros(len(raw_ms), dtype=bool)
     out = []
-    d0 = np.diff(raw_ms)
-    for i in np.nonzero(d0 <= -REGRESSION_MAX_MS)[0]:
+    for i in _big_drops(raw_ms) - 1:
         if int(i) in skip:                       # erwarteter Ruecksprung (doppelte Rohstunde)
             continue
         at, back = int(raw_ms[i]), int(raw_ms[i + 1])
@@ -1737,7 +1849,8 @@ def _wd(ms: int) -> int:
 
 def check_timezone(raw_ms: np.ndarray, symbol: str,
                    bounds: tuple[int, int] | None = None, mode: str = "tick",
-                   rule: TzRule | None = None, neighbours: tuple = (None, None)) -> dict:
+                   rule: TzRule | None = None, neighbours: tuple = (None, None),
+                   fold_resolution: dict | None = None) -> dict:
     """
     Impliziten Offset (Rohzeit - UTC, ganze Stunden) aus Marktluecken schaetzen
     (Marktzeiten bleiben New York/CME) und mit dem erwarteten Offset der
@@ -1817,17 +1930,28 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
     rep["max_reversal_s"] = float(max(0, -int(d0.min())) / 1000) if len(d0) else 0.0
     # erwarteter Ruecksprung der doppelten Rohstunde (dst_daily_utc, Herbst): kein Fehler
     exp_jumps = expected_fold_jumps(raw_ms, mode, fixed)
+    if fold_resolution and fold_resolution.get("side") == "split-at" and len(raw_ms):
+        # von Hand gesetzter Trennpunkt: ein Ruecksprung genau dort ist erwartet
+        for r_ in _rules_in(raw_ms, mode, fixed):
+            for w in (rule_windows(r_, int(raw_ms.min()), int(raw_ms.max()) + 1)
+                      if r_.kind == "dst_daily_utc" else []):
+                if w["kind"] != "fall" or w["date"] != fold_resolution.get("date"):
+                    continue
+                is_post, _ = _manual_fold(raw_ms, w, fold_resolution)
+                if is_post is not None and is_post.any():
+                    j = int(np.argmax(is_post))
+                    if j in set(_big_drops(raw_ms).tolist()):
+                        exp_jumps[j - 1] = w
     rep["expected_reversals"] = [
         {"at_raw": _raw_iso(int(raw_ms[i])), "back_to_raw": _raw_iso(int(raw_ms[i + 1])),
          "minutes": round(-int(d0[i]) / MIN_MS, 1), "date": w["date"],
          "fold_raw": [_raw_iso(w["lo"]), _raw_iso(w["hi"])]} for i, w in sorted(exp_jumps.items())]
-    large = np.array([i for i in np.nonzero(d0 <= -REGRESSION_MAX_MS)[0] if int(i) not in exp_jumps],
-                     dtype=np.int64)
+    large = np.array([i for i in _big_drops(raw_ms) - 1 if int(i) not in exp_jumps], dtype=np.int64)
     # betroffene Ticks je Ruecksprung: Rohzeit in [zurueck_auf, bei]
     rev_mask, rev_rows = _reversal_mask(raw_ms, exp_jumps)
     rep["large_reversals"] = rev_rows[:N_EXAMPLES]
     rep["reversal_ticks_total"] = int(rev_mask.sum())
-    rep["transition_nights"] = transition_nights(raw_ms, mode, fixed, bounds, exp_jumps)
+    rep["transition_nights"] = transition_nights(raw_ms, mode, fixed, bounds, exp_jumps, fold_resolution)
     _, rel = weekend_release(raw_ms, mode, fixed)
     if rel is not None:
         # alle Ruecksprung- und Verbotene-Stunden-Ticks im geschlossenen Wochenendmarkt:
@@ -2038,7 +2162,7 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
 
 
 def transition_nights(raw_ms: np.ndarray, mode: str = "tick", rule=None, bounds=None,
-                      exp_jumps: dict | None = None) -> list[dict]:
+                      exp_jumps: dict | None = None, fold_resolution: dict | None = None) -> list[dict]:
     """
     Bericht je Umstellung im Rohmonat (bounds; sonst Spanne der Ticks): fuer die
     Regel(n) des Monats je Offset-Wechsel ein Eintrag (date, kind spring/fall,
@@ -2054,15 +2178,16 @@ def transition_nights(raw_ms: np.ndarray, mode: str = "tick", rule=None, bounds=
     fixed_est): zusaetzlich ein Eintrag rule_transition=False je EU-Sonntag mit
     der Beobachtung im Fenster von berlin_minus_6_utc_midnight (observed:
     fold_reversal|gap|continuous|ambiguous|no_data; nie ein Fehler).
+    Der Herbst-Ruecksprung kommt aus fold_reversal (dieselbe Quelle wie die
+    Umrechnung); passende menschliche fold_resolution: status ok,
+    resolved_manually true. exp_jumps wird nicht mehr gebraucht (Kompatibilitaet).
     """
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
     if not len(raw_ms) and bounds is None:
         return []
     blo, bhi = bounds if bounds is not None else (int(raw_ms.min()), int(raw_ms.max()) + 1)
-    if exp_jumps is None:
-        exp_jumps = expected_fold_jumps(raw_ms, mode, rule)
-    exp_post = {i + 1 for i in exp_jumps}
     srt = np.sort(raw_ms)
+    drops = _big_drops(raw_ms)
 
     def count(a, b):
         return int(np.searchsorted(srt, b) - np.searchsorted(srt, a))
@@ -2083,10 +2208,11 @@ def transition_nights(raw_ms: np.ndarray, mode: str = "tick", rule=None, bounds=
              "window_raw": [_raw_iso(lo), _raw_iso(hi)], "reversal_found": False,
              "weekend_closed": bool(weekend_closed_raw(np.array([lo, hi - 1])).all())}
         if w["kind"] == "fall":
-            post = [j for j in exp_post if lo <= raw_ms[j] < hi] if own else []
-            if not post:
-                jumps = np.nonzero(raw_ms[1:] < raw_ms[:-1] - REGRESSION_MAX_MS)[0] + 1
-                post = [int(j) for j in jumps if lo <= raw_ms[j] < hi][:1]
+            j0 = fold_reversal(raw_ms, w, drops)
+            post = [] if j0 is None else [j0]
+            manual = (own and r.kind == "dst_daily_utc" and not post and fold_resolution
+                      and fold_resolution.get("date") == w["date"]
+                      and _manual_fold(raw_ms, w, fold_resolution)[0] is not None)
             e["expected"] = (f"roh {_raw_iso(hi - 1000)} -> {_raw_iso(lo)} (Rohstunde doppelt, "
                              f"Offset {w['pre_h']:+g} -> {w['post_h']:+g} h um "
                              f"{_raw_iso(w['t_utc'])} UTC; Aufloesung nach Dateireihenfolge)" if own else
@@ -2103,6 +2229,9 @@ def transition_nights(raw_ms: np.ndarray, mode: str = "tick", rule=None, bounds=
                 e["observed"] = ("fold_reversal" if post else "ambiguous" if n_in and not both
                                  else "continuous" if n_in or both else "no_data")
                 e["status"] = "ok" if (n_in or both) else "no_data"
+            elif manual:
+                e.update(status="ok", resolved_manually=True, fold_resolution=fold_resolution,
+                         detail="doppelte Rohstunde von Hand aufgeloest (--resolve-fold)")
             elif r.kind == "dst_daily_utc":
                 e["status"] = ("ok" if post else "unexpected" if (n_in or both) else "no_data")
                 e["detail"] = ("doppelte Rohstunde ohne Ruecksprung in Dateireihenfolge "
@@ -2481,6 +2610,8 @@ class Ctx:
         if info.get("accepted") and same_tz:
             return True, None
         if not info.get("accepted") and same_tz and info.get("tz_check_version") == TZ_CHECK_VERSION:
+            if isinstance(info.get("fold_resolution"), dict):
+                return False, None          # menschliche Faltenaufloesung: neu rechnen, Marker bleibt
             raise Quarantined(u, ym, info.get("reason") or "Quarantaene", info.get("check"))
         log.warning("Quarantaene-Marker %s stammt aus aelterer Zeitzonen-Pruefung (Version %s, %s%s) - "
                     "Rohmonat wird neu geprueft (ohne Download)", q.name,
@@ -2509,7 +2640,8 @@ class Ctx:
         pad["provisional"] = pad["left_missing"] or pad["right_missing"]
         return (left, right), pad
 
-    def _convert(self, raw: np.ndarray, rule, u: Unit, ym: tuple[int, int]) -> np.ndarray:
+    def _convert(self, raw: np.ndarray, rule, u: Unit, ym: tuple[int, int],
+                 fold_resolution: dict | None = None) -> np.ndarray:
         """Rohzeit -> UTC nach der Regel des Rohmonats (TimezoneError wie raw_to_utc_ms).
         "undecided": UTC des ersten Kandidaten, der umrechnen kann; Ticks, die die
         Kandidaten verschieden (oder nicht alle) umrechnen, werden mit den echten
@@ -2517,7 +2649,7 @@ class Ctx:
         keinen UTC-Monat, in den einer davon fallen kann. Kann kein Kandidat
         umrechnen (alle werfen): TimezoneError (Vereinigung der bad_mask)."""
         if not isinstance(rule, UndecidedRule):
-            return raw_to_utc_ms(raw, rule)
+            return raw_to_utc_ms(raw, rule, fold_resolution)
         conv = undecided_conversion(raw, rule)
         if all(e is not None for e in conv.errors):
             err = TimezoneError("; ".join(str(e) for e in conv.errors))
@@ -2531,10 +2663,11 @@ class Ctx:
             self.undecided.pop((u, ym), None)
         return conv.ref
 
-    def _check(self, raw: np.ndarray, ym, bounds, nb, rule=None) -> dict:
+    def _check(self, raw: np.ndarray, ym, bounds, nb, rule=None, fold_resolution=None) -> dict:
         """check_timezone fuer Rohmonat ym (rule None = Regel je Rohmonat), bei zu
         wenigen Ankern gemeinsam mit den gecachten Nachbar-Rohmonaten."""
-        chk = check_timezone(raw, self.symbol, bounds, self.mode, rule=rule, neighbours=nb)
+        chk = check_timezone(raw, self.symbol, bounds, self.mode, rule=rule, neighbours=nb,
+                             fold_resolution=fold_resolution)
         if chk["status"] == "not_checkable":
             # zu wenige Anker (kurzer erster Historienmonat, duenner Monat):
             # gemeinsam mit gecachten Nachbar-Rohmonaten pruefen
@@ -2579,6 +2712,12 @@ class Ctx:
                 raise Quarantined(u, ym, f"Format nicht lesbar: {e}", None)
             self._quarantine(u, ym, f"Format nicht lesbar: {e}", None, note)
         raw_all = sel["raw_ms"].to_numpy()
+        # menschliche Aufloesung einer Herbstnacht ohne erkennbaren Ruecksprung
+        # (--resolve-fold): nur aus einem aktuellen, nicht freigegebenen Marker
+        fres = None
+        if not accepted and old is None and q.exists():
+            fres = (self.read_qmarker(q) or {}).get("fold_resolution")
+            fres = fres if isinstance(fres, dict) else None
         marker = (self.read_qmarker(q) or {}) if accepted else {}
         released = marker.get("releasable_weekend")
         dropped = None
@@ -2617,7 +2756,7 @@ class Ctx:
                 raise Quarantined(u, ym, reason, {"accepted_ignored": True, "releasable_weekend": rel,
                                                   "status": "failed", "ok": False, "reason": reason})
         try:
-            sel = sel.assign(utc_ms=self._convert(raw_all, rule, u, ym))
+            sel = sel.assign(utc_ms=self._convert(raw_all, rule, u, ym, fres))
         except TimezoneError as e:
             # Default: nie raten -> Quarantaene. Liegen ALLE betroffenen Ticks (auch die
             # von Rueckspruengen) im geschlossenen Wochenendmarkt, darf ein Mensch
@@ -2628,15 +2767,23 @@ class Ctx:
                 f"--accept-weekend-ticks {_ymstr(ym)}, diese {int(drop.sum())} Tick(s) werden dann "
                 "verworfen]" if rel is not None else
                 " [nicht freigebbar: Ticks ausserhalb des geschlossenen Wochenendmarkts]"))
-            if accepted:
+            fu = getattr(e, "fold_unresolved", None)
+            if fu:
+                reason += (f" [doppelte Rohstunde {fu['date']} ({fu['ticks']} Tick(s), roh {fu['first_raw']} .. "
+                           f"{fu['last_raw']}) ohne eindeutigen Ruecksprung: nach Pruefung von Hand aufloesen "
+                           f"mit --resolve-fold {_ymstr(ym)} --side pre|post|split-at ROHZEIT]")
+            if accepted or fres:
+                # Freigabe/Aufloesung im Marker passt nicht: Marker bleibt, Monat gesperrt
                 raise Quarantined(u, ym, reason, None)
-            self._quarantine(u, ym, reason, None, note, releasable=rel)
+            self._quarantine(u, ym, reason, None, note, releasable=rel,
+                             fold_unresolved={k: fu[k] for k in ("date", "ticks", "first_raw", "last_raw")}
+                             if fu else None)
         if accepted and dropped is None:
             return sel, {"accepted_manually": True, "marker": str(q)}
         if not len(sel):
             return sel, dict(dropped or {})
         nb, pad = self._neighbours(ym)
-        key = (u, ym, pad["left"], pad["right"], dropped is not None)
+        key = (u, ym, pad["left"], pad["right"], dropped is not None, bool(fres))
         chk = self.tz.get(key)
         if chk is None:
             bounds = raw_month_bounds_ms(ym)
@@ -2647,7 +2794,7 @@ class Ctx:
             # (undecided -> erster Kandidat)
             cands = (list(rule.candidates) if isinstance(rule, UndecidedRule)
                      and (u, ym) in self.undecided else [None])
-            results = [self._check(sel["raw_ms"].to_numpy(), ym, bounds, nb, c) for c in cands]
+            results = [self._check(sel["raw_ms"].to_numpy(), ym, bounds, nb, c, fres) for c in cands]
             chk = next((c for c in results if c["ok"]), results[0])
             if cands != [None]:
                 chk = {**chk, "candidates_checked": {c.name: r["status"] for c, r in zip(cands, results)}}
@@ -2678,10 +2825,11 @@ class Ctx:
                         if pad[s_]]
                 raise Quarantined(u, ym, f"VORLAEUFIG (Nachbar-Rohmonat {', '.join(miss)} fehlt im "
                                   f"Cache, nicht gespeichert): {reason}", chk)
-            if dropped is not None:
-                # freigegebener Marker bleibt; der Rest besteht trotzdem nicht
-                raise Quarantined(u, ym, f"nach Verwerfen von {dropped['dropped_ticks']} freigegebenen "
-                                  f"Wochenend-Tick(s) weiterhin: {reason}", chk)
+            if dropped is not None or fres:
+                # freigegebener/aufgeloester Marker bleibt; der Rest besteht trotzdem nicht
+                what = (f"Verwerfen von {dropped['dropped_ticks']} freigegebenen Wochenend-Tick(s)"
+                        if dropped is not None else "der Faltenaufloesung von Hand")
+                raise Quarantined(u, ym, f"nach {what} weiterhin: {reason}", chk)
             self._quarantine(u, ym, reason, chk, note, releasable=chk.get("releasable_weekend"))
         if old is not None and q.exists() and not self.report_only and not pad["provisional"]:
             q.unlink(missing_ok=True)                  # neu geprueft und bestanden
@@ -2689,6 +2837,10 @@ class Ctx:
                         "unter %s", q.name, _ymstr(ym), rule.describe())
         if dropped is not None:
             chk = {**chk, "accepted_manually": True, "marker": str(q), **dropped}
+        if fres:
+            log.warning("%s Rohmonat %s: doppelte Rohstunde %s von Hand aufgeloest (%s, Marker %s)",
+                        u.key, _ymstr(ym), fres.get("date"), fres.get("side"), q.name)
+            chk = {**chk, "fold_resolved_manually": fres, "marker": str(q)}
         return sel, chk
 
     def check_undecided(self, u: Unit, r: tuple[int, int], ym: tuple[int, int]) -> None:
@@ -2770,7 +2922,7 @@ class Ctx:
         return pad
 
     def _quarantine(self, u: Unit, ym, reason: str, check: dict | None, note: str | None = None,
-                    releasable: dict | None = None):
+                    releasable: dict | None = None, fold_unresolved: dict | None = None):
         rule = rule_for(self.mode, ym)
         zone, shift = rule_identity(rule)
         info = {"reason": reason, "check": check, "since": self.now().isoformat(),
@@ -2782,6 +2934,10 @@ class Ctx:
             # alle Ruecksprung-/Verbotene-Stunden-Ticks im geschlossenen Wochenendmarkt:
             # "accepted": true (--accept-weekend-ticks) verwirft genau diese Ticks
             info["releasable_weekend"] = releasable
+        if fold_unresolved:
+            # doppelte Herbststunde ohne erkennbaren Ruecksprung: nur von Hand
+            # aufloesbar (--resolve-fold), gilt dann genau fuer diese Ticks
+            info["fold_unresolved"] = fold_unresolved
         if note:
             info["note"] = note
             reason = f"{reason} [{note}]"
@@ -3193,8 +3349,9 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
                      "dabei entfernt); nach manueller Pruefung \"accepted\": true im Marker "
                      "(.quarantine bzw. .empty) = freigeben - NICHT bei Rueckspruengen/nicht "
                      "eindeutiger Ortszeit: dort nur Wochenend-Ticks verwerfen mit "
-                     "--accept-weekend-ticks YYYY-MM (Marker mit releasable_weekend), sonst "
-                     "bleibt die Quarantaene.")
+                     "--accept-weekend-ticks YYYY-MM (Marker mit releasable_weekend), doppelte "
+                     "Herbststunde ohne Ruecksprung nur mit --resolve-fold YYYY-MM --side ... (Marker "
+                     "mit fold_unresolved), sonst bleibt die Quarantaene.")
     if client.abort:
         hints.append(f"Lauf abgebrochen: {client.abort}")
     if content:
@@ -3508,6 +3665,104 @@ def accept_weekend_ticks(symbol: str, ym: tuple[int, int], data_root: Path | Non
         lock.close()
 
 
+# --------------------------------------------- doppelte Stunde von Hand ---
+FOLD_SIDES = ("pre", "post", "split-at")
+
+
+def resolve_fold(symbol: str, ym: tuple[int, int], side: str, split_at: str | None = None,
+                 data_root: Path | None = None, *, mode: str = "tick", out=None) -> int:
+    """
+    --resolve-fold: doppelte Herbst-Rohstunde (dst_daily_utc) eines ROHmonats, die
+    sich nicht nach Dateireihenfolge aufloesen laesst (duenne Daten, keine Ticks
+    auf einer Seite, Sprung < 30 min, UTC nicht monoton), von Hand aufloesen.
+    Nur fuer einen Quarantaene-Marker mit fold_unresolved, der zu den Daten im
+    Roh-Cache passt (Datum, Anzahl, erste/letzte Rohzeit). side: pre = alle
+    Ticks der Stunde vor der Umstellung (-4 h), post = alle danach (-5 h),
+    split-at = in Dateireihenfolge vor dem ersten Tick mit Rohzeit split_at vor,
+    ab ihm nach der Umstellung. Gibt die Ticks mit ihrer UTC aus und setzt
+    fold_resolution im Marker (nichts anderes); der naechste Lauf rechnet damit,
+    prueft neu und schreibt bei Erfolg. Aendern sich die Daten, gilt die
+    Aufloesung nicht mehr (Quarantaene). Kein Download. Exit 0, 2 (nicht
+    aufloesbar, Grund auf stderr), 3 (Lock belegt).
+    """
+    out = out or sys.stdout
+    _check_symbol(symbol)
+    data_root = Path(data_root or dk.default_data_root())
+    ym = tuple(ym)
+
+    def refuse(msg: str) -> int:
+        log.error("--resolve-fold %s %s: %s", symbol, _ymstr(ym), msg)
+        print(f"NICHT aufgeloest: {msg}", file=sys.stderr)
+        return EXIT_VALIDATION
+
+    if side not in FOLD_SIDES:
+        return refuse(f"--side {side!r} unbekannt; erlaubt: {', '.join(FOLD_SIDES)}")
+    if (side == "split-at") != bool(split_at):
+        return refuse("split-at braucht genau eine Rohzeit (YYYY-MM-DD HH:MM:SS[.mmm]), pre/post keine")
+    lock = acquire_lock(data_root, symbol)
+    if lock is None:
+        log.error("%s: Lock belegt (anderer Lauf aktiv) - spaeter erneut", symbol)
+        return EXIT_GAPS
+    try:
+        ctx = Ctx(symbol, mode, data_root, None, dk.utc_now, report_only=True)
+        u = ctx.unit(ym)
+        q = u.qmarker(data_root, ym)
+        if not q.exists():
+            return refuse(f"kein Quarantaene-Marker {q}")
+        info = ctx.read_qmarker(q)
+        if info is None:
+            return refuse(f"Marker {q} unlesbar (kein gueltiges JSON)")
+        fu = info.get("fold_unresolved")
+        if not isinstance(fu, dict):
+            return refuse(f"Marker {q.name} hat keine unaufgeloeste doppelte Stunde (fold_unresolved): "
+                          f"{info.get('reason')}")
+        rule = rule_for(mode, ym)
+        if not isinstance(rule, TzRule) or rule.kind != "dst_daily_utc" or \
+                (info.get("raw_tz"), info.get("tz_shift_h", 0)) != rule_identity(rule) or \
+                info.get("tz_check_version") != TZ_CHECK_VERSION:
+            return refuse(f"Marker {q.name} passt nicht zur aktuellen Regel/Pruefversion - erst einen "
+                          "normalen Lauf neu pruefen lassen")
+        if not u.path(data_root).exists():
+            return refuse(f"Rohdatei {u.name} nicht im Cache")
+        try:
+            raw = ctx._month_rows(u, ym)["raw_ms"].to_numpy()
+        except (CorruptZip, FormatError) as e:
+            return refuse(f"Rohdatei {u.name} nicht lesbar: {e}")
+        wins = [w for w in rule_windows(rule, int(raw.min()), int(raw.max()) + 1)
+                if w["kind"] == "fall" and w["date"] == fu.get("date")]
+        if not wins or fold_info(raw, wins[0]) != {k: fu.get(k) for k in ("date", "ticks", "first_raw", "last_raw")}:
+            return refuse("die Ticks der doppelten Stunde im Roh-Cache passen nicht (mehr) zum Marker - "
+                          "Marker loeschen (= neu pruefen)")
+        w = wins[0]
+        if split_at:
+            try:
+                split_at = _raw_iso(_parse_raw_ts(split_at), ms_digits=True)
+            except ValueError:
+                return refuse(f"Rohzeit {split_at!r} nicht lesbar (YYYY-MM-DD HH:MM:SS[.mmm])")
+        res = {"side": side, "split_at_raw": split_at, **fu}
+        is_post, why = _manual_fold(raw, w, res)
+        if is_post is None:
+            return refuse(why)
+        inf = np.nonzero((raw >= w["lo"]) & (raw < w["hi"]))[0]
+        print(f"{symbol} {mode} Rohmonat {_ymstr(ym)}: doppelte Rohstunde {w['date']} "
+              f"{_raw_iso(w['lo'])} .. {_raw_iso(w['hi'])}, {len(inf)} Tick(s), Aufloesung {side}"
+              + (f" ab {split_at}" if split_at else "") + " (Dateireihenfolge):", file=out)
+        for i in inf[:500]:
+            off = w["post_ms"] if is_post[i] else w["pre_ms"]
+            print(f"  roh {_raw_iso(int(raw[i]), ms_digits=True)} -> UTC "
+                  f"{_raw_iso(int(raw[i]) - off, ms_digits=True)} ({'nach' if is_post[i] else 'vor'} "
+                  "der Umstellung)", file=out)
+        if len(inf) > 500:
+            print(f"  ... ({len(inf)} insgesamt)", file=out)
+        info["fold_resolution"] = {**res, "set_at": dk.utc_now().isoformat()}
+        dk.write_json_atomic(q, info)
+        log.warning("%s Rohmonat %s: doppelte Rohstunde %s von Hand aufgeloest (%s) - %s", symbol,
+                    _ymstr(ym), w["date"], side, q)
+        return EXIT_OK
+    finally:
+        lock.close()
+
+
 # -------------------------------------------------------------------- cli ---
 def _ym(s: str) -> tuple[int, int]:
     y, m = map(int, s.split("-"))
@@ -3549,6 +3804,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="Quarantaene des ROHmonats freigeben, wenn alle betroffenen Ticks im "
                         "geschlossenen Wochenendmarkt liegen (releasable_weekend): diese Ticks "
                         "werden dann verworfen; sonst Exit 2. Kein Download")
+    p.add_argument("--resolve-fold", metavar="YYYY-MM",
+                   help="doppelte Herbst-Rohstunde (So 19:00-19:59) des ROHmonats ohne erkennbaren "
+                        "Ruecksprung von Hand aufloesen (Marker mit fold_unresolved), mit --side")
+    p.add_argument("--side", nargs="+", metavar="SIDE",
+                   help="zu --resolve-fold: pre | post | split-at ROHZEIT (YYYY-MM-DD HH:MM:SS[.mmm])")
     p.add_argument("-v", "--verbose", action="store_true")
     a = p.parse_args(argv)
     try:
@@ -3565,10 +3825,15 @@ def main(argv: list[str] | None = None) -> int:
         end = _ym(a.end) if a.end else (dk.utc_now().year, dk.utc_now().month)
         verify = _ym(a.verify_month) if a.verify_month else None
         accept = _ym(a.accept_weekend_ticks) if a.accept_weekend_ticks else None
+        fold = _ym(a.resolve_fold) if a.resolve_fold else None
     except ValueError:
         p.error("Monate als YYYY-MM angeben")
-    if verify and accept:
-        p.error("--verify-month und --accept-weekend-ticks nicht zusammen")
+    if sum(x is not None for x in (verify, accept, fold)) > 1:
+        p.error("--verify-month, --accept-weekend-ticks und --resolve-fold nicht zusammen")
+    if fold and not a.side:
+        p.error("--resolve-fold braucht --side pre|post|split-at ROHZEIT")
+    if a.side and not fold:
+        p.error("--side nur mit --resolve-fold")
 
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(message)s")
@@ -3582,6 +3847,9 @@ def main(argv: list[str] | None = None) -> int:
               sleep=lambda s: stop.wait(s))          # Schlaf durch SIGTERM unterbrechbar
     if accept:
         return accept_weekend_ticks(a.symbol, accept, mode=a.mode)
+    if fold:
+        side, rest = a.side[0], " ".join(a.side[1:]) or None
+        return resolve_fold(a.symbol, fold, side, rest, mode=a.mode)
     if verify:
         try:
             return verify_month(a.symbol, verify, mode=a.mode, **kw)["exit_code"]

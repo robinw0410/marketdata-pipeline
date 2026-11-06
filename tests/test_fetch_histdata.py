@@ -2200,3 +2200,142 @@ def test_v7_rule_kind_in_config(tmp_path):
         hd.load_tz_config(bad)
     assert hd.label_rules(hd.source_tz_label(DAILY)) == [("Europe/Berlin", -6, "dst_daily_utc")]
     assert hd.rule_identity(DAILY) == ("Europe/Berlin|dst_daily_utc", -6)
+
+
+# ========================================================= Review v7 ---
+def _fold_conv(stamps, **kw):
+    return hd.raw_to_utc_ms(np.array([_ms(s) for s in stamps]), DAILY, **kw)
+
+
+S21 = "2021-10-31 "
+
+
+def test_review_v7_fold_by_shared_helper_consistent_everywhere():
+    """Items 3/4/5: >= 30 min an EINER Stelle (_big_drops); Umrechnung, expected_reversals
+    und transition_nights nutzen denselben Faltensprung (fold_reversal); ein Tick, der
+    nach der Aufloesung die UTC-Reihenfolge bricht, macht die Nacht unaufgeloest."""
+    cases = {  # Ticks roh (Dateireihenfolge) -> aufloesbar?
+        "regular": (["18:59", "19:40", "19:59:59", "19:00", "19:30", "20:10"], True),
+        "exact_30": (["18:59", "19:30", "19:00", "19:10"], True),
+        "drop_20": (["18:59", "19:20", "19:00", "20:10"], False),
+        "late_pre_tick": (["19:50", "19:00", "19:30", "19:58", "19:40"], False),   # fold.py
+        "stray_first": (["19:10", "19:58", "19:15", "19:59", "19:00", "19:05"], False),
+    }
+    bounds = hd.raw_month_bounds_ms((2021, 10))
+    for name, (ts, ok) in cases.items():
+        raw = np.array([_ms(S21 + t) for t in ts])
+        try:
+            u = hd.raw_to_utc_ms(raw, DAILY)
+            conv = True
+            assert (np.diff(u) >= 0).all(), name
+        except hd.TimezoneError as e:
+            conv = False
+            assert e.fold_unresolved["date"] == "2021-10-31", name
+        rep = hd.check_timezone(raw, "XAUUSD", bounds, rule=DAILY)
+        night = [t for t in rep["transition_nights"] if t["rule_transition"]][0]
+        assert conv is ok, name
+        assert bool(rep["expected_reversals"]) is ok and night["reversal_found"] is ok, name
+        assert (night["status"] == "ok") is ok, name
+        if ok:
+            assert not rep["large_reversals"], name
+    # genau 30 min: auch ausserhalb der Falte ein Ruecksprung (gleicher Vergleich)
+    wd = np.array([_ms("2021-10-13 10:30"), _ms("2021-10-13 10:00")])
+    assert hd._big_drops(wd).tolist() == [1]
+    assert len(hd.check_timezone(wd, "XAUUSD", bounds, rule=DAILY)["large_reversals"]) == 1
+    assert hd._big_drops(np.array([_ms("2021-10-13 10:30"), _ms("2021-10-13 10:00:00.001")])).tolist() == []
+    # Uebergrosse Falte (letzter Tick vor dem Sprung ist 19:58 nach 19:00-Sprung) -> 19:58 nicht 1 h verschoben
+    with pytest.raises(hd.TimezoneError):
+        _fold_conv([S21 + "19:50:00", S21 + "19:00:00", S21 + "19:30:00", S21 + "19:58:00", S21 + "19:40:00"])
+
+
+def test_review_v7_manual_fold_resolution_in_conversion():
+    ts = [S21 + t for t in ("18:59:00", "19:10:00", "19:20:00", "19:00:00", "19:15:00", "20:05:00")]
+    with pytest.raises(hd.TimezoneError) as e:
+        _fold_conv(ts)                                     # Sprung nur 20 min: unaufgeloest
+    fu = e.value.fold_unresolved
+    assert fu == {"date": "2021-10-31", "ticks": 4, "first_raw": "2021-10-31 19:00:00.000",
+                  "last_raw": "2021-10-31 19:20:00.000"}
+    res = {**fu, "side": "split-at", "split_at_raw": "2021-10-31 19:00:00.000"}
+    got = [hd._raw_iso(int(x)) for x in _fold_conv(ts, fold_resolution=res)]
+    assert got == ["2021-10-31 22:59:00", "2021-10-31 23:10:00", "2021-10-31 23:20:00",
+                   "2021-11-01 00:00:00", "2021-11-01 00:15:00", "2021-11-01 01:05:00"]
+    for bad in ({**res, "ticks": 5}, {**res, "split_at_raw": "2021-10-31 19:05:00.000"}):
+        with pytest.raises(hd.TimezoneError, match="passt nicht"):
+            _fold_conv(ts, fold_resolution=bad)
+    with pytest.raises(hd.TimezoneError, match="passt nicht"):    # pre: nicht monoton
+        _fold_conv(ts, fold_resolution={**fu, "side": "pre"})
+
+
+def _oct_without_second_pass():
+    """Oktober 2024 nach der Tagesregel, aber ohne die zweite Runde der doppelten Stunde
+    (keine Ticks Mo 00:00-01:00 UTC): kein Ruecksprung, Seite nicht erkennbar."""
+    oct_ = raw_month_ticks("XAUUSD", 2024, 10)
+    gap = (oct_["utc"] >= pd.Timestamp("2024-10-28 00:00", tz="UTC")) & \
+        (oct_["utc"] < pd.Timestamp("2024-10-28 01:00", tz="UTC"))
+    return oct_[~gap.to_numpy()].reset_index(drop=True)
+
+
+def test_review_v7_resolve_fold_cli(tmp_path, clock, v7_default, monkeypatch, capsys):
+    """Item 2: unaufgeloeste Falte -> Marker mit fold_unresolved; nur der Mensch loest auf
+    (--resolve-fold ... --side pre), dann geschrieben; geaenderte Daten -> ungueltig."""
+    oct_ = _oct_without_second_pass()
+    files = {("T", "202409"): tick_zip("XAUUSD", 2024, 9), ("T", "202410"): _zip_from(oct_, "XAUUSD", 2024, 10),
+             ("T", "202411"): tick_zip("XAUUSD", 2024, 11)}
+    site = Site(clock, files)
+    now = datetime(2025, 1, 15, tzinfo=UTC)
+    rep = run(tmp_path, clock, site, start=(2024, 10), end=(2024, 11), now=now)
+    assert rep["exit_code"] == 4 and "--resolve-fold 2024-10" in rep["quarantine"][0]["reason"]
+    q = hd.Unit("XAUUSD", "tick", 2024, 10).qmarker(tmp_path, (2024, 10))
+    info = json.loads(q.read_text())
+    assert info["fold_unresolved"] == {"date": "2024-10-27", "ticks": 60,
+                                       "first_raw": "2024-10-27 19:00:00.137",
+                                       "last_raw": "2024-10-27 19:59:00.137"}
+    assert "releasable_weekend" not in info
+    monkeypatch.setenv("MARKETDATA_DATA_ROOT", str(tmp_path))
+    monkeypatch.setattr(hd.requests, "Session", lambda: pytest.fail("kein Download"))
+    # falsche Aufrufe: Exit 2, Marker unveraendert
+    assert hd.main(["--symbol", "XAUUSD", "--resolve-fold", "2024-10", "--side", "split-at"]) == 2
+    assert hd.main(["--symbol", "XAUUSD", "--resolve-fold", "2024-10", "--side", "split-at",
+                    "2024-10-27", "19:30:00"]) == 2                          # kein Tick dort
+    assert hd.main(["--symbol", "XAUUSD", "--resolve-fold", "2024-10", "--side", "middle"]) == 2
+    assert hd.main(["--symbol", "XAUUSD", "--resolve-fold", "2024-09", "--side", "pre"]) == 2    # kein Marker
+    assert "fold_resolution" not in json.loads(q.read_text())
+    capsys.readouterr()
+    assert hd.main(["--symbol", "XAUUSD", "--resolve-fold", "2024-10", "--side", "pre"]) == 0
+    out = capsys.readouterr().out
+    assert "roh 2024-10-27 19:59:00.137 -> UTC 2024-10-27 23:59:00.137" in out
+    info = json.loads(q.read_text())
+    assert info["fold_resolution"]["side"] == "pre" and info["accepted"] is False
+    n = site.requests
+    rep = run(tmp_path, clock, site, start=(2024, 10), end=(2024, 11), now=now)
+    assert rep["exit_code"] == 0 and rep["summary"]["months_written"] == ["2024-10", "2024-11"], \
+        rep["quarantined"]
+    assert site.requests == n and q.exists()                              # Entscheidung bleibt
+    df = pd.read_parquet(hd.store_path(tmp_path, "XAUUSD", 2024, 10))
+    u = pd.concat([raw_month_ticks("XAUUSD", 2024, 9)["utc"], oct_["utc"]])
+    u = u[(u >= pd.Timestamp("2024-10-01", tz="UTC")) & (u < pd.Timestamp("2024-11-01", tz="UTC"))]
+    assert list(df["ts"]) == sorted(set(u.dt.floor("1min"))) and int(df["tick_count"].sum()) == len(u)
+    tz = json.loads(hd.report_path(tmp_path, "XAUUSD", 2024, 10).read_text())["raw_months"]["2024-10"]["timezone"]
+    assert tz["fold_resolved_manually"]["side"] == "pre"
+    night = [t for t in tz["transition_nights"] if t["rule_transition"]][0]
+    assert night["status"] == "ok" and night["resolved_manually"] is True
+    # Daten aendern sich (ein Tick mehr in der Stunde): Aufloesung gilt nicht mehr
+    changed = _with_ticks(oct_, ["2024-10-27 19:59:30"])
+    hd.Unit("XAUUSD", "tick", 2024, 10).path(tmp_path).write_bytes(_zip_from(changed, "XAUUSD", 2024, 10))
+    hd.store_path(tmp_path, "XAUUSD", 2024, 10).unlink()
+    rep = run(tmp_path, clock, Site(clock), start=(2024, 10), now=now)
+    assert rep["exit_code"] == 4 and "passt nicht" in rep["quarantine"][0]["reason"]
+    assert not hd.store_path(tmp_path, "XAUUSD", 2024, 10).exists()
+    assert json.loads(q.read_text())["fold_resolution"]["side"] == "pre"      # Marker bleibt
+
+
+def test_review_v7_undecided_with_daily_candidate_skips_expected_fold():
+    """Item 6: "undecided" mit der Tagesregel als (nicht erstem) Kandidaten: der erwartete
+    Herbstsprung wird nicht als verwerfbarer Ruecksprung gezaehlt."""
+    und = hd.UndecidedRule(candidates=(hd.TZ_RULES["ny_local"], DAILY))
+    raw = _raw_ms(raw_month_ticks("XAUUSD", 2024, 10, stamping="daily"))
+    drop, rel = hd.weekend_release(raw, "tick", und)
+    assert not drop.any() and rel is None
+    assert len(hd.expected_fold_jumps(raw, "tick", und)) == 1
+    rep = hd.check_timezone(raw, "XAUUSD", hd.raw_month_bounds_ms((2024, 10)), rule=und)
+    assert rep["large_reversals"] == [] and len(rep["expected_reversals"]) == 1

@@ -261,7 +261,25 @@ Time zone:
   the -5 h ticks (from it on). Without such a reversal the ticks cannot be
   placed and raise `TimezoneError` (quarantine); they are never guessed or
   dropped. The check expects this reversal (`expected_reversals`, not a
-  `large_reversals` entry, never releasable).
+  `large_reversals` entry, never releasable). "30 minutes or more" is one
+  comparison everywhere, and the fold reversal comes from one helper
+  (`fold_reversal`) for conversion, `expected_reversals` and
+  `transition_nights`. The resolution must give UTC that is non-decreasing in
+  file order across the night (tolerance 5 s); otherwise the night counts as
+  unresolved.
+- **Unresolved fold, human resolution**: the quarantine marker then carries
+  `fold_unresolved` (`date`, `ticks`, `first_raw`, `last_raw`). Neither
+  `"accepted": true` nor the weekend release frees it. After checking, run
+  `fetch_histdata.py --symbol XAUUSD --resolve-fold YYYY-MM --side pre|post|split-at RAW_TS`
+  (pre: all ticks of the hour before the change, -4 h; post: all after, -5 h;
+  split-at: in file order, before the first tick with that raw time pre,
+  from it on post). It prints every affected tick with its UTC, checks
+  monotonic UTC, and only sets `fold_resolution` on that marker (no
+  download; exit 2 with the reason if it does not apply). The next run uses
+  it, re-checks the month (the night counts as `ok`, `resolved_manually`) and
+  writes it if it passes; the marker stays as the record. It applies to
+  exactly those ticks: if their count or first/last raw time changes, it is
+  invalid and the month is quarantined again.
 - **Spring: raw Sunday 19:00–19:59:59.999 does not exist** (raw 18:59:59 →
   20:00:00 = 23:59:59 UTC → Monday 00:00 UTC); a tick there raises
   `TimezoneError`. This is still to be confirmed on the data; the survey

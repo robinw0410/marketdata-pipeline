@@ -32,9 +32,12 @@ sind unter beiden Regeln identisch.
 - Kandidaten: alle Regeln aus fh.TZ_RULES (auch berlin_minus_6_utc_midnight,
   Art dst_daily_utc: Wechsel Mo 00:00 UTC nach dem EU-Sonntag) plus eigene.
 - Kontroll-Ausschluss: Kontrollmonate eines Jahres (Art "control" oder ohne
-  Fenster zwischen den Sommerzeit-Regeln) - faellt dort eine Regel durch (z.B.
-  fixed_est im Juli: -4 h statt -5 h), zaehlt sie in den Umstellungsmonaten
-  DESSELBEN Jahres nicht mit ("fixed_est ausgeschlossen (2019-07: +1.0 h)").
+  Fenster zwischen den Sommerzeit-Regeln) - faellt dort eine Regel TRENNEND
+  durch (eine andere Regel besteht denselben Monat desselben Symbols, Median-
+  Abweichung nicht 0; z.B. fixed_est im Juli: -4 h statt -5 h), zaehlt sie in
+  den Umstellungsmonaten DESSELBEN Jahres und Symbols nicht mit ("fixed_est
+  ausgeschlossen (2019-07: +1.0 h)"). Scheitern alle Regeln (Datenfehler):
+  "Kontrolle unbrauchbar", kein Ausschluss.
 - Regelfamilien: Regeln, die sich je Jahr nur wenige Stunden unterscheiden
   (berlin_minus_6 und berlin_minus_6_utc_midnight: nur die EU-Sonntage).
 - Rohmonat entscheidend (je Symbol): alle bestehenden, nicht ausgeschlossenen
@@ -508,22 +511,41 @@ def control_like(ym: tuple[int, int], kind: str, rules: dict) -> bool:
                for i, a in enumerate(dst) for b in dst[i + 1:])
 
 
-def year_exclusions(rows: list[dict]) -> dict[int, dict[str, str]]:
-    """{jahr: {regel: Grund}}: Regeln, die in einem Kontrollmonat des Jahres
-    (irgendein Symbol) durchfallen - z.B. fixed_est im Juli (-4 h statt -5 h).
-    Sie zaehlen in den Umstellungsmonaten desselben Jahres nicht mit."""
-    out: dict[int, dict[str, list]] = {}
+MIN_DISCRIMINATING_DEV_H = 0.5   # Abweichung im Kontrollmonat ab der ein Durchfallen die Regel trennt
+
+
+def year_exclusions(rows: list[dict]) -> dict[tuple[int, str], dict[str, str]]:
+    """
+    {(jahr, symbol): {regel: Grund}}: Regeln, die in einem Kontrollmonat des
+    Jahres TRENNEND durchfallen - z.B. fixed_est im Juli (-4 h statt -5 h,
+    berlin_minus_6 besteht). Sie zaehlen in den Umstellungsmonaten desselben
+    Jahres und Symbols nicht mit. Trennend = eine andere Regel besteht denselben
+    Kontrollmonat desselben Symbols UND die Median-Abweichung der Regel ist nicht
+    0 (|dev| >= MIN_DISCRIMINATING_DEV_H). Ein Datenfehler (z.B. Ruecksprung an
+    einem Werktag), an dem ALLE Regeln scheitern, schliesst nichts aus: der
+    Kontrollmonat wird als "Kontrolle unbrauchbar" markiert (row
+    "control_unusable"); ein Durchfallen mit Abweichung 0 ebenso wenig.
+    """
+    out: dict[tuple[int, str], dict[str, list]] = {}
     for r in rows:
         if not (r["evaluated"] and r.get("control_like")):
             continue
-        for n, res in r["results"].items():
-            if res["status"] == "failed":
-                dev = res.get("median_deviation_h")
-                why = f"{r['month']}" + (f": {dev:+.1f} h" if isinstance(dev, (int, float)) else "")
-                lst = out.setdefault(r["ym"][0], {}).setdefault(n, [])
-                if why not in lst:
-                    lst.append(why)
-    return {y: {n: ", ".join(w) for n, w in v.items()} for y, v in out.items()}
+        res_ = r["results"]
+        if not any(x["status"] == "ok" for x in res_.values()):
+            reasons = [f"{n}: {x.get('reason')}" for n, x in res_.items() if x.get("reason")]
+            r["control_unusable"] = "alle Regeln durchgefallen" + (
+                f" ({reasons[0][:160]})" if reasons else "")
+            continue
+        for n, x in res_.items():
+            dev = x.get("median_deviation_h")
+            if x["status"] != "failed" or not isinstance(dev, (int, float)) \
+                    or abs(dev) < MIN_DISCRIMINATING_DEV_H:
+                continue
+            lst = out.setdefault((r["ym"][0], r["symbol"]), {}).setdefault(n, [])
+            why = f"{r['month']}: {dev:+.1f} h"
+            if why not in lst:
+                lst.append(why)
+    return {k: {n: ", ".join(w) for n, w in v.items()} for k, v in out.items()}
 
 
 def _runs(items: list[tuple[tuple[int, int], str]]) -> list[dict]:
@@ -1201,10 +1223,12 @@ def render_markdown(res: dict) -> str:
     out += md_table(res["evidence_table"]["head"], res["evidence_table"]["rows"]) + [""]
     if res.get("exclusions"):
         out += ["## Ausgeschlossene Kandidaten", "",
-                "In einem Kontrollmonat desselben Jahres durchgefallen; zaehlen in den "
-                "Umstellungsmonaten des Jahres nicht mit.", ""]
-        out += md_table(["Jahr", "Regel", "Kontrollmonat: Abweichung"],
-                        [[y, n, why] for y, ex in res["exclusions"].items() for n, why in ex.items()])
+                "In einem Kontrollmonat desselben Jahres und Symbols trennend durchgefallen "
+                "(andere Regel besteht, Abweichung nicht 0); zaehlen in den Umstellungsmonaten "
+                "des Jahres fuer dieses Symbol nicht mit.", ""]
+        out += md_table(["Jahr", "Symbol", "Regel", "Kontrollmonat: Abweichung"],
+                        [[y, sym, n, why] for y, by in res["exclusions"].items()
+                         for sym, ex in by.items() for n, why in ex.items()])
         out += [""]
     if res.get("transition_nights"):
         out += ["## Umstellungsnaechte", "",
@@ -1343,8 +1367,10 @@ def survey(symbols=SYMBOLS, years=DEFAULT_YEARS, months=DEFAULT_MONTHS,
     for r in rows:
         if not r["evaluated"]:
             continue
-        excl = None if r["control_like"] else exclusions.get(r["ym"][0])
+        excl = None if r["control_like"] else exclusions.get((r["ym"][0], r["symbol"]))
         r.update(classify(r["results"], r["kind"], dst_rules(sel, r["ym"][0]), excl, families))
+        if r.get("control_unusable"):
+            r["text"] += f" | Kontrolle unbrauchbar: {r['control_unusable']}"
         conf = r["configured"]
         if conf is None or conf == UNDECIDED:
             # "undecided" im Fahrplan: offen, nie Widerspruch oder Fehler
@@ -1412,9 +1438,15 @@ def survey(symbols=SYMBOLS, years=DEFAULT_YEARS, months=DEFAULT_MONTHS,
     print("\n".join(text_table(head, erows, "  ")), file=out)
     if exclusions:
         print("\nAusgeschlossen fuer die Umstellungsmonate (in einem Kontrollmonat desselben "
-              "Jahres durchgefallen):", file=out)
-        for y, ex in sorted(exclusions.items()):
-            print(f"  {y}: " + "; ".join(f"{n} ({why})" for n, why in ex.items()), file=out)
+              "Jahres und Symbols trennend durchgefallen):", file=out)
+        for (y, sym), ex in sorted(exclusions.items(),
+                                   key=lambda kv: (kv[0][0], list(symbols).index(kv[0][1]))):
+            print(f"  {y} {sym}: " + "; ".join(f"{n} ({why})" for n, why in ex.items()), file=out)
+    unusable = [r for r in rows if r.get("control_unusable")]
+    if unusable:
+        print("\nKontrolle unbrauchbar (alle Regeln durchgefallen - Datenfehler, schliesst "
+              "nichts aus): " + "; ".join(f"{r['symbol']} {r['month']}: {r['control_unusable']}"
+                                          for r in unusable), file=out)
     fams = sorted({f for f in families.values() if len(f) > 1}, key=sorted)
     if fams:
         print("\nRegelfamilien (unterscheiden sich nur in den Umstellungsnaechten): "
@@ -1495,7 +1527,11 @@ def survey(symbols=SYMBOLS, years=DEFAULT_YEARS, months=DEFAULT_MONTHS,
             "leading_open": an["leading_open"], "trailing_open": an["trailing_open"],
             "explanation": an["explanation"]},
         "analysis_lines": a_lines,
-        "exclusions": {str(y): v for y, v in exclusions.items()},
+        "exclusions": {str(y): {sym: v for (yy, sym), v in exclusions.items() if yy == y}
+                       for y in sorted({k[0] for k in exclusions})},
+        "unusable_controls": [{"symbol": r["symbol"], "month": r["month"],
+                               "reason": r["control_unusable"]}
+                              for r in rows if r.get("control_unusable")],
         "families": [sorted(f) for f in fams],
         "transition_nights": nights, "transition_nights_summary": n_summary,
         "schedule": [{k: v for k, v in e.items() if k != "note"} for e in sched],

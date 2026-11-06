@@ -354,7 +354,7 @@ def test_fixed_est_failing_july_is_excluded_in_same_year(tmp_path, cfg, monkeypa
     assert not by["2012-03"]["decisive"]
     assert by["2012-03"]["text"] == "keine Regel passt | fixed_est ausgeschlossen (2012-07: +1.0 h)"
     assert by["2012-10"]["winner"] == "berlin_minus_6"
-    assert res["exclusions"] == {"2012": {"fixed_est": "2012-07: +1.0 h"}}
+    assert res["exclusions"] == {"2012": {"XAUUSD": {"fixed_est": "2012-07: +1.0 h"}}}
     assert "fixed_est (2012-07: +1.0 h)" in out
     assert by["2012-01"]["text"] == \
         "Kontrolle ok: berlin_minus_6, ny_local, fixed_est, berlin_minus_6_utc_midnight"
@@ -1108,3 +1108,78 @@ def test_integration_utc_midnight_real_zips(tmp_path, cfg):
     assert (fall["last_before_raw"], fall["first_after_raw"], fall["reversal_found"]) == \
         ("2019-10-27 19:59:00", "2019-10-27 19:00:00", True)
     assert res["configured_failed"] == [] and res["exit_code"] == 3   # 2018-03, 2019-11 fehlen
+
+
+# ------------------------------- Review v7: nur trennende Kontroll-Ausschluesse ---
+def test_control_glitch_where_all_rules_fail_excludes_nothing(tmp_path, cfg, monkeypatch):
+    """Review v7 MEDIUM 1: XAGUSD 2019-07 mit einem Werktags-Ruecksprung (Datenfehler):
+    alle Regeln failed +0.0 h -> "Kontrolle unbrauchbar", nichts ausgeschlossen; 2019
+    entscheidet trotzdem ueber die anderen Belege (XAUUSD-Juli, Oktober)."""
+    base = fake_evaluator(lambda ym: UM)
+
+    def ev(d, sym, ym, mode="tick", rule=None, **kw):
+        rep = base(d, sym, ym, mode, rule, **kw)
+        if sym == "XAGUSD" and tuple(ym) == (2019, 7):
+            rep.update(status="failed", median_deviation_h=0.0,
+                       reason="1 Ruecksprung >= 30 min an einem Werktag")
+        return rep
+    monkeypatch.setattr(fh, "evaluate_raw_month", ev)
+    for s_ in sv.SYMBOLS:
+        for ym in [(2019, 3), (2019, 7), (2019, 10)]:
+            touch_cache(tmp_path / "data", s_, ym)
+    res, out = run(tmp_path, symbols=list(sv.SYMBOLS), years=[2019], months=[3, 10],
+                   controls=[7], offline=True)
+    assert res["exclusions"] == {"2019": {"XAUUSD": {"fixed_est": "2019-07: +1.0 h"}}}
+    assert res["unusable_controls"] == [{"symbol": "XAGUSD", "month": "2019-07", "reason":
+                                         "alle Regeln durchgefallen (berlin_minus_6: 1 Ruecksprung "
+                                         ">= 30 min an einem Werktag)"}]
+    assert "Kontrolle unbrauchbar" in out
+    by = {(m["symbol"], m["month"]): m for m in res["months"]}
+    assert "keine Regel passt" not in by[("XAGUSD", "2019-03")]["text"]
+    assert by[("XAGUSD", "2019-03")]["text"].startswith("mehrere passen")   # fixed_est nicht ausgeschl.
+    assert by[("XAUUSD", "2019-03")]["allowed"] == [UM]
+    assert by[("XAGUSD", "2019-10")]["allowed"] == [UM]
+    mv = {m["month"]: m for m in res["raw_month_verdicts"]}
+    assert mv["2019-03"]["allowed"] == [UM] and mv["2019-03"]["support"] == ["XAUUSD"]
+
+
+def test_real_case_fixed_est_excluded_by_july_minus_4h(tmp_path, cfg, monkeypatch):
+    """fixed_est faellt im Juli mit Abweichung durch, die berlin-Regeln bestehen:
+    trennend -> fixed_est ausgeschlossen, sonst nichts."""
+    monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(lambda ym: UM))
+    touch_cache(tmp_path / "data", "XAUUSD", (2019, 7))
+    touch_cache(tmp_path / "data", "XAUUSD", (2019, 3))
+    res, _ = run(tmp_path, years=[2019], months=[3], controls=[7], offline=True)
+    jul = next(m for m in res["months"] if m["month"] == "2019-07")
+    assert {n for n, r in jul["results"].items() if r["status"] == "ok"} == \
+        {"berlin_minus_6", UM, "ny_local"}
+    assert res["exclusions"] == {"2019": {"XAUUSD": {"fixed_est": "2019-07: +1.0 h"}}}
+    assert res["unusable_controls"] == []
+
+
+def test_exclusion_is_scoped_per_symbol(tmp_path, cfg, monkeypatch):
+    """XAUUSD-Juli schliesst fixed_est nur fuer XAUUSD aus; XAGUSD ohne Juli bleibt
+    2019-03 nicht entscheidend (fixed_est und utc_midnight bestehen)."""
+    monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(lambda ym: UM))
+    for ym in [(2019, 3), (2019, 7)]:
+        touch_cache(tmp_path / "data", "XAUUSD", ym)
+    touch_cache(tmp_path / "data", "XAGUSD", (2019, 3))
+    res, _ = run(tmp_path, symbols=list(sv.SYMBOLS), years=[2019], months=[3], controls=[7],
+                 offline=True)
+    assert res["exclusions"] == {"2019": {"XAUUSD": {"fixed_est": "2019-07: +1.0 h"}}}
+    by = {(m["symbol"], m["month"]): m for m in res["months"]}
+    assert by[("XAUUSD", "2019-03")]["allowed"] == [UM]
+    assert not by[("XAGUSD", "2019-03")]["decisive"]
+    assert "ausgeschlossen" not in by[("XAGUSD", "2019-03")]["text"]
+
+
+def test_zero_deviation_failure_is_not_discriminating():
+    def row(results):
+        return {"evaluated": True, "control_like": True, "ym": (2019, 7), "month": "2019-07",
+                "symbol": "XAUUSD", "results": results}
+    ok = {"status": "ok", "median_deviation_h": 0.0}
+    r = row({"berlin_minus_6": ok, "fixed_est": {"status": "failed", "median_deviation_h": 0.0},
+             "ny_local": {"status": "failed", "median_deviation_h": None}})
+    assert sv.year_exclusions([r]) == {} and "control_unusable" not in r
+    r = row({"berlin_minus_6": ok, "fixed_est": {"status": "failed", "median_deviation_h": -1.0}})
+    assert sv.year_exclusions([r]) == {(2019, "XAUUSD"): {"fixed_est": "2019-07: -1.0 h"}}

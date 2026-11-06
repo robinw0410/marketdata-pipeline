@@ -547,33 +547,64 @@ def _generator_selftest(sym, y):
     return fold
 
 
+def hour_ticks(root, sym, lo: datetime, hi: datetime) -> int:
+    """Summe tick_count der geschriebenen Bars in [lo, hi) UTC (ueber UTC-Monatsgrenzen)."""
+    n = 0
+    for ym in {(lo.year, lo.month), ((hi - timedelta(microseconds=1)).year,
+                                     (hi - timedelta(microseconds=1)).month)}:
+        b = bars_of(store_file(root, sym, *ym))
+        sel = (b["ts"] >= pd.Timestamp(lo)) & (b["ts"] < pd.Timestamp(hi))
+        n += int(b.loc[sel, "tick_count"].sum())
+    return n
+
+
+def gen_ticks(sym, raws: dict, lo: datetime, hi: datetime) -> int:
+    u = np.concatenate([utc_ms_of(raw_month(sym, *r, st)) for r, st in raws.items()])
+    return int(((u >= int(lo.timestamp() * 1000)) & (u < int(hi.timestamp() * 1000))).sum())
+
+
+def check_months_written(root, sym, months, raws):
+    for ym in months:
+        out = store_file(root, sym, *ym)
+        assert out.exists(), ym
+        bars = bars_of(out)
+        want = ticks_in_utc_month(sym, ym, {r: raws[r] for r in (ym_add(ym, -1), ym)})
+        assert int(bars["tick_count"].sum()) == len(want), ym
+        assert set(ms_of(bars["ts"])) == set(int(x) for x in (want // MIN_MS) * MIN_MS), ym
+        assert NEW in label_of(out) and f"v{fh.TZ_CHECK_VERSION}" in label_of(out)
+
+
 @pytest.mark.parametrize("sym", SYMS)
-@pytest.mark.parametrize("y", [2019, 2024])
+@pytest.mark.parametrize("y", list(YEARS))
 def test_run_october_fold_written_every_tick_accounted(tmp_path, sym, y):
     fold = _generator_selftest(sym, y)
-    seed_raw(tmp_path, [(y, m) for m in (8, 9, 10, 11, 12)], sym=sym)
+    months = [(y, m) for m in (8, 9, 10, 11, 12)]
+    seed_raw(tmp_path, months, sym=sym)
     site = Site()
     rep = do_run(tmp_path, site, (y, 10), (y, 11), sym=sym)
     assert rep["exit_code"] == 0, rep.get("quarantined") or rep
     assert site.requests == 0
     assert rep["summary"]["months_written"] == [f"{y}-10", f"{y}-11"]
     assert markers(tmp_path) == []
-    for ym in ((y, 10), (y, 11)):
-        out = store_file(tmp_path, sym, *ym)
-        bars = bars_of(out)
-        want = ticks_in_utc_month(sym, ym, {ym_add(ym, -1): NEW, ym: NEW})
-        assert int(bars["tick_count"].sum()) == len(want), ym
-        assert set(ms_of(bars["ts"])) == set(int(x) for x in (want // MIN_MS) * MIN_MS)
-        assert NEW in label_of(out) and "v7" in label_of(out)
-    # Sonntagabend: Minuten So 22:00 .. Mo 00:59 UTC lueckenlos, je 20 Ticks (alle 3 s)
+    check_months_written(tmp_path, sym, [(y, 10), (y, 11)], {ym: NEW for ym in months})
+    # je Durchgang der Faltung: 1. Durchgang = UTC So 23:00-24:00 (-4), 2. = Mo 00:00-01:00
+    # (-5); 2021: Montag = 01.11. -> zweiter Durchgang im UTC-November
     d = FALL[y]
-    bars = bars_of(store_file(tmp_path, sym, y, 10)).set_index("ts")
-    for h, mi in ((22, 0), (23, 30), (23, 59)):
-        assert bars.loc[pd.Timestamp(datetime(y, 10, d.day, h, mi, tzinfo=UTC)), "tick_count"] >= 20
     mon = d + timedelta(days=1)
-    nov_or_oct = bars_of(store_file(tmp_path, sym, mon.year, mon.month)).set_index("ts")
-    assert nov_or_oct.loc[pd.Timestamp(datetime(mon.year, mon.month, mon.day, 0, 0, tzinfo=UTC)),
-                          "tick_count"] >= 20
+    raws = {(y, 9): NEW, (y, 10): NEW}
+    for lo, hi in ((datetime(y, 10, d.day, 22, tzinfo=UTC), datetime(y, 10, d.day, 23, tzinfo=UTC)),
+                   (datetime(y, 10, d.day, 23, tzinfo=UTC),
+                    datetime(mon.year, mon.month, mon.day, tzinfo=UTC)),
+                   (datetime(mon.year, mon.month, mon.day, tzinfo=UTC),
+                    datetime(mon.year, mon.month, mon.day, 1, tzinfo=UTC))):
+        want = gen_ticks(sym, raws, lo, hi)
+        assert want >= 1200, (lo, want)                        # alle 3 s
+        assert hour_ticks(tmp_path, sym, lo, hi) == want, (lo, hi)
+    first_pass = gen_ticks(sym, raws, datetime(y, 10, d.day, 23, tzinfo=UTC),
+                           datetime(mon.year, mon.month, mon.day, tzinfo=UTC))
+    second_pass = gen_ticks(sym, raws, datetime(mon.year, mon.month, mon.day, tzinfo=UTC),
+                            datetime(mon.year, mon.month, mon.day, 1, tzinfo=UTC))
+    assert first_pass + second_pass == int(fold.sum())
     # Bericht: Umstellungsnacht ok, erwarteter Ruecksprung, kein grosser Ruecksprung
     mrep = json.loads(month_report_file(tmp_path, sym, y, 10).read_text())
     ns = nights(mrep, d)
@@ -614,40 +645,103 @@ def test_october_fold_under_berlin_minus_6_or_ny_local_fails(tmp_path, monkeypat
 
 
 # ==================================================================== 4 ====
-@pytest.mark.parametrize("y", [2019, 2024])
-def test_run_march_gap_ok_and_injected_gap_tick_quarantined(tmp_path, y):
+@pytest.mark.parametrize("sym", SYMS)
+@pytest.mark.parametrize("y", list(YEARS))
+def test_run_march_gap_written_every_tick_accounted(tmp_path, sym, y):
     spr = SPRING[y]
-    df = raw_month("XAUUSD", y, 3, NEW)
+    mon = spr + timedelta(days=1)
+    df = raw_month(sym, y, 3, NEW)
     raw = raw_ms_of(df)
     gap = (raw >= rms(y, 3, spr.day, 19)) & (raw < rms(y, 3, spr.day, 20))
     assert gap.sum() == 0
     assert rms(y, 3, spr.day, 18, 59, 59) in set(raw) and rms(y, 3, spr.day, 20) in set(raw)
-    root = tmp_path / "ok"
-    seed_raw(root, [(y, m) for m in (1, 2, 3, 4)])
+    months = [(y, m) for m in (1, 2, 3, 4, 5)]
+    seed_raw(tmp_path, months, sym=sym)
     site = Site()
-    rep = do_run(root, site, (y, 3))
+    rep = do_run(tmp_path, site, (y, 3), (y, 4), sym=sym)
     assert rep["exit_code"] == 0, rep.get("quarantined") or rep
     assert site.requests == 0
-    bars = bars_of(store_file(root, "XAUUSD", y, 3))
-    want = ticks_in_utc_month("XAUUSD", (y, 3), {(y, 2): NEW, (y, 3): NEW})
-    assert int(bars["tick_count"].sum()) == len(want)
-    mrep = json.loads(month_report_file(root, "XAUUSD", y, 3).read_text())
+    assert rep["summary"]["months_written"] == [f"{y}-03", f"{y}-04"]
+    assert markers(tmp_path) == []
+    check_months_written(tmp_path, sym, [(y, 3), (y, 4)], {ym: NEW for ym in months})
+    raws = {(y, 3): NEW}
+    for lo, hi in ((datetime(y, 3, spr.day, 22, tzinfo=UTC), datetime(y, 3, spr.day, 23, tzinfo=UTC)),
+                   (datetime(y, 3, spr.day, 23, tzinfo=UTC),
+                    datetime(mon.year, mon.month, mon.day, tzinfo=UTC)),
+                   (datetime(mon.year, mon.month, mon.day, tzinfo=UTC),
+                    datetime(mon.year, mon.month, mon.day, 1, tzinfo=UTC))):
+        want = gen_ticks(sym, raws, lo, hi)
+        assert want >= 1200, (lo, want)
+        assert hour_ticks(tmp_path, sym, lo, hi) == want, (lo, hi)
+    mrep = json.loads(month_report_file(tmp_path, sym, y, 3).read_text())
     ns = nights(mrep, spr)
     assert ns, mrep
     n = ns[0]
     assert n["kind"] == "spring" and n["status"] == "ok" and n["ticks_in_gap"] == 0
     assert str(n["last_before_raw"]).startswith(f"{spr:%Y-%m-%d} 18:59:59")
     assert str(n["first_after_raw"]).startswith(f"{spr:%Y-%m-%d} 20:00:00")
-    # ein Tick roh So 19:30 (existiert nicht) -> Quarantaene
-    root2 = tmp_path / "bad"
-    seed_raw(root2, [(y, m) for m in (1, 2, 4)])
+
+
+@pytest.mark.parametrize("sym", SYMS)
+@pytest.mark.parametrize("y", [2019, 2021, 2024])
+def test_run_march_injected_gap_tick_quarantined(tmp_path, sym, y):
+    """Ein Tick roh So 19:30 (existiert unter der Regel nicht) -> Quarantaene."""
+    spr = SPRING[y]
+    df = raw_month(sym, y, 3, NEW)
+    seed_raw(tmp_path, [(y, m) for m in (1, 2, 4)], sym=sym)
     t = rms(y, 3, spr.day, 19, 30)
-    write_raw(root2, (y, 3), zip_of("XAUUSD", y, 3, with_extra(df, [t], t - 1)))
-    rep = do_run(root2, Site(), (y, 3))
+    write_raw(tmp_path, (y, 3), zip_of(sym, y, 3, with_extra(df, [t], t - 1, sym)), sym)
+    rep = do_run(tmp_path, Site(), (y, 3), sym=sym)
     assert rep["exit_code"] == 4, rep
     assert f"{y}-03" in rep["summary"]["months_quarantine"]
-    assert not store_file(root2, "XAUUSD", y, 3).exists()
-    assert markers(root2)
+    assert not store_file(tmp_path, sym, y, 3).exists()
+    assert markers(tmp_path)
+
+
+# Montag 00:00 UTC (Wechsel) = UTC-Monatsgrenze
+BOUNDARY = [((2019, 3), (2019, 4), "spring"), ((2021, 10), (2021, 11), "fall"),
+            ((2024, 3), (2024, 4), "spring")]
+
+
+@pytest.mark.parametrize("sym", SYMS)
+@pytest.mark.parametrize("before,after,kind", BOUNDARY)
+def test_transition_on_utc_month_boundary(tmp_path, sym, before, after, kind):
+    y, m = before
+    sun = (SPRING if kind == "spring" else FALL)[y]
+    mon = sun + timedelta(days=1)
+    assert (mon.year, mon.month, mon.day) == (*after, 1)           # Selbsttest
+    months = [ym_add(before, k) for k in (-2, -1, 0, 1, 2)]
+    seed_raw(tmp_path, months, sym=sym)
+    site = Site()
+    rep = do_run(tmp_path, site, before, after, sym=sym)
+    assert rep["exit_code"] == 0, rep.get("quarantined") or rep
+    assert site.requests == 0
+    assert rep["summary"]["months_written"] == [f"{y}-{m:02d}", f"{after[0]}-{after[1]:02d}"]
+    check_months_written(tmp_path, sym, [before, after], {ym: NEW for ym in months})
+    b0 = bars_of(store_file(tmp_path, sym, *before))
+    b1 = bars_of(store_file(tmp_path, sym, *after))
+    # letzte Minute vorher = So 23:59 UTC, erste danach = Mo 00:00 UTC
+    assert b0["ts"].max() == pd.Timestamp(datetime(y, m, sun.day, 23, 59, tzinfo=UTC))
+    assert b1["ts"].min() == pd.Timestamp(datetime(*after, 1, tzinfo=UTC))
+    # die Ticks Mo 00:00-01:00 UTC stammen aus dem ROHmonat davor (roh So 19:xx bzw. 20:xx)
+    src = raw_month(sym, y, m, NEW)
+    u = utc_ms_of(src)
+    lo, hi = utc_dt(*after, 1), utc_dt(*after, 1, 1)
+    sel = (u >= lo) & (u < hi)
+    assert sel.sum() >= 1200
+    r = raw_ms_of(src)[sel]
+    want_h = 19 if kind == "fall" else 20
+    assert (r >= rms(y, m, sun.day, want_h)).all() and (r < rms(y, m, sun.day, want_h + 1)).all()
+    assert int(b1.loc[(b1["ts"] >= pd.Timestamp(lo, unit="ms", tz="UTC"))
+                      & (b1["ts"] < pd.Timestamp(hi, unit="ms", tz="UTC")), "tick_count"].sum()) \
+        == int(sel.sum())
+    last = (u >= utc_dt(y, m, sun.day, 23)) & (u < lo)
+    assert int(b0.loc[b0["ts"] >= pd.Timestamp(datetime(y, m, sun.day, 23, tzinfo=UTC)),
+                      "tick_count"].sum()) == int(last.sum())
+    for ym in (before, after):
+        mrep = json.loads(month_report_file(tmp_path, sym, *ym).read_text())
+        ns = nights(mrep, sun)
+        assert ns and all(n["kind"] == kind and n["status"] == "ok" for n in ns), (ym, ns)
 
 
 # ==================================================================== 5 ====
@@ -686,7 +780,11 @@ def test_survey_finds_new_rule_from_2018_12(tmp_path, monkeypatch, capsys, no_ht
     assert rows["2019-07"]["results"]["fixed_est"]["status"] == "failed"
     assert "fixed_est" in r["excluded"]
     assert NYL not in r["excluded"] and NEW not in r["excluded"]
-    assert r["winner"] in (None, B6, NEW) and r["winner"] != "fixed_est"
+    # die Maerz-Nacht (Luecke roh 19:00-19:59, Oeffnung roh 17:00) bestaetigt die neue Regel
+    assert r["decisive"] is True and r["winner"] == NEW, r
+    r20 = rows["2020-03"]
+    assert r20["decisive"] is True and r20["winner"] == NEW, r20
+    assert r20["results"][NYL]["status"] == "failed"
     # Oktober-Faltung: nur die neue Regel besteht
     for y in (2019, 2020):
         o = rows[f"{y}-10"]
@@ -781,3 +879,199 @@ def test_v6_store_file_without_changed_times_is_relabelled(tmp_path, label):
     assert "2019-07" in rep["relabelled_timezone"]
     pd.testing.assert_frame_equal(pd.read_parquet(out), good)
     assert NEW in label_of(out) and "v7" in label_of(out)
+
+
+# ============================================================ review v7 ====
+FY = 2024                               # Herbstnacht 2024-10-27 (Montag 28.10 = UTC-Oktober)
+
+
+def fold_month(ticks_hms, y=FY, sym="XAUUSD") -> pd.DataFrame:
+    """Rohmonat Oktober (neue Regel) ohne die Generator-Ticks der doppelten Stunde roh
+    So 19:00-19:59:59.999; statt dessen genau ticks_hms ((h, m, s, ms)) in dieser
+    Dateireihenfolge direkt nach roh So 18:59:59."""
+    d = FALL[y]
+    df = raw_month(sym, y, 10, NEW)
+    raw = raw_ms_of(df)
+    keep = ~((raw >= rms(y, 10, d.day, 19)) & (raw < rms(y, 10, d.day, 20)))
+    df = df[keep].reset_index(drop=True)
+    ticks = [rms(y, 10, d.day, h, mi, s, ms * 1000) for h, mi, s, ms in ticks_hms]
+    return with_extra(df, ticks, rms(y, 10, d.day, 18, 59, 59, 999_000), sym)
+
+
+def T(h, mi, s=0, ms=0):
+    return (h, mi, s, ms)
+
+
+def seed_fold_case(root, ticks_hms, y=FY, sym="XAUUSD"):
+    seed_raw(root, [(y, m) for m in (8, 9, 11, 12)], sym=sym)
+    write_raw(root, (y, 10), zip_of(sym, y, 10, fold_month(ticks_hms, y, sym)), sym)
+
+
+def qmarker(root, sym, y, m) -> Path:
+    p = raw_zip_path(root, sym, y, m)
+    return p.with_name(p.name + ".quarantine")
+
+
+def cli(argv, root, monkeypatch, capsys):
+    monkeypatch.setenv("MARKETDATA_DATA_ROOT", str(root))
+    capsys.readouterr()
+    try:
+        code = fh.main(argv)
+    except SystemExit as e:
+        code = e.code
+    o = capsys.readouterr()
+    return code, o.out + o.err
+
+
+def test_exact_30_min_drop_is_a_fold_reversal_29_59_999_is_not():
+    """Eine Schwelle ueberall: Ruecksprung >= 30:00.000 (REGRESSION_MAX_MS) zaehlt."""
+    assert fh.REGRESSION_MAX_MS == 30 * MIN_MS
+    d, y = FALL[FY], FY
+    mon = d + timedelta(days=1)
+    exact = np.array([rms(y, 10, d.day, 18, 59), rms(y, 10, d.day, 19, 30), rms(y, 10, d.day, 19),
+                      rms(y, 10, d.day, 19, 10), rms(y, 10, d.day, 20)], dtype=np.int64)
+    assert list(fh.raw_to_utc_ms(exact, rule(NEW))) == [
+        utc_dt(y, 10, d.day, 22, 59), utc_dt(y, 10, d.day, 23, 30),
+        utc_dt(mon.year, mon.month, mon.day, 0), utc_dt(mon.year, mon.month, mon.day, 0, 10),
+        utc_dt(mon.year, mon.month, mon.day, 1)]
+    short = exact.copy()
+    short[1] = rms(y, 10, d.day, 19, 29, 59, 999_000)
+    with pytest.raises(fh.TimezoneError):
+        fh.raw_to_utc_ms(short, rule(NEW))
+    # check_timezone mit derselben Schwelle: genau 30:00 ist der erwartete Ruecksprung
+    df = fold_month([T(19, 30), T(19, 0), T(19, 10)])
+    rep = fh.check_timezone(raw_ms_of(df), "XAUUSD", month_bounds(y, 10), mode="tick",
+                            rule=rule(NEW), neighbours=neighbours("XAUUSD", (y, 10)))
+    assert rep["status"] == "ok", rep.get("reason")
+    assert len(rep["expected_reversals"]) == 1
+    assert rep["large_reversals"] == []
+    n = nights(rep, d)
+    assert n and n[0]["status"] == "ok" and n[0]["reversal_found"] is True
+    assert n[0]["ticks_in_fold"] == 3
+    df2 = fold_month([T(19, 29, 59, 999), T(19, 0), T(19, 10)])
+    rep2 = fh.check_timezone(raw_ms_of(df2), "XAUUSD", month_bounds(y, 10), mode="tick",
+                             rule=rule(NEW), neighbours=neighbours("XAUUSD", (y, 10)))
+    assert rep2["large_reversals"] == [] and rep2["expected_reversals"] == []
+    n2 = nights(rep2, d)
+    assert n2 and n2[0]["reversal_found"] is False and n2[0]["status"] != "ok"
+
+
+OUT_OF_ORDER = [T(19, 50), T(19, 0), T(19, 30), T(19, 58), T(19, 40)]
+
+
+def test_out_of_order_fold_tick_is_not_silently_shifted():
+    d, y = FALL[FY], FY
+    arr = np.array([rms(y, 10, d.day, 18, 59, 59)]
+                   + [rms(y, 10, d.day, *t[:2]) for t in OUT_OF_ORDER]
+                   + [rms(y, 10, d.day, 20)], dtype=np.int64)
+    with pytest.raises(fh.TimezoneError):
+        fh.raw_to_utc_ms(arr, rule(NEW))
+
+
+def test_out_of_order_fold_month_quarantined_as_unresolved(tmp_path):
+    seed_fold_case(tmp_path, OUT_OF_ORDER)
+    site = Site()
+    rep = do_run(tmp_path, site, (FY, 10))
+    assert rep["exit_code"] == 4, rep
+    assert site.requests == 0
+    assert not store_file(tmp_path, "XAUUSD", FY, 10).exists()
+    info = json.loads(qmarker(tmp_path, "XAUUSD", FY, 10).read_text())
+    fu = info["fold_unresolved"]
+    d = FALL[FY]
+    assert fu["date"].startswith(f"{d:%Y-%m-%d}") and fu["ticks"] == len(OUT_OF_ORDER)
+    assert fu["first_raw"].startswith(f"{d:%Y-%m-%d} 19:00:00")
+    assert fu["last_raw"].startswith(f"{d:%Y-%m-%d} 19:58:00")
+
+
+THIN = [T(19, 10), T(19, 25), T(19, 40)]          # nur EIN Durchgang: kein Ruecksprung
+
+
+@pytest.mark.parametrize("side,expect", [
+    (["pre"], [(23, 10), (23, 25), (23, 40)]),
+    (["post"], [(24, 10), (24, 25), (24, 40)]),
+    (["split-at", f"{FALL[FY]:%Y-%m-%d} 19:25:00"], [(23, 10), (24, 25), (24, 40)]),
+])
+def test_resolve_fold_cli_assigns_exactly_those_ticks(tmp_path, monkeypatch, capsys, side, expect):
+    d, y = FALL[FY], FY
+    seed_fold_case(tmp_path, THIN)
+    rep = do_run(tmp_path, Site(), (y, 10))
+    assert rep["exit_code"] == 4, rep
+    q = qmarker(tmp_path, "XAUUSD", y, 10)
+    fu = json.loads(q.read_text())["fold_unresolved"]
+    assert fu["ticks"] == 3
+    code, text = cli(["--symbol", "XAUUSD", "--resolve-fold", f"{y}-10", "--side", *side],
+                     tmp_path, monkeypatch, capsys)
+    assert code == 0, text
+    assert "19:10" in text and "19:40" in text
+    assert json.loads(q.read_text()).get("fold_resolution")
+    assert not store_file(tmp_path, "XAUUSD", y, 10).exists()        # CLI baut nichts
+    site = Site()
+    rep = do_run(tmp_path, site, (y, 10))
+    assert rep["exit_code"] == 0, rep.get("quarantined") or rep
+    assert site.requests == 0
+    bars = bars_of(store_file(tmp_path, "XAUUSD", y, 10))
+    lo = pd.Timestamp(datetime(y, 10, d.day, 23, tzinfo=UTC))
+    win = bars[(bars["ts"] >= lo) & (bars["ts"] < lo + pd.Timedelta(hours=2))]
+    want = [lo + pd.Timedelta(hours=h - 23, minutes=mi) for h, mi in expect]
+    assert list(win["ts"]) == want
+    assert list(win["tick_count"]) == [1, 1, 1]
+    gen = raw_month("XAUUSD", y, 10, NEW)
+    u = utc_ms_of(gen)
+    r = raw_ms_of(gen)
+    fold = (r >= rms(y, 10, d.day, 19)) & (r < rms(y, 10, d.day, 20))
+    want_n = len(ticks_in_utc_month("XAUUSD", (y, 10), {(y, 9): NEW, (y, 10): NEW}))
+    lo_m, hi_m = month_bounds(y, 10)
+    want_n -= int((fold & (u >= lo_m) & (u < hi_m)).sum())
+    assert int(bars["tick_count"].sum()) == want_n + 3
+
+
+def test_resolve_fold_invalidated_by_changed_data(tmp_path, monkeypatch, capsys):
+    y = FY
+    seed_fold_case(tmp_path, THIN)
+    assert do_run(tmp_path, Site(), (y, 10))["exit_code"] == 4
+    code, text = cli(["--symbol", "XAUUSD", "--resolve-fold", f"{y}-10", "--side", "pre"],
+                     tmp_path, monkeypatch, capsys)
+    assert code == 0, text
+    # Daten aendern sich (ein Tick mehr in der doppelten Stunde)
+    write_raw(tmp_path, (y, 10), zip_of("XAUUSD", y, 10, fold_month(THIN + [T(19, 50)])))
+    site = Site()
+    rep = do_run(tmp_path, site, (y, 10))
+    assert rep["exit_code"] == 4, rep
+    assert site.requests == 0
+    assert not store_file(tmp_path, "XAUUSD", y, 10).exists()
+    reason = rep["quarantine"][0]["reason"]
+    assert "19:50" in reason, reason                     # die neuen Daten sind gemeint
+    # Marker bleibt (Aufloesung gilt nicht, wird aber nicht still ersetzt); Marker
+    # loeschen = neu pruefen -> neuer Marker beschreibt die aktuellen 4 Ticks
+    q = qmarker(tmp_path, "XAUUSD", y, 10)
+    q.unlink()
+    rep = do_run(tmp_path, Site(), (y, 10))
+    assert rep["exit_code"] == 4
+    info = json.loads(q.read_text())
+    assert info["fold_unresolved"]["ticks"] == 4
+    assert not info.get("fold_resolution")
+    assert not store_file(tmp_path, "XAUUSD", y, 10).exists()
+
+
+def test_resolve_fold_cli_needs_fold_unresolved_marker(tmp_path, monkeypatch, capsys):
+    # kein Marker
+    seed_raw(tmp_path, [(FY, m) for m in (8, 9, 10, 11, 12)])
+    code, text = cli(["--symbol", "XAUUSD", "--resolve-fold", f"{FY}-10", "--side", "pre"],
+                     tmp_path, monkeypatch, capsys)
+    assert code == 2, text
+    assert "unrecognized arguments" not in text and "Marker" in text, text
+    # Marker anderer Art (Tick in der Maerz-Luecke): kein fold_unresolved
+    spr = SPRING[FY]
+    seed_raw(tmp_path, [(FY, m) for m in (1, 2, 4)])
+    t = rms(FY, 3, spr.day, 19, 30)
+    write_raw(tmp_path, (FY, 3), zip_of("XAUUSD", FY, 3, with_extra(raw_month("XAUUSD", FY, 3, NEW),
+                                                                    [t], t - 1)))
+    assert do_run(tmp_path, Site(), (FY, 3))["exit_code"] == 4
+    q = qmarker(tmp_path, "XAUUSD", FY, 3)
+    before = q.read_text()
+    assert "fold_unresolved" not in json.loads(before) or not json.loads(before)["fold_unresolved"]
+    code, text = cli(["--symbol", "XAUUSD", "--resolve-fold", f"{FY}-03", "--side", "post"],
+                     tmp_path, monkeypatch, capsys)
+    assert code == 2, text
+    assert "unrecognized arguments" not in text and "fold_unresolved" in text, text
+    assert q.read_text() == before
