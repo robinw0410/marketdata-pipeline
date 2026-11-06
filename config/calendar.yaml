@@ -1,0 +1,108 @@
+# Konfiguration fuer scripts/fetch_calendar.py (Wirtschaftskalender / News-Sperre).
+#
+# Alle Uhrzeiten sind LOKALZEIT der jeweiligen Zeitzone und werden zur Laufzeit
+# mit zoneinfo nach UTC umgerechnet (Sommerzeit!). Nie feste Offsets eintragen.
+#
+# Mit [Annahme] markierte Werte stammen aus dem Gedaechtnis und waren bei der
+# Erstellung OHNE Netzzugang nicht pruefbar. Die FRED-Release-IDs sind zur
+# Laufzeit abgesichert (Namens-Check, siehe fred.releases.expected_name).
+
+timezones:
+  US: America/New_York
+  EA: Europe/Berlin          # EZB-Sitz Frankfurt
+
+# Deterministische Impact-Zuordnung je event_type. Jeder event_type, den eine
+# Quelle erzeugt, MUSS hier genau einmal stehen (sonst Abbruch beim Laden).
+impact:
+  high: [FOMC_STATEMENT, FOMC_PRESS_CONF, CPI, NFP, PCE, ECB_RATE_DECISION]
+  medium: [GDP, PPI, RETAIL_SALES, FOMC_MINUTES, ECB_PRESS_CONF, JOBLESS_CLAIMS]
+  low: []
+
+fred:
+  base_url: https://api.stlouisfed.org/fred
+  realtime_start: "2000-01-01"
+  realtime_end: "9999-12-31"
+  page_limit: 10000
+  # release_id [Annahme, aus dem Gedaechtnis]. Vor jeder Nutzung ruft das
+  # Skript fred/release?release_id=.. ab und bricht hart ab, wenn der Name
+  # expected_name nicht enthaelt (Gross-/Kleinschreibung egal).
+  # time_local: Regeluhrzeit America/New_York [Annahme: fuer alle Jahre gleich].
+  releases:
+    - {event_type: NFP,            release_id: 50,  expected_name: "Employment Situation",                               time_local: "08:30"}
+    - {event_type: CPI,            release_id: 10,  expected_name: "Consumer Price Index",                               time_local: "08:30"}
+    - {event_type: PCE,            release_id: 54,  expected_name: "Personal Income and Outlays",                        time_local: "08:30"}
+    - {event_type: GDP,            release_id: 53,  expected_name: "Gross Domestic Product",                             time_local: "08:30"}
+    - {event_type: PPI,            release_id: 46,  expected_name: "Producer Price Index",                               time_local: "08:30"}
+    - {event_type: RETAIL_SALES,   release_id: 9,   expected_name: "Advance Monthly Sales for Retail and Food Services", time_local: "08:30"}
+    - {event_type: JOBLESS_CLAIMS, release_id: 180, expected_name: "Unemployment Insurance Weekly Claims Report",        time_local: "08:30"}
+
+fomc:
+  current_url: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+  historical_url: https://www.federalreserve.gov/monetarypolicy/fomchistorical{year}.htm
+  # regulaere Sitzungen je Jahr (ohne unscheduled / notation vote / conference call)
+  meetings_per_year: [7, 10]
+  # Uhrzeiten America/New_York je Zeitraum, Statement am letzten Sitzungstag.
+  # [Annahme, Vorwissen, unverifiziert] Zeitraeume:
+  #   bis 2012-12-31                 Statement 14:15 (Sitzungen ohne PK)
+  #   2011-04-27 bis 2012-12-31      Statement 12:30, PK 14:15 (Sitzungen MIT PK)
+  #   ab 2013-01-01                  Statement 14:00, PK 14:30
+  # valid_from/valid_to inklusive (valid_to: null = offen). with_press_conf:
+  # true/false = nur Sitzungen mit/ohne PK, null = beide. Fuer jede Sitzung
+  # muss GENAU eine Regel passen, sonst Abbruch (ConfigError).
+  time_rules:
+    - {valid_from: "1990-01-01", valid_to: "2012-12-31", with_press_conf: false, statement: "14:15"}
+    - {valid_from: "2011-04-27", valid_to: "2012-12-31", with_press_conf: true,  statement: "12:30", press_conf: "14:15"}
+    - {valid_from: "2013-01-01", valid_to: null,         with_press_conf: null,  statement: "14:00", press_conf: "14:30"}
+  minutes_time: "14:00"         # nur wenn das Veroeffentlichungsdatum auf der Seite steht
+  # [Annahme] Pressekonferenz-Regel: ab press_conf_every_meeting_from bei jeder
+  # regulaeren Sitzung; davor nur bei SEP-Sitzungen ab press_conf_sep_from.
+  press_conf_every_meeting_from: "2019-01-01"
+  press_conf_sep_from: "2011-04-01"
+  max_sep_per_year: 5
+
+ecb:
+  url: https://www.ecb.europa.eu/press/calendars/mgcgc/html/index.en.html
+  # Entscheidungen je Jahr (zweitaegige Sitzung = eine Entscheidung). Fuer
+  # Jahre NACH dem laufenden Jahr ist weniger erlaubt (Kalender ggf. erst
+  # teilweise veroeffentlicht), mehr als das Maximum nie.
+  meetings_per_year: [6, 12]
+  # Uhrzeiten Europe/Berlin, gueltig ab 'from' (verifiziert laut Auftrag).
+  # [Annahme] Nach jeder geldpolitischen Sitzung gibt es eine Pressekonferenz.
+  time_rules:
+    - {from: "1999-01-01", decision: "13:45", press_conf: "14:30"}
+    - {from: "2022-07-21", decision: "14:15", press_conf: "14:45"}
+
+adhoc:
+  file: config/calendar_adhoc.csv
+
+# Optionaler Kreuzcheck (nur Report, nichts wird uebernommen, Fehler nicht fatal).
+ff:
+  url: https://nfs.faireconomy.media/ff_calendar_thisweek.json
+  tolerance_minutes: 5
+  # Titel-Regex (Python, case-insensitive, re.search) -> event_type, je Land
+  # des Feeds. [Annahme] Titel aus dem Gedaechtnis, unverifiziert.
+  titles:
+    USD:
+      "^Non-Farm Employment Change$": NFP
+      "^CPI m/m$": CPI
+      "^Core PCE Price Index m/m$": PCE
+      "^(Advance|Prelim|Final) GDP q/q$": GDP
+      "^PPI m/m$": PPI
+      "^Retail Sales m/m$": RETAIL_SALES
+      "^Unemployment Claims$": JOBLESS_CLAIMS
+      "^FOMC Statement$": FOMC_STATEMENT
+      "^FOMC Press Conference$": FOMC_PRESS_CONF
+      "^FOMC Meeting Minutes$": FOMC_MINUTES
+    EUR:
+      "^Main Refinancing Rate$": ECB_RATE_DECISION
+      "^ECB Press Conference$": ECB_PRESS_CONF
+
+validation:
+  # vollstaendige Jahre (< laufendes UTC-Jahr) ab min_high_from_year muessen
+  # mindestens so viele High-Impact-Events (ohne cancelled) haben
+  min_high_per_year: 30
+  min_high_from_year: 2010
+  # plausible Lokalzeit (Stunde, inklusive) fuer nicht-adhoc Events
+  plausible_local_hours: [7, 18]
+  # mehr neu gestrichene High-Impact-Events in einem Lauf -> Abbruch
+  max_cancelled_high_per_run: 10

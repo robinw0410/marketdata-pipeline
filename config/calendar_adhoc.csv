@@ -1,0 +1,11 @@
+# Ad-hoc-Ereignisse fuer scripts/fetch_calendar.py (status=adhoc).
+# Zeilen mit '#' am Anfang sind Kommentare. Uhrzeit = Lokalzeit in 'tz'
+# (Umrechnung nach UTC mit zoneinfo). impact: high|medium|low.
+# Nur Ereignisse eintragen, deren Datum und Uhrzeit belegt sind - nichts
+# aus dem Gedaechtnis ergaenzen.
+#
+# 2020-03-03: FOMC-Notfallsitzung, Zinssenkung, Bekanntgabe 10:00 ET
+# 2020-03-15: FOMC-Notfallsitzung (Sonntag), Bekanntgabe 17:00 ET
+date_local,time_local,tz,event_type,country,impact,note
+2020-03-03,10:00,America/New_York,FOMC_STATEMENT,US,high,Notfallsitzung Zinssenkung
+2020-03-15,17:00,America/New_York,FOMC_STATEMENT,US,high,Notfallsitzung (Sonntag)

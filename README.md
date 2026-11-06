@@ -52,9 +52,13 @@ flowchart LR
 - **`verify_live.py`**: compares a collected day bar by bar against Binance's
   official daily archive (missing bars, phantom bars, OHLCV differences).
 - **`gaps.sql`**: DuckDB query that lists gaps in the historical store.
-- **`fetch_dukascopy.py`**: historical tick data for XAUUSD, XAGUSD and EURUSD
-  from Dukascopy, aggregated to 1-minute bars with **bid and ask** OHLC. See
+- **`fetch_dukascopy.py`**: historical 1-minute bars with **bid and ask** OHLC
+  for XAUUSD, XAGUSD and EURUSD from Dukascopy (daily 1-minute candle files by
+  default, hourly tick files optionally). See
   [Dukascopy (metals / FX)](#dukascopy-metals--fx) below.
+- **`fetch_calendar.py`**: economic calendar (US / euro area) for the news
+  blackout of a gold/silver bot. See
+  [Economic calendar](#economic-calendar) below.
 - **`export_fixture.py`**: exports a small slice of the kline store (default
   BTCUSDT 1m, 2024-01-01 to 2024-01-07) as a gzip CSV test fixture under
   `tests/fixtures/`. Meant to be run where the data lives; the output is then
@@ -62,37 +66,579 @@ flowchart LR
 
 ### Dukascopy (metals / FX)
 
-`fetch_dukascopy.py` downloads hourly `.bi5` tick files from
-`datafeed.dukascopy.com` (URL month is **0-based**, January = `00`; hours are
-UTC). Each file is LZMA-compressed; an empty file means no ticks, a 404 means
-missing. Records are 20 bytes big-endian (`>3I2f`): ms since the start of the
-hour, ask, bid (integers), ask volume, bid volume (float32).
+`fetch_dukascopy.py` reads `datafeed.dukascopy.com` (URL month is **0-based**,
+January = `00`; all times UTC). Files are LZMA-compressed; an empty file means
+no data, a 404 means missing.
 
+Two modes (`--mode`):
+
+- **`candles` (default)**: one file per day and side,
+  `{SYM}/{YYYY}/{MM0}/{DD}/{BID|ASK}_candles_min_1.bi5`, 24-byte big-endian
+  records (uint32 seconds since 00:00 UTC, four uint32 prices, float32
+  volume). Two requests per day instead of 24 (~12x fewer). BID and ASK are
+  merged into the same schema as the tick mode. Minutes where **both** sides
+  have volume 0 and flat prices are fill candles and are dropped.
+  `tick_count` is **1** for every kept minute (not a real tick count).
+- **`ticks`**: hourly `{HH}h_ticks.bi5`, 20-byte records (`>3I2f`: ms since
+  the hour, ask, bid, ask volume, bid volume), aggregated to 1-minute bars.
+
+The candle format is taken from `dukascopy-node` 1.46.4 (the last version that
+used the bi5 datafeed; line references in `DATA.md` and the script docstring)
+and was **not verified live**. The order of the four price fields is
+disputed (`dukascopy-node`: open, close, low, high; another source: open, high,
+low, close), so it is **determined per file from the data**: an order fits
+if `high >= max(open, close)` and `low <= min(open, close)` for every non-flat
+candle. Exactly one fits: used. Both fit (only possible if `close == high` in
+every active candle, where both readings give identical values): used,
+reported as `ambiguous`. **None fits: the file goes to quarantine**
+(`<name>.quarantine`, not cached, not retried), the month is not written, the
+run report lists it under `quarantine`, and the exit code is **4** (manual
+check needed). Check the format against ticks on the target machine with:
+
+```bash
+python scripts/fetch_dukascopy.py --symbol XAUUSD --verify-day 2024-03-06
+```
+
+It loads the day's 24 tick files and both candle files, aggregates the ticks to
+minutes and compares OHLC per side (detected field order, minutes only in one
+source, max deviation in points, volumes). Exit 0 = match, 4 = deviation above
+`--verify-tol` (points, default 0.5) / `--verify-max-share` (default 0) or a
+quarantined file, 3 = download failed. Report:
+`metals/reports/SYM-verify-YYYY-MM-DD.json`. Delete a `.quarantine` file to
+have it downloaded again.
+
+Fault tolerance and throttling:
+
+- A file that still fails after `--attempts` (5) does **not** stop the run:
+  it is collected, the run continues, and all failures are retried at the end
+  in `--final-retries` rounds (2), each after `--final-wait` seconds (300).
+- A monthly file is written **only if the month is complete**: no unresolved
+  failures, no unconfirmed "no data" answers, no quarantined files. The next
+  run fetches only the missing files and then writes the month.
+- "No data" (404 or an empty 200 response) is cached as a marker
+  (`<name>.404` / `<name>.empty`, JSON with `first_seen` and `confirmed`),
+  never as a 0-byte raw file. On weekends, Dec 25 and Jan 1 it is final at
+  once. **On weekdays it is unconfirmed** (a gap, exit 3) until a request at
+  least 24 h later again returns no data (in tick mode this applies to 404
+  only; empty weekday hours are normal). A candle day with data on one side
+  only is treated the same way. Candle files are requested only 6 h after the
+  end of the day, months only 6 h after month end.
+- Corrupt cache files (LZMA error, 0 bytes) are moved aside as `<name>.corrupt`
+  and downloaded again. Validation errors are collected per month; the other
+  months continue and the run exits 2 at the end.
+- The run report `metals/reports/SYM-dukascopy-run.json` is **always** written
+  (also on gaps, SIGTERM or validation errors): summary, `gaps` (symbol, month,
+  file, day/hour/side, URL, HTTP status, last error, attempts),
+  `unconfirmed`, `quarantine` and `validation_errors`. The next run reads it
+  and tries the gap files first.
+- `--workers` (default 1), `--pause` (1.0 s between requests per worker), one
+  `requests.Session` (keep-alive) per worker, separate `--connect-timeout`
+  (10 s) / `--read-timeout` (60 s). Every throttling or error response
+  (403/408/425/429/5xx, timeouts, connection errors) increments a counter `k`
+  shared by **all** workers and across files and sets a global cooldown of
+  `--backoff-base` (2 s) x 2^k with jitter, capped at `--max-backoff` (600 s);
+  `Retry-After` is honoured up to the cap; the counter resets only on 200/404.
+  After `--max-consecutive-failures` (20) failures in a row the run stops
+  cleanly (report, exit 3) and leaves the restart to systemd.
+- HTTP 403 is most likely the datafeed's WAF/bot protection (newer
+  `dukascopy-node` versions moved to a different API for that reason). It is
+  retried like 503, never treated as "no data", counted separately in the
+  report, and if most requests of a run get a 403 the log and report say so
+  (raise `--pause`, try later).
+- Progress (files done/total, rate, ETA) every `--progress-every` (50)
+  downloaded files; cache hits do not count as requests.
+- A per-symbol lock (`flock` on `metals/.lock-SYM`) prevents two processes
+  (e.g. a history service and a monthly timer) from working on the same
+  symbol; the second one exits 3 at once without touching reports.
+- SIGTERM/SIGINT: no new downloads, running ones finish, the report is
+  written, exit 3 if anything is left. A restart continues without duplicate
+  work; finished months are skipped. Use `TimeoutStopSec` above the read
+  timeout (e.g. 120 s).
+- Exit codes (in this order of precedence): **2** validation error (no
+  restart), **3** gaps: failed downloads, unconfirmed "no data", interrupted,
+  circuit breaker or lock busy (restart later is fine), **4** manual check
+  needed: quarantined file or `--verify-day` mismatch (no restart), **0**
+  complete. Exit 3 deliberately wins over 4: the units restart on 3 but not
+  on 4, so returning 4 while gaps remain would stop the backfill. A
+  quarantine is still hard to miss: the run report `status` reads e.g.
+  `gaps+quarantine`, a top-level `quarantined` list names the months, and
+  every run logs an ERROR line while it lasts.
+
+Store and validation:
+
+- Raw files are cached (month 1-based in the cache path), so the store can be
+  rebuilt (`--rebuild`) without downloading again; delete a marker to request
+  that file again. All files are written atomically (hidden
+  `.name.pid.thread.part` temp file, which pyarrow ignores, fsync of file and
+  directory, `os.replace`); orphaned temp files are removed at start.
+- Bars cover `[t, t+1min)`, labelled left, and exist only for minutes with
+  trading (no filling). Only **completed UTC months** are written (so no
+  candle file of the running day is ever requested); existing monthly files
+  are not overwritten unless `--rebuild` is given. Parquet schema metadata
+  `dukascopy_mode` and the monthly report field `mode` record the mode.
 - **Assumption, to be verified:** price = integer / `POINT_DIVISOR`, with
   1000 for XAUUSD/XAGUSD and 100000 for EURUSD. A wrong divisor shifts prices
   by powers of ten, so every bar is checked against a coarse plausible range
-  (XAUUSD 200–20000, XAGUSD 3–500, EURUSD 0.5–2.0) and the run aborts hard
-  instead of writing wrong prices.
-- Raw files are cached (month 1-based in the cache path), so the store can be
-  rebuilt (`--rebuild`) without downloading again. 404s are cached as
-  `HHh_ticks.404` marker files; delete a marker to request that hour again.
-- Downloads are polite: generic User-Agent, retries with exponential backoff,
-  `--workers` (default 4) and a pause between requests.
-- Bars cover `[t, t+1min)`, labelled left, and exist only for minutes with
-  ticks (no filling). Only **completed UTC months** are written; existing
-  monthly files are not overwritten unless `--rebuild` is given.
-- Hard validation before writing: duplicates, monotonic time, bid and ask OHLC
+  (XAUUSD 200–20000, XAGUSD 3–500, EURUSD 0.5–2.0) and a yearly price anchor,
+  and the run aborts hard instead of writing wrong prices.
+- Hard validation before writing (the month is not written): duplicates, monotonic time, bid and ask OHLC
   consistency, prices > 0, NaNs, plausible range, crossed quotes
   (`ask_close < bid_close`, abort above 0.1 % of bars). Soft checks are only
   reported (log + JSON under `metals/reports/`): spread outliers (> 20x the
-  monthly median), 1m mid jumps > 2 %, and minutes without ticks Mon–Fri on a
-  coarse grid. There is deliberately **no hard gap limit** as for crypto:
-  metals and FX have daily breaks and weekends. Classifying gaps as planned or
-  unplanned is left to the consumer's trading calendar.
-- Data root: `MARKETDATA_DATA_ROOT`, default `data/` in the repo (only this
-  script reads the variable).
+  monthly median), 1m mid jumps > 2 %, minutes without ticks Mon–Fri on a
+  coarse grid, and continuity (`|open[t+1] - close[t]|` in points). There is
+  deliberately **no hard gap limit** as for crypto: metals and FX have daily
+  breaks and weekends. Classifying gaps as planned or unplanned is left to the
+  consumer's trading calendar.
+- Data root: `MARKETDATA_DATA_ROOT`, default `data/` in the repo (read only
+  by this script and `fetch_calendar.py`).
 - **License:** check Dukascopy's terms of use yourself. Do not redistribute
   or commit the data, raw or derived (`data/` is git-ignored).
+
+### HistData (metals, default source)
+
+`fetch_histdata.py` is the **default source** for XAUUSD and XAGUSD.
+**EURUSD is no longer fetched from HistData**: it has no daily break, too few
+time anchors per month, and its 2024-11 `--verify-month` passed although the
+stamping was wrong. The bot uses a daily reference rate (ECB/FRED) instead;
+`--symbol EURUSD` is rejected with that hint (`fetch_dukascopy.py` is
+unchanged). Any run moves an old HistData EURUSD store directory (written by
+check version 4) to `metals/stale/` once (WARNING, run report
+`retired_removed_symbols`); its raw cache is left alone.
+Dukascopy answers HTTP 429 per client IP in the homelab, even with one
+worker. The output is the same as the Dukascopy store (columns, dtypes,
+atomic writes, reports, exit codes). The bot can tell the two sources apart
+only by the partition `metals/source=histdata/...`. Research, sources and
+open points (German): [docs/histdata_research.md](docs/histdata_research.md).
+
+Download: GET the period page
+`https://www.histdata.com/download-free-forex-historical-data/?/ascii/{tick-data-quotes|1-minute-bar-quotes}/{sym}/{YYYY}[/{M}]`,
+read the hidden form `file_down` (`tk`, `date`, `datemonth`, `platform`,
+`timeframe`, `fxpair`), then POST it to `https://www.histdata.com/get.php`
+with that page as `Referer`. The response is a ZIP with one CSV and a status
+`.txt` (gap list). An empty body means no data. **Every file costs 2
+requests**, and only one request runs at a time.
+
+Two modes (`--mode`):
+
+- **`tick` (default)**: Generic ASCII ticks `YYYYMMDD HHMMSSmmm,bid,ask,volume`,
+  one ZIP per month, aggregated to 1-minute bid **and** ask OHLC with a real
+  `tick_count`. This is the only HistData format that has the ask side, so
+  it is the only one that keeps the spread. Parquet metadata:
+  `histdata_mode=histdata_tick`, `spread_available=true`.
+- **`m1`**: Generic ASCII 1-minute bars `YYYYMMDD HHMMSS;o;h;l;c;v`, **bid
+  only**. Past years come as one yearly ZIP, the current year monthly.
+  - It writes to its **own partition** `metals/source=histdata_m1/...`, so
+    bid-only months never mix with tick months; the bot reads only
+    `source=histdata` and `source=dukascopy`.
+  - The store gets `ask_* = bid_*` (spread 0) and `tick_count = 1`. The
+    metadata says `histdata_mode=histdata_m1`, `spread_available=false`, and
+    the bot's cost model must supply the spread.
+  - A monthly file whose `histdata_mode` differs from the current mode is
+    never overwritten, not even with `--rebuild` (`store_mode_conflict`,
+    exit 4).
+  - Exact duplicate minutes are dropped; conflicting duplicates (observed in
+    real HistData M1 files) are merged and counted in the monthly report.
+
+Time zone:
+
+- **Tick timestamps follow a per-period stamping schedule (check version
+  7)**, from the owner's extended survey 2009–2025 on real XAUUSD/XAGUSD
+  ticks: `ny_local` (America/New_York) up to and including 2018-11 (2010,
+  2012, 2015 and 2018 clearly `ny_local`), then `berlin_minus_6_utc_midnight`
+  from 2018-12: Europe/Berlin local time minus 6 h (UTC-5 in EU winter, UTC-4
+  in EU summer), but the DST status is taken at **00:00 UTC of the UTC day**,
+  so the change takes effect at **Monday 00:00 UTC** after the last Sunday of
+  March/October, not at Sunday 01:00 UTC (rule kind `dst_daily_utc`). In
+  2019-03 only the Berlin family passes (fixed UTC-5 is excluded by the July
+  control months at -4 h). Every October since 2019 contains thousands of real
+  ticks in a raw reversal on the EU fall-back **Sunday**: raw 19:59:59 →
+  19:00:00, i.e. 23:59:59 UTC → Monday 00:00:00 UTC. (The earlier reading
+  "stray weekend ticks, raw Saturday 21:00 → 20:00" was wrong.)
+- **Fall: the raw hour Sunday 19:00–19:59:59.999 occurs twice** (market
+  open). `raw_to_utc_ms` resolves it by **file order**: the first reversal of
+  30 minutes or more into that hour separates the -4 h ticks (before it) from
+  the -5 h ticks (from it on). Without such a reversal the ticks cannot be
+  placed and raise `TimezoneError` (quarantine); they are never guessed or
+  dropped. The check expects this reversal (`expected_reversals`, not a
+  `large_reversals` entry, never releasable). "30 minutes or more" is one
+  comparison everywhere, and the fold reversal comes from one helper
+  (`fold_reversal`) for conversion, `expected_reversals` and
+  `transition_nights`. The resolution must give UTC that is non-decreasing in
+  file order across the night (tolerance 5 s); otherwise the night counts as
+  unresolved.
+- **Unresolved fold, human resolution**: the quarantine marker then carries
+  `fold_unresolved` (`date`, `ticks`, `first_raw`, `last_raw`). Neither
+  `"accepted": true` nor the weekend release frees it. After checking, run
+  `fetch_histdata.py --symbol XAUUSD --resolve-fold YYYY-MM --side pre|post|split-at RAW_TS`
+  (pre: all ticks of the hour before the change, -4 h; post: all after, -5 h;
+  split-at: in file order, before the first tick with that raw time pre,
+  from it on post). It prints every affected tick with its UTC, checks
+  monotonic UTC, and only sets `fold_resolution` on that marker (no
+  download; exit 2 with the reason if it does not apply). The next run uses
+  it, re-checks the month (the night counts as `ok`, `resolved_manually`) and
+  writes it if it passes; the marker stays as the record. It applies to
+  exactly those ticks: if their count or first/last raw time changes, it is
+  invalid and the month is quarantined again.
+- **Spring: raw Sunday 19:00–19:59:59.999 does not exist** (raw 18:59:59 →
+  20:00:00 = 23:59:59 UTC → Monday 00:00 UTC); a tick there raises
+  `TimezoneError`. This is still to be confirmed on the data; the survey
+  reports every transition night (`transition_nights`).
+- **Why the switch can be set at raw month 2018-12**: `ny_local` and the new
+  rule differ only in two windows a year (March from the US start, 2nd Sunday
+  07:00 UTC, to Monday 00:00 UTC after the EU start; Oct/Nov from Monday
+  00:00 UTC after the EU end to the US end, 1st Sunday of November 06:00 UTC).
+  Between the 2018 window (ends 2018-11-04 06:00 UTC, `ny_local` confirmed)
+  and the 2019 window (starts 2019-03-10 07:00 UTC, Berlin family confirmed)
+  there is none, so every raw-month boundary from 2018-12 to 2019-03 is
+  equivalent. The list per year 2009–2025 (checked with zoneinfo) is in
+  `config/histdata_timezone.yaml`.
+- **`undecided`** is still supported but no longer in the default schedule:
+  the conversion runs under every candidate; a UTC month into which a tick
+  converted differently could fall is not written (`months_rule_undecided`,
+  exit 4, no marker).
+- **The market stays New York-based**: the expected anchors are still the
+  CME/New York session times (17:00/18:00 `America/New_York`); only the
+  stamping rule changed.
+- **M1 keeps the documented fixed UTC-5** (`fixed_est` = `Etc/GMT+5`). This is
+  **not verified** for M1. Check it with `--mode m1 --verify-month 2024-07`
+  before relying on M1 summer months.
+- **Rules and schedule** live in `config/histdata_timezone.yaml`
+  (`$HISTDATA_TZ_CONFIG` selects another file). A rule (`TzRule`) has a name, a
+  zoneinfo zone, a whole-hour shift and a `kind` (`zone_shift`, the default:
+  offset at the instant itself; `dst_daily_utc`: offset of the zone at 00:00
+  UTC of the instant's UTC day) (raw = local time in `zone` +
+  `shift_h`). Built in: `berlin_minus_6` (Europe/Berlin, -6), `ny_local`
+  (America/New_York, 0), `fixed_est` (Etc/GMT+5, 0); the file may define more.
+  `schedule` lists per mode `{from: "YYYY-MM", rule: name}` keyed on **raw**
+  months, sorted; a rule change takes effect only at a raw-month boundary.
+  `{from: "YYYY-MM", rule: undecided, candidates: [ny_local, berlin_minus_6]}`
+  marks an open period (at least two known rules).
+  To use another rule for a period, add an entry, e.g.
+
+  ```yaml
+  schedule:
+    tick:
+      - {from: "2000-01", rule: fixed_est}
+      - {from: "2012-01", rule: berlin_minus_6}
+    m1:
+      - {from: "2000-01", rule: fixed_est}
+  ```
+
+  An unknown rule or zone, an unsorted or duplicate `from`, a missing mode
+  or schedule, a schedule that starts after the earliest raw month needed
+  (first history month minus one, i.e. 2009-02), or a missing config file
+  (also the repo default) stops at load time; there is never a silent
+  fallback. Before changing the
+  schedule, compare candidate rules offline against the raw cache with
+  `scripts/histdata_tz_survey.py` (uses `evaluate_raw_month`: cached raw files
+  only, no download, no markers). After a change, the next run detects every
+  monthly file whose `source_timezone` no longer matches (see below).
+- `raw_to_utc_ms(raw_ms, rule)` converts exactly (vectorized; `raw_ms` in file
+  order). A raw time that does not exist or is ambiguous under the rule is
+  never guessed (except the fall hour of `dst_daily_utc`, resolved by file
+  order as above): such a tick raises `TimezoneError` and the raw month goes
+  to quarantine (exit 4).
+- A UTC month M therefore needs raw months M-1 (its last 4 or 5 hours) and
+  M; the raw months are computed from the schedule. M is written only when
+  both are present, or when M-1 is before the symbol's history or confirmed
+  empty.
+- The time zone is **checked in code for every raw month** (check version 7).
+  The report lists each transition of the rule in the raw month under
+  `transition_nights` (date, kind spring/fall, expected, last_before_raw,
+  first_after_raw, reversal_found, ticks_in_fold/ticks_in_gap, status
+  ok/no_data/unexpected); `unexpected` (fall: data on both sides but no
+  reversal, or unresolved ticks; spring: ticks in the nonexistent hour) is a
+  failure. Rules without an EU change (e.g. `ny_local`) also get observation
+  entries for the EU Sundays (`rule_transition: false`, never a failure).
+  Every market gap gives a close anchor and an open anchor:
+  - weekend (gap of 24 h or more, closing on Thursday/Friday and opening on
+    Sunday/Monday): close 17:00, open 18:00 New York. Other gaps of 24 h or
+    more are outages: reported, never anchors;
+  - for metals, the daily break (Mon–Thu, 17:00–18:00 New York): used only
+    if every break-like gap of that day gives the same unique deviation of
+    at most 1 h, so a random outage cannot replace the real break.
+
+  Expected market times come from `zoneinfo` `America/New_York`. The
+  expected offset (raw minus UTC) is taken per anchor from the raw month's
+  stamping rule at that moment (`berlin_minus_6`: -5 h in EU winter, -4 h in
+  EU summer; `fixed_est`: always -5 h). `check_timezone(..., rule=...)`
+  accepts a fixed candidate rule; the report names it in `rule`. Decisions use the
+  **deviation** = implied minus expected. A gap's deviation is estimated
+  from both sides together: the close may not lie before the last tick (15
+  minutes tolerance for late ticks) and the open not after the first tick (5
+  minutes). This stays correct for thin data, where the ticks are minutes
+  away from 17:00/18:00. The ticks of the first/last 8 days of the cached
+  neighbouring raw months are added as context, so gaps across the month
+  edge count too.
+- **Hard failures** (quarantine) are only systematic or corroborated problems:
+  - median deviation not 0, or fewer than 60 % of unique anchors at 0
+  - **two or more independent gaps in a row with the same non-zero
+    deviation** and no zero in between (a stamping switch, e.g. a week with
+    the EU or pre-2007 US DST rule), at least one of them in this month;
+    context gaps from the neighbouring months count
+  - a timestamp jump back of 30 minutes or more in file order
+  - a local time that is ambiguous or does not exist
+- **Warnings only** (in the report, the month is written): a single
+  outlier such as a stray tick after the close or before the open, a feed
+  that stops at 16:00 or opens an hour late, a 17:15 close, a holiday early
+  close, an outage of 24 h or more during the week, an exact-hour outage,
+  and gaps whose sides contradict each other or are ambiguous.
+- **Run order.** A result computed without a neighbouring raw month that
+  should exist (closed, inside the history, not in the cache) is
+  *provisional*: it is neither cached nor saved as a marker; the next check
+  with the neighbour decides. A single deviating gap at the month edge with
+  no context behind it holds the month back until the neighbour is there.
+  For the newest month (raw M+1 not published yet) the file is written with
+  the parquet metadata `tz_right_padding=false`; once raw M+1 is in the
+  cache (at the start or the end of a later run), the file is re-checked
+  from the cache. If it passes, the flag is set; if not, the file is moved
+  to `metals/stale/` and the raw month is quarantined.
+- If a confirmed switch in raw month M+1 reaches back into month M (the run
+  includes a gap from M's context), month M is not written either.
+- A month with too few anchors, such as a short first month of the
+  history, is checked together with its cached neighbouring raw months. If
+  it still can't be checked, it goes to quarantine as "NICHT PRUEFBAR".
+- Otherwise the raw month goes to **quarantine** (`<zip>.quarantine` with the
+  full check, exit 4). Nothing shifted is ever written.
+  - Deleting the marker re-checks the month without a download.
+  - Deleting the ZIP downloads it again; the new download removes the
+    marker and the month is checked again.
+  - Setting `"accepted": true` in the marker releases the month after a
+    manual check - except for reversals of 30 minutes or more and ticks at
+    ambiguous or nonexistent local times: there a plain `"accepted": true` is
+    ignored (ERROR, the month stays quarantined); only weekend ticks can be
+    dropped, via `--accept-weekend-ticks` (see below).
+  - Markers carry `tz_rule`, `raw_tz` (zone), `tz_shift_h` and
+    `tz_check_version`. A marker that is not released and comes from an
+    older check version or another rule (e.g. check v4 with `ny_local`) is
+    re-checked under the current rule without a download.
+  - `"accepted": true` holds only for the same rule (zone and shift). A
+    release made under another rule is re-checked: if the month passes, the
+    marker is removed; if not, it is rewritten with `"accepted": false` and a
+    note that the earlier release applied to the old conversion.
+  - A tick at an ambiguous or nonexistent local time, or a reversal of 30
+    minutes or more in file order (other than the expected fall reversal of
+    `dst_daily_utc`), quarantines the raw month (default: error, never a
+    guess). The weekend release below is for genuine strays in the closed
+    weekend market only; the expected Sunday fold is never released or
+    dropped. Each `large_reversals` entry reports `at_raw`,
+    `back_to_raw`, `minutes`, `n_ticks`, `first_raw`, `last_raw` and
+    `weekend_closed`; the affected ticks are all ticks with a raw time in
+    [`back_to_raw`, `at_raw`]. If **all** affected reversal ticks and all
+    impossible-hour ticks lie in the closed weekend market by the **raw**
+    clock (`WEEKEND_CLOSED_RAW`: Friday from 18:00, all of Saturday, Sunday
+    before 16:00 - conservative across rules and offsets), the report and the
+    marker carry `releasable_weekend` (`reversal_ticks`,
+    `impossible_hour_ticks`, `raw_ranges`). After a manual check run
+    `fetch_histdata.py --symbol XAUUSD --accept-weekend-ticks YYYY-MM` (raw
+    month; prints the ticks to drop, no download; exit 2 with the reason if
+    the marker is not releasable). Those ticks are then **dropped** (never
+    converted), the rest is re-checked and written if it passes; the monthly
+    report gets `dropped_ticks`, `dropped_raw` and a `warning`. Ticks outside
+    the closed weekend market are never releasable. Under `undecided` the
+    impossible-hour set is the union over all candidates, and a tick that
+    any candidate cannot convert counts as converted differently.
+  - An unreadable marker (invalid JSON, e.g. a typo while setting
+    `"accepted": true`) is kept, logged as ERROR and keeps blocking.
+- Monthly files carry the parquet metadata `source_timezone`, derived from
+  the stamping rule(s) of their raw months and the check version, e.g.
+  `berlin_minus_6_utc_midnight (Europe/Berlin -6 h, Sommerzeit ab 00:00 UTC) -> UTC, je Rohmonat geprueft (tz_check v7)`.
+  Files of v5/v6 (`berlin_minus_6`, `undecided`) whose UTC times differ under
+  the v7 schedule (the transition Sundays in March/October, and the
+  `ny_local` windows of 2019–2021 written as undecided) are moved to
+  `metals/stale/` and rebuilt; the rest is relabelled. Months held as
+  undecided under v6 are written now; old quarantine markers (e.g. the
+  October reversals) are re-checked.
+  At the start of **every** run, all monthly files of the symbol and mode
+  are checked, not only those in `--start`/`--end`:
+  - an older or different label whose conversion gives the **same UTC times
+    in this month** (an older check version, or e.g. `ny_local` or
+    `berlin_minus_6` files of January or July, where both rules agree): the raw months are re-checked
+    from the cache under the current rule, with no download. If they pass,
+    only the metadata is rewritten (`relabelled_timezone`). If they fail,
+    the file is moved to `metals/stale/` and quarantined
+    (`retired_after_recheck`). Without the raw cache the file stays and is
+    listed under `unverified_after_version_bump`;
+  - a different conversion that **shifts UTC times in this month** (`ny_local`
+    versus `berlin_minus_6` files of March, October and November; for an
+    `undecided` month any differing candidate counts, i.e. the weeks between the US and
+    EU clock changes; fixed-UTC-5 files of every month with EU summer time):
+    the file is **moved to `metals/stale/` at once**, so the bot sees a gap
+    rather than a shifted month, and rebuilt if the month is in range.
+    Outside the range it is listed under `stale_retired_out_of_range`.
+
+  Months inside the range are rebuilt from the raw cache (WARNING,
+  `rebuilt_timezone`); this needs no requests when the raw ZIPs are cached,
+  otherwise they are downloaded as usual. `summary.months_rebuilt_timezone`
+  lists the months written; `summary.months_stale_timezone_not_rebuilt` the
+  ones whose rebuild failed. A shifted file has already left the store, so
+  the bot sees a gap. A file that was not shifted stays in place, and the
+  next run retries. `--verify-month` only reports: the state of the month's
+  file (`store_file`) and the check result. It neither changes the file nor
+  writes or deletes quarantine markers.
+
+Unpublished and missing data:
+
+- A month is requested only after its raw month has ended (UTC month end
+  + 4 h in EU summer or + 5 h in EU winter/m1, plus 6 h settle time).
+- An empty answer within 45 days of month end is **pending** (exit 3). It is
+  checked again at most every 24 h.
+- An older empty answer is "no data". It is unconfirmed (exit 3) until a
+  check at least 24 h later is empty again.
+- A confirmed empty month **before the first month that has data** (tick
+  history starting later than M1) is listed under `months_unavailable` and
+  does not cause exit 3 or 4.
+- A confirmed empty month **inside the known history** is suspicious. That
+  means any month after the first month with data, or any month at all if
+  the symbol has never returned data. Such a month is listed under
+  `months_missing_in_history` and gives exit 4 when nothing else is open.
+  It is checked again every 30 days, or at once with `--rebuild`. After a
+  manual check, `"accepted": true` in its `<zip>.empty` marker turns it
+  into "unavailable".
+- Three empty answers in a row inside the known history stop the run
+  (`status: aborted`, exit 3). This usually means a token, WAF or server
+  problem, not missing data.
+- Months before the symbol's history need no request. The history starts
+  used are XAUUSD 2009-03 and XAGUSD 2009-05; these are the
+  M1 start dates, and the tick start dates are unverified.
+
+HTTP and errors:
+
+- `--pause` (5 s) is the minimum gap between two requests.
+- 5xx, timeouts, connection errors, 403 and truncated ZIPs each count as a
+  failed attempt (`--attempts` 5). Each one sets an escalating cooldown of
+  `--backoff-base` (10 s) × 2^k, capped at `--max-backoff` (600 s). After
+  `--max-consecutive-failures` (10) failures in a row the run stops (exit 3).
+- **Permanent content errors** get one attempt per run and do not count
+  toward the circuit breaker. They are a page without the `file_down` form,
+  a form that does not match the request, an HTML or text answer instead of
+  a ZIP (error page, captcha, WAF), and a ZIP with a missing or wrong CSV.
+  - The file gets a `<zip>.failed` marker and is tried again after 24 h at
+    the earliest. Later months carry on.
+  - Content errors are listed under `content_errors` in the report (exit 3).
+  - Three of them in a row stop the run (`status: aborted`).
+  - Such an answer is never treated as data.
+- A corrupt cached ZIP (bad ZIP, CRC error) is moved aside as
+  `<zip>.corrupt` and downloaded again.
+- **HTTP 429** goes through `scripts/ratelimit.py`:
+  - `gate.wait()` runs before every request.
+  - A 429 pauses all requests for max(`Retry-After`, `--rate-limit-pause`).
+    The default is 900 s, and smaller values are rejected.
+  - The block is persisted in `metals/state/histdata-ratelimit.json`, so
+    restarts and parallel symbols respect it.
+  - A 429 does **not** use up an attempt, does not escalate the backoff and
+    does not count toward the circuit breaker.
+  - A 429 on the POST restarts from the page GET after the pause, so the
+    form token is fresh.
+  - Once `--max-rate-limit-wait` (21600 s) is used up, the run ends cleanly
+    with exit 3 and a report.
+
+Resume, files and reports (`SRC` = `histdata`, or `histdata_m1` in m1 mode):
+
+- Finished months and cached ZIPs are skipped and cost no requests.
+- `--rebuild` rebuilds months from the raw cache.
+- Raw cache:
+  `metals/raw/source=histdata/symbol=SYM/mode={tick|m1}/HISTDATA_COM_ASCII_SYM_{T|M1}{period}.zip`.
+- Reports:
+  - `metals/reports/SYM-SRC-run.json`: always written, also on errors and
+    SIGTERM. It holds the summary, `quarantined` at the top level, `gaps`,
+    `content_errors`, `pending`, `unconfirmed`, `quarantine`,
+    `validation_errors` and the gaps HistData reports in its status `.txt`
+    (`histdata_reported_gaps`).
+  - `SYM-SRC-1m-YYYY-MM.json` per month: `fetch_dukascopy.validate` plus the
+    time zone check of each raw month.
+  - `SYM-SRC-verify-YYYY-MM.json` from `--verify-month`.
+- Lock: `metals/.lock-histdata-SYM`, separate from the Dukascopy lock. If
+  it is held, the run exits 3.
+- SIGTERM ends the run cleanly with a report and exit 3. Orphaned temp files
+  are removed at start.
+
+Exit codes are the same as Dukascopy:
+
+- **2**: validation error.
+- **3**: gaps, content errors, pending months, unconfirmed "no data",
+  aborted run, 429 budget used up, circuit breaker, SIGTERM or lock held.
+  Restarting later is fine.
+- **4**: manual check needed. This covers quarantine (time zone mismatch,
+  not checkable, unreadable format), a confirmed empty month inside the
+  history, a store mode conflict, and a month held as `rule_undecided`
+  (status `rule_undecided` when that is the only manual case). No restart.
+- **0**: complete.
+
+Exit 3 deliberately wins over 4, for the same restart reason as above. The
+manual-check months are still visible: `status` reads e.g.
+`gaps+quarantine`, the `quarantined` list (month, kind, reason) sits at the
+top of the run report, and every run logs `MANUELLE PRUEFUNG NOETIG ...` as
+an ERROR.
+
+Request count: 2 requests per raw month in tick mode, so a full XAUUSD
+history (2009-03 to now, about 210 months) is about 420 requests, which is
+about 35 minutes of pauses plus the download time. One tick month is several
+million rows; plan for 1–2 GB of RAM.
+
+Homelab commands (container user `mkt`):
+
+```bash
+# check one month first (max. 4 requests): decode, time zone check, validation
+runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
+  /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
+  --symbol XAUUSD --verify-month 2024-03
+runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
+  /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
+  --symbol XAUUSD --verify-month 2024-07          # summer month: DST check
+runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
+  /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
+  --symbol XAUUSD --mode m1 --verify-month 2024-07   # M1 time zone (unverified)
+# full history (default start = history start of the symbol)
+runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
+  /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
+  --symbol XAUUSD --start 2009-03
+# bid-only fallback
+python scripts/fetch_histdata.py --symbol XAGUSD --start 2024-01 --end 2024-06 --mode m1
+```
+
+### Economic calendar
+
+`fetch_calendar.py` builds `calendar/events.parquet` (current state) plus a
+snapshot per run under `calendar/snapshots/`, so moved dates stay traceable.
+Schema and sources are in [DATA.md](DATA.md#wirtschaftskalender); settings in
+`config/calendar.yaml` and `config/calendar_adhoc.csv`.
+
+- **Sources**, each with its own parser: FRED `release/dates` (date only,
+  time by rule, 08:30 ET; needs `FRED_API_KEY`), the Fed's FOMC calendar
+  pages, the ECB Governing Council calendar, and a hand-kept ad-hoc CSV.
+  Local times are converted with `zoneinfo`, never with a fixed offset.
+- **Assumptions are guarded at run time.** The FRED release IDs come from
+  memory: before use, the script fetches each release's name and aborts if it
+  doesn't match. The FOMC and ECB parsers check meetings per year (FOMC 7–10,
+  ECB 6–12) and fail instead of guessing.
+- **Merge with the last state.** Same `event_id` → newest source wins; changed
+  `ts_utc` → `rescheduled`; an event that disappears inside a source's newly
+  fetched date range → `cancelled` (the row is kept).
+- **Hard validation** (schema, UTC, no NaT, event_id vs. local date, impact
+  vs. config, plausible local hour, at least 30 high-impact events per
+  complete year from 2010, at most 10 newly cancelled high-impact events per
+  run) on the merged table. If it fails, **nothing** is written, the old
+  state stays, exit code 2.
+- **Fault tolerance per source.** If one source fails (download, parser or
+  plausibility check), its events from the last state stay **unchanged** (not
+  cancelled), the other sources are updated and written as usual, and the run
+  still exits non-zero (3; 4 for a config error such as the FRED name check),
+  so systemd/alerting fires. A changed ECB page therefore can't block new
+  CPI/NFP dates. On the very first run, a missing source is fine as long as
+  the validation still passes. A JSON report (incl. failed sources) is
+  written to `calendar/reports/` either way.
+- **Cross-check** against the faireconomy weekly JSON is report-only: time
+  differences over 5 minutes are listed, nothing is taken over, and failures
+  of that source are not fatal.
+- Not verified without network access when this was written: page structures
+  of federalreserve.gov and ecb.europa.eu (the parsers were built against
+  self-written fixtures), FRED release IDs (hence the name check), the FOMC
+  press-conference rule before 2019, the FOMC times before 2013 (14:15, and
+  12:30 statement / 14:15 press conference at press-conference meetings from
+  2011-04-27; configurable periods in `fomc.time_rules`), ff titles. The ECB page covers only the
+  current calendar, so ECB history builds up from the first run on.
 
 ### Backtester (`scripts/bt`)
 
@@ -221,8 +767,14 @@ python scripts/collect_klines.py --symbols BTCUSDT ETHUSDT --interval 1m
 python scripts/compact_live.py --symbol BTCUSDT
 python scripts/verify_live.py  --symbol BTCUSDT --date 2026-08-21
 
+# economic calendar (FRED_API_KEY from /etc/marketdata.env or the shell)
+python scripts/fetch_calendar.py --start-year 2003 --dry-run -v
+python scripts/fetch_calendar.py --sources fomc,ecb,adhoc,ff   # without FRED (fails validation on an empty store)
+
 # metals / FX from Dukascopy (written to data/metals, raw cache in data/raw/dukascopy)
-python scripts/fetch_dukascopy.py --symbol XAUUSD --start 2024-01 --workers 4
+python scripts/fetch_dukascopy.py --symbol XAUUSD --start 2024-01            # 1m candles, 1 worker
+python scripts/fetch_dukascopy.py --symbol XAUUSD --start 2024-01 --mode ticks
+python scripts/fetch_dukascopy.py --symbol XAUUSD --verify-day 2024-03-06   # candles vs. ticks
 
 # test fixture from the local kline store
 python scripts/export_fixture.py      # -> tests/fixtures/BTCUSDT-1m-2024-01-01_07.csv.gz
@@ -247,7 +799,8 @@ python -m pytest tests
 ├── scripts/
 │   ├── fetch_klines.py      historical spot klines (checksum-verified)
 │   ├── fetch_funding.py     funding rates + perp klines
-│   ├── fetch_dukascopy.py   Dukascopy ticks -> 1m bid/ask bars (metals, FX)
+│   ├── fetch_dukascopy.py   Dukascopy candles/ticks -> 1m bid/ask bars (metals, FX)
+│   ├── fetch_calendar.py    economic calendar (FRED, FOMC, ECB, ad hoc)
 │   ├── export_fixture.py    kline slice -> tests/fixtures/*.csv.gz
 │   ├── collect_klines.py    WebSocket live collector
 │   ├── compact_live.py      NDJSON -> Parquet (completed days)
@@ -262,14 +815,17 @@ python -m pytest tests
 │       └── strategies.py    controls + example strategy
 ├── tests/                   pytest, synthetic fixtures only
 │   └── fixtures/            small exported data slices (export_fixture.py)
+├── config/                  calendar.yaml, calendar_adhoc.csv
 ├── systemd/                 systemd units (see Deployment)
 ├── logs/experiments.jsonl   experiment log (committed)
 ├── data/                    not committed
 │   ├── klines/              spot klines, symbol=/year=
-│   ├── raw/dukascopy/       raw .bi5 cache, SYM/YYYY/MM/DD (month 1-based)
+│   ├── raw/dukascopy/       raw .bi5 cache (candles + ticks), SYM/YYYY/MM/DD (month 1-based)
+│   ├── raw/fomc/            cached FOMC historical pages
+│   ├── calendar/            events.parquet, snapshots/, reports/
 │   └── metals/
 │       ├── source=dukascopy/symbol=/year=/SYM-1m-YYYY-MM.parquet
-│       └── reports/         validation report per month (JSON)
+│       └── reports/         per-month validation, run report + gap list, verify-day (JSON)
 ├── DATA.md                  dataset inventory
 ├── GAPS.md                  gap analysis
 └── SPLITS.md                frozen data splits
@@ -285,13 +841,16 @@ units only get write access to `/opt/marketdata/data`.
 |---|---|
 | `marketdata-collector.service` | **Running in production.** The file in `systemd/` is the deployed unit, unchanged. It reads `/etc/marketdata.env`; template: [`.env.example`](.env.example). |
 | `marketdata-compact.service` + `.timer` | **Deployed and running.** Compacts completed UTC days, daily at 00:30 UTC. `Persistent=true` catches up on runs missed while the container was down. |
+| `marketdata-calendar.service` + `.timer` | **New, not deployed yet.** Economic calendar, daily at 05:10 UTC, `Persistent=true`. Reads `FRED_API_KEY` from `/etc/marketdata.env` (`EnvironmentFile=-`, optional). Exits non-zero if a source or the validation fails (a failed source keeps its old events, the rest is still written). Needs `pyyaml` (`pip install -r requirements.txt`). |
 
 There is no timer for `fetch_klines.py`; historical data is fetched manually.
 
 The collector unit loads `/etc/marketdata.env` via `EnvironmentFile=` without
-a `-` prefix, so the file has to exist; it may be empty. Its only setting,
-`KUMA_PUSH_URL` (Uptime Kuma push heartbeat), is optional. Copy
-[`.env.example`](.env.example) there and fill it in, or leave it empty.
+a `-` prefix, so the file has to exist; it may be empty. The collector's
+setting `KUMA_PUSH_URL` (Uptime Kuma push heartbeat) is optional. The calendar
+unit reads `FRED_API_KEY` from the same file; without it the FRED source fails
+and the run exits non-zero. Copy [`.env.example`](.env.example) there and fill
+it in.
 
 Installing the units on a new host:
 
@@ -301,6 +860,9 @@ sudo systemctl daemon-reload
 sudo systemctl start marketdata-compact.service      # one manual run first, check the log
 journalctl -u marketdata-compact.service -n 50
 sudo systemctl enable --now marketdata-collector.service marketdata-compact.timer
+# calendar: one manual run first, then the timer
+sudo systemctl start marketdata-calendar.service && journalctl -u marketdata-calendar.service -n 50
+sudo systemctl enable --now marketdata-calendar.timer
 ```
 
 ## Known issues / changelog
