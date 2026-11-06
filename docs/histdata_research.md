@@ -79,6 +79,45 @@ Zweite Messung des Eigentümers im Homelab an **echten** HistData-Ticks, **alle 
 
 **Schluss: Rohzeit = Europe/Berlin-Ortszeit minus 6 h**, also UTC-5 in der EU-Winterzeit und UTC-4 in der EU-Sommerzeit; Wechsel am letzten Sonntag im März bzw. Oktober um 01:00 UTC. Das widerlegt sowohl die HistData-Angabe "EST ohne Sommerzeit" als auch die erste Deutung (America/New_York, Prüfversion 2-4; die Juli-Messung allein konnte beide nicht unterscheiden). **Der Markt selbst bleibt New-York-basiert:** die erwarteten Anker sind weiter die CME/New-York-Sessionzeiten (17:00/18:00 America/New_York); nur die Stempelungsregel ist eine andere.
 
+### Survey über die Jahre (v6): Wechsel ny_local → berlin_minus_6
+
+Survey des Eigentümers im Homelab (`scripts/histdata_tz_survey.py`, 124 Requests, XAUUSD und XAGUSD), je Jahr die Umstellungszeiträume März und Okt/Nov:
+
+| Jahr | Zeitraum | Ergebnis |
+|---|---|---|
+| 2010, 2012, 2015, 2018 | März und Okt/Nov, beide Metalle | eindeutig `ny_local` |
+| 2021, 2024 | März | eindeutig `berlin_minus_6` (`ny_local` fällt durch) |
+| 2021, 2024 | Oktober | "keine Regel passt" nur wegen **eines** 60-min-Rücksprungs in Dateireihenfolge: verirrte Ticks im geschlossenen Wochenendmarkt der EU-Umstellungsnacht (unter `berlin_minus_6` springt die Rohuhr Sa 21:00 → 20:00); sonst `berlin_minus_6` |
+| 2009, 2011, 2013, 2014, 2016, 2017, 2019, 2020, 2022, 2023, 2025 | - | nicht untersucht |
+
+Der Wechsel liegt also zwischen 2018-11 und 2021-03. **Vorläufiger Fahrplan (Prüfversion 6):** tick `ny_local` ab 2000-01, `undecided` (Kandidaten `ny_local`, `berlin_minus_6`) ab 2018-12, `berlin_minus_6` ab 2021-03; m1 unverändert `fixed_est`. Ein erweiterter Survey soll den Wechsel eingrenzen.
+
+**Warum die Monate dazwischen unter beiden Regeln gleich sind:** Außerhalb zweier Fenster je Jahr liefern `ny_local` und `berlin_minus_6` im Winter UTC-5 und im Sommer UTC-4, die Abbildung roh → UTC ist identisch. Nur in den Fenstern rechnet `ny_local` mit UTC-4, `berlin_minus_6` mit UTC-5: März vom US-Beginn (2. Sonntag im März, 07:00 UTC) bis zum EU-Beginn (letzter Sonntag im März, 01:00 UTC), Okt/Nov vom EU-Ende (letzter Sonntag im Oktober, 01:00 UTC) bis zum US-Ende (1. Sonntag im November, 06:00 UTC). Mit zoneinfo auf der Viertelstunde nachgerechnet (keine weiteren Abweichungen im Jahr):
+
+| Jahr | März (UTC) | Okt/Nov (UTC) |
+|---|---|---|
+| 2009 | 03-08 07:00 .. 03-29 01:00 | 10-25 01:00 .. 11-01 06:00 |
+| 2010 | 03-14 07:00 .. 03-28 01:00 | 10-31 01:00 .. 11-07 06:00 |
+| 2011 | 03-13 07:00 .. 03-27 01:00 | 10-30 01:00 .. 11-06 06:00 |
+| 2012 | 03-11 07:00 .. 03-25 01:00 | 10-28 01:00 .. 11-04 06:00 |
+| 2013 | 03-10 07:00 .. 03-31 01:00 | 10-27 01:00 .. 11-03 06:00 |
+| 2014 | 03-09 07:00 .. 03-30 01:00 | 10-26 01:00 .. 11-02 06:00 |
+| 2015 | 03-08 07:00 .. 03-29 01:00 | 10-25 01:00 .. 11-01 06:00 |
+| 2016 | 03-13 07:00 .. 03-27 01:00 | 10-30 01:00 .. 11-06 06:00 |
+| 2017 | 03-12 07:00 .. 03-26 01:00 | 10-29 01:00 .. 11-05 06:00 |
+| 2018 | 03-11 07:00 .. 03-25 01:00 | 10-28 01:00 .. 11-04 06:00 |
+| 2019 | 03-10 07:00 .. 03-31 01:00 | 10-27 01:00 .. 11-03 06:00 |
+| 2020 | 03-08 07:00 .. 03-29 01:00 | 10-25 01:00 .. 11-01 06:00 |
+| 2021 | 03-14 07:00 .. 03-28 01:00 | 10-31 01:00 .. 11-07 06:00 |
+| 2022 | 03-13 07:00 .. 03-27 01:00 | 10-30 01:00 .. 11-06 06:00 |
+| 2023 | 03-12 07:00 .. 03-26 01:00 | 10-29 01:00 .. 11-05 06:00 |
+| 2024 | 03-10 07:00 .. 03-31 01:00 | 10-27 01:00 .. 11-03 06:00 |
+| 2025 | 03-09 07:00 .. 03-30 01:00 | 10-26 01:00 .. 11-02 06:00 |
+
+Darum kann der Wechsel an **jeder** Rohmonatsgrenze zwischen dem letzten `ny_local`- und dem ersten `berlin_minus_6`-Umstellungszeitraum liegen; nur Monate mit Ticks in einem Fenster (März, Oktober, November) grenzen ihn ein.
+
+**`undecided` im Fetcher:** `rule_for` liefert `UndecidedRule`; `raw_to_utc_ms` rechnet alle Kandidaten und gibt das Ergebnis nur zurück, wenn es identisch ist, sonst `RuleUndecided` (keine `FormatError`). Ein UTC-Monat, in den ein verschieden umgerechneter Tick unter irgendeinem Kandidaten fallen kann, wird **nicht** geschrieben: Laufreport `months_rule_undecided` (Rohbereiche), manueller Fall (Exit 4; 3 hat Vorrang), kein Quarantäne-Marker, keine Extra-Requests, jeder Lauf prüft neu aus dem Cache. UTC-Monate, die vom Rohmonat nur identisch umgerechnete Ticks brauchen (z.B. UTC-April mit den letzten Stunden des Rohmärz), werden geschrieben. Geprüft wird unter dem ersten Kandidaten; hat der Rohmonat verschieden umgerechnete Ticks, unter jedem Kandidaten (bestanden, wenn einer passt).
+
 **M1 ist NICHT verifiziert.** Für M1 bleibt `fixed_est` (`Etc/GMT+5`, fest UTC-5) laut HistData-Angabe. Sie wird nicht stillschweigend umgestellt. Prüfen mit einem Sommermonat:
 
 ```
@@ -92,16 +131,17 @@ Liegt die Median-Abweichung bei +1 (impliziter Offset -4 h statt -5 h), ist auch
 ### Stempelungsregeln und Fahrplan (`config/histdata_timezone.yaml`)
 
 - Regel (`TzRule`): Name, zoneinfo-Zone, ganze Stunden Verschiebung; Rohzeit = Ortszeit in `zone` + `shift_h`. Eingebaut: `berlin_minus_6` (Europe/Berlin, -6), `ny_local` (America/New_York, 0), `fixed_est` (Etc/GMT+5, 0). Weitere Regeln in der Datei (`rules`, Namen eindeutig, Zone wird geprüft).
-- `schedule` je Modus: Liste `{from: "YYYY-MM", rule: name}` nach **Roh**monaten, aufsteigend; ein Wechsel gilt nur an Rohmonatsgrenzen. Default: tick `berlin_minus_6` ab 2000-01, m1 `fixed_est` ab 2000-01. Andere Datei: `$HISTDATA_TZ_CONFIG`. Unbekannte Regel/Zone, unsortiertes oder doppeltes `from`, fehlender Modus oder `schedule`, ein Fahrplan, der erst nach dem frühesten benötigten Rohmonat beginnt (Historienbeginn minus 1 Monat = 2009-02), oder eine fehlende Datei (auch die Default-Datei im Repo) → Abbruch beim Laden, nie still ein Default.
+- `schedule` je Modus: Liste `{from: "YYYY-MM", rule: name}` nach **Roh**monaten, aufsteigend; ein Wechsel gilt nur an Rohmonatsgrenzen. `{from: "YYYY-MM", rule: undecided, candidates: [ny_local, berlin_minus_6]}` markiert einen offenen Zeitraum (mindestens 2 bekannte Regeln). Default (v6, vorläufig): tick `ny_local` ab 2000-01, `undecided` ab 2018-12, `berlin_minus_6` ab 2021-03; m1 `fixed_est` ab 2000-01. Andere Datei: `$HISTDATA_TZ_CONFIG`. Unbekannte Regel/Zone, unsortiertes oder doppeltes `from`, fehlender Modus oder `schedule`, ein Fahrplan, der erst nach dem frühesten benötigten Rohmonat beginnt (Historienbeginn minus 1 Monat = 2009-02), oder eine fehlende Datei (auch die Default-Datei im Repo) → Abbruch beim Laden, nie still ein Default.
 - Regel für einen Zeitraum ändern (z.B. falls ältere Jahre anders gestempelt sind): Kandidaten erst offline gegen den Roh-Cache abgleichen (`scripts/histdata_tz_survey.py`, nutzt `evaluate_raw_month`: nur Cache, kein Download, keine Marker, mit Nachbarmonaten als Kontext wie im echten Bau), dann einen Eintrag in `schedule` ergänzen. Der nächste Lauf erkennt betroffene Monatsdateien an `source_timezone` (s. Altbestand).
 
 ### Umrechnung (`raw_to_utc_ms`)
 
 - `raw_to_utc_ms(raw_ms, rule)`: Rohziffern minus `shift_h` sind Wanduhrzeit in `rule.zone`; vektorisiert nach UTC: je möglichem Offset der Zone ein Kandidat, gültig, wenn die Zone in genau diesem UTC-Zeitpunkt diesen Offset hat (Wechseltabelle aus zoneinfo, je Jahr). Exakt auf die Millisekunde. Ein Rohmonat wird mit der Regel dieses Rohmonats umgerechnet (`raw_to_utc_ms_mode`).
-- **Nie raten:** Ortszeiten in der Sommerzeit-Lücke existieren nicht, Ortszeiten in der doppelten Stunde sind mehrdeutig - für `berlin_minus_6` roh Samstag 20:00:00-20:59:59.999 in den beiden Umstellungsnächten (z.B. 2024-03-30, 2024-10-26). Beides ergibt `TimezoneError` (Unterklasse von `FormatError`) mit den ersten Beispielen. Der Markt ist dann geschlossen; ein Tick dort heißt, dass etwas nicht stimmt. Der Rohmonat geht per Default in Quarantäne (Exit 4). Liegen **alle** betroffenen Ticks im geschlossenen Wochenendmarkt (roh Samstag oder Sonntag vor 12:00), steht im Marker `"tz_error_releasable": true`; nach manueller Prüfung gibt `"accepted": true` frei: diese Ticks werden **verworfen** (nie umgerechnet), Anzahl und Rohzeiten stehen im Monatsreport (`dropped_ticks`, `dropped_raw`). Ein solcher Tick außerhalb des Wochenendes ist nie freigebbar.
+- **Nie raten:** Ortszeiten in der Sommerzeit-Lücke existieren nicht, Ortszeiten in der doppelten Stunde sind mehrdeutig - für `berlin_minus_6` roh Samstag 20:00:00-20:59:59.999 in den beiden Umstellungsnächten (z.B. 2024-03-30, 2024-10-26). Beides ergibt `TimezoneError` (Unterklasse von `FormatError`) mit den ersten Beispielen. Der Markt ist dann geschlossen; ein Tick dort heißt, dass etwas nicht stimmt. Der Rohmonat geht per Default in Quarantäne (Exit 4). Ebenso ein Rücksprung ≥ 30 min in Dateireihenfolge; betroffen sind dabei alle Ticks mit Rohzeit in [`back_to_raw`, `at_raw`] (beide Seiten des Sprungs).
+- **Verwerfbare Wochenend-Ticks:** Liegen **alle** betroffenen Ticks (Rücksprünge und verbotene Stunden) im geschlossenen Wochenendmarkt nach **Rohuhr** (`WEEKEND_CLOSED_RAW`: Freitag ab 18:00, ganzer Samstag, Sonntag vor 16:00 - konservativ über alle Regeln und Offsets, denn Schluss Fr 17:00 und Öffnung So 18:00 New York liegen roh je nach Regel und Woche bei 16:00-18:00 bzw. 17:00-19:00), tragen Prüfbericht und Marker `releasable_weekend` (`reversal_ticks`, `impossible_hour_ticks`, `raw_ranges`). Freigabe nach Prüfung: `fetch_histdata.py --symbol XAUUSD --accept-weekend-ticks 2024-10` (Rohmonat; zeigt die zu verwerfenden Ticks, kein Download; nicht freigebbar → Exit 2 mit Grund) oder `"accepted": true` im Marker. Dann werden genau diese Ticks **verworfen** (nie umgerechnet), der Rest wird neu geprüft und bei Erfolg geschrieben; Monatsreport `dropped_ticks`, `dropped_raw`, `warning`. Außerhalb des geschlossenen Wochenendmarkts nie freigebbar. `evaluate_raw_month(..., drop_releasable_weekend=True)` prüft offline so (Survey).
 - Folge: UTC-Monat M = Rohmonat M-1 (dessen letzte 4 h im EU-Sommer bzw. 5 h im EU-Winter) + Rohmonat M (ohne diese Stunden an seinem Ende). Die Rohmonate werden aus dem Fahrplan berechnet, nicht fest verdrahtet. EU-Umstellungen liegen nie auf einem Monatsrand (Sonntag 01:00 UTC am Monatsende, Rohzeit Samstag 20:00).
 
-### Prüfung je Rohmonat (`check_timezone`, Prüfversion 5)
+### Prüfung je Rohmonat (`check_timezone`, Prüfversion 6)
 
 Grundsatz (Re-Review von v3, das echte Datenfehler als Zeitzonenfehler wertete): **hart nur Systematisches oder Bestätigtes, Einzelausreißer sind Warnungen.**
 
@@ -124,7 +164,7 @@ Grundsatz (Re-Review von v3, das echte Datenfehler als Zeitzonenfehler wertete):
   - Ein einzelner abweichender Eintrag am Monatsrand ohne Kontext dahinter (`leading_suspect`/`trailing_suspect`) hält den Monat zurück, bis der Nachbar da ist.
   - Neuester Monat (M+1 noch nicht veröffentlicht): geschrieben mit Parquet-Metadatum `tz_right_padding=false`. Sobald M+1 im Cache ist (Laufbeginn oder -ende), wird aus dem Cache nachgeprüft: besteht → `true`, sonst nach `metals/stale/` und Quarantäne.
   - Reicht ein bestätigter Wechsel im Folge-Rohmonat M+1 in Monat M zurück (`switch_reaches_prev_month`), wird auch UTC-Monat M nicht geschrieben.
-- Report-Felder: `status`, `ok`, `reason`, `raw_tz`, `anchors`, `entries`, `offsets` (implizit), `expected_offsets`, `deviations`, `median_offset_h` (implizit, zur Anzeige), `median_deviation_h`, `share_expected`, `switch_runs`, `warnings`, `outages`, `contradictions`, `ambiguous_gaps`, `padding`, `edge_violations`, `transition_violations`, `deviating_examples`, `reversals`.
+- Report-Felder: `status`, `ok`, `reason`, `raw_tz`, `anchors`, `entries`, `offsets` (implizit), `expected_offsets`, `deviations`, `median_offset_h` (implizit, zur Anzeige), `median_deviation_h`, `share_expected`, `switch_runs`, `warnings`, `outages`, `contradictions`, `ambiguous_gaps`, `padding`, `edge_violations`, `transition_violations`, `deviating_examples`, `reversals`, `large_reversals` (je Rücksprung `at_raw`, `back_to_raw`, `minutes`, `n_ticks`, `first_raw`, `last_raw`, `weekend_closed`), `reversal_ticks_total`, `releasable_weekend`.
 - Synthetisch geprüft: siehe "Messungen v4" unten.
 - Zu wenige Anker (z.B. kurzer erster Historienmonat): Prüfung gemeinsam mit gecachten Nachbar-Rohmonaten. Bleibt das Ergebnis unentscheidbar, folgt Quarantäne mit dem Grund "NICHT PRUEFBAR".
 - Quarantäne: `<zip>.quarantine` mit vollem Prüfbericht, `raw_tz` und `tz_check_version`, Exit 4. Die UTC-Monate, die diesen Rohmonat brauchen, werden nicht geschrieben. Es wird nie verschoben geschrieben.
@@ -139,11 +179,11 @@ Grundsatz (Re-Review von v3, das echte Datenfehler als Zeitzonenfehler wertete):
 
 ### Altbestand
 
-Monatsdateien tragen das Parquet-Metadatum `source_timezone` = Regel(n) ihrer Rohmonate mit Zone/Verschiebung und `TZ_CHECK_VERSION` (z.B. `berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v5)`), dazu `tz_right_padding`. Wird der Fahrplan geändert, passen betroffene Dateien automatisch nicht mehr. Zu Beginn **jedes** Laufs werden alle Monatsdateien des Symbols/Modus geprüft, nicht nur `--start`/`--end`:
+Monatsdateien tragen das Parquet-Metadatum `source_timezone` = Regel(n) ihrer Rohmonate mit Zone/Verschiebung und `TZ_CHECK_VERSION` (z.B. `berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v6)`), dazu `tz_right_padding`. v5 hatte alle Tick-Monate unter `berlin_minus_6` geschrieben; unter dem v6-Fahrplan werden März, Oktober und November bis 2021-02 als verschoben erkannt (nach `metals/stale/`, Neubau unter `ny_local` bzw. als `rule_undecided` zurückgehalten), die übrigen Monate nur neu gekennzeichnet. Wird der Fahrplan geändert, passen betroffene Dateien automatisch nicht mehr. Zu Beginn **jedes** Laufs werden alle Monatsdateien des Symbols/Modus geprüft, nicht nur `--start`/`--end`:
 
 - Andere oder ältere Kennzeichnung, die im UTC-Monat **dieselben UTC-Zeiten** ergibt (ältere Prüfversion; `ny_local`-Dateien von Januar, Februar, April bis September und Dezember, wo beide Regeln übereinstimmen; M1-Dateien der Vorversionen): Rohmonate aus dem Cache unter der aktuellen Regel neu prüfen (kein Download). Besteht → nur Metadaten erneuert (`relabelled_timezone`). Fällt durch → nach `metals/stale/` und Quarantäne (`retired_after_recheck`). Roh-Cache fehlt → Datei bleibt, gemeldet als `unverified_after_version_bump`.
 - `tz_right_padding=false` und Rohmonat M+1 jetzt im Cache: ebenso nachprüfen.
-- Andere Umrechnung, die im Monat **UTC-Zeiten verschiebt** (`ny_local`: März, Oktober, November = die Wochen zwischen US- und EU-Umstellung; fest UTC-5: alle Monate mit EU-Sommerzeit): sofort nach `metals/stale/...` verschoben (nichts gelöscht; der Bot sieht eher eine Lücke als einen verschobenen Monat), im Bereich neu gebaut, außerhalb gemeldet (`stale_retired_out_of_range`).
+- Andere Umrechnung, die im Monat **UTC-Zeiten verschiebt** (`ny_local` ↔ `berlin_minus_6`: März, Oktober, November = die Wochen zwischen US- und EU-Umstellung; bei `undecided` genügt ein abweichender Kandidat; fest UTC-5: alle Monate mit EU-Sommerzeit): sofort nach `metals/stale/...` verschoben (nichts gelöscht; der Bot sieht eher eine Lücke als einen verschobenen Monat), im Bereich neu gebaut, außerhalb gemeldet (`stale_retired_out_of_range`).
 - Quarantäne-Marker tragen `tz_rule`, `raw_tz` (Zone), `tz_shift_h`, `tz_check_version`. Marker von v4 (`ny_local`) werden ohne Download unter der neuen Regel neu geprüft; `"accepted": true` gilt nur für dieselbe Regel.
 
 Monate im Bereich werden aus dem Roh-Cache neu gebaut (WARNING, `rebuilt_timezone`, Ergebnis `summary.months_rebuilt_timezone` bzw. `summary.months_stale_timezone_not_rebuilt`; der nächste Lauf versucht es erneut). Ohne Requests nur, wenn die Roh-ZIPs gecached sind; sonst wird normal geladen. `--verify-month` meldet den Zustand der Monatsdatei (`store_file`), ändert aber nichts.
@@ -216,7 +256,7 @@ Der Fetcher nimmt diese M1-Startmonate als `HISTORY_START`. Monate davor gelten 
 ## 7. Offene Punkte (unverifiziert)
 
 1. Zeitzone der **M1**-Dateien (Abschnitt 4): `--mode m1 --verify-month 2024-07`. Ticks sind für 2024 verifiziert (`berlin_minus_6`), M1 nicht.
-1a. Ob ältere Jahre anders gestempelt sind (vor 2024 nicht gemessen): `scripts/histdata_tz_survey.py` über mehrere Jahre laufen lassen und bei Bedarf den Fahrplan in `config/histdata_timezone.yaml` je Zeitraum ändern.
+1a. Wann zwischen 2018-11 und 2021-03 die Stempelung von `ny_local` auf `berlin_minus_6` wechselte (Fahrplan dort `undecided`): erweiterter Survey (`scripts/histdata_tz_survey.py`), dann den Eintrag in `config/histdata_timezone.yaml` entscheiden. Nicht untersuchte Jahre: 2009, 2011, 2013, 2014, 2016, 2017, 2019, 2020, 2022, 2023, 2025.
 2. Tick-Historienbeginn je Symbol.
 3. Format der Status-.txt.
 4. Ob HistData bestimmte User-Agents oder Request-Raten blockt, und wie eine Fehler-, Captcha- oder WAF-Seite aussieht. Jede Nicht-ZIP-Antwort mit Inhalt ist ein Fehlschlag mit Textausschnitt im Report, nie Daten.

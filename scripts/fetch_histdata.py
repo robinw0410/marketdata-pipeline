@@ -38,14 +38,24 @@ je ROHmonat nach Fahrplan in config/histdata_timezone.yaml (load_tz_config,
 rule_for; andere Datei per $HISTDATA_TZ_CONFIG; Datei muss existieren und ab
 spaetestens 2009-02 gelten; Fehler -> Abbruch beim Laden, nie still ein
 Default). Wechsel nur an Rohmonatsgrenzen.
-- tick: berlin_minus_6 = Europe/Berlin - 6 h: UTC-5 im EU-Winter, UTC-4 in
-  der EU-Sommerzeit (Wechsel letzter So Maerz/Oktober 01:00 UTC). Im Homelab
-  an echten Ticks aller drei Symbole gemessen: 2024-03 bleibt nach der
-  US-Umstellung (10.03.) bis 31.03. bei -5 h (Tagespause roh 15:59:59 ->
-  17:00:00 statt 16:59 -> 18:00), 2024-10 ab der EU-Umstellung (27.10.) schon
-  -5 h; Januar/Juli passen. Widerlegt: ny_local (America/New_York, Pruef-
-  version 4) und die HistData-Angabe "EST ohne Sommerzeit". Die Marktzeiten
-  (Anker) bleiben New York/CME: 17:00/18:00 America/New_York.
+- tick (VORLAEUFIGER Fahrplan nach Survey, s. Kommentar in der YAML und
+  docs/histdata_research.md): ny_local (America/New_York) bis 2018-11 -
+  Survey 2010/2012/2015/2018 eindeutig; "undecided" (Kandidaten ny_local,
+  berlin_minus_6) 2018-12 .. 2021-02 - Wechsel liegt zwischen 2018-11 und
+  2021-03; berlin_minus_6 (Europe/Berlin - 6 h: UTC-5 im EU-Winter, UTC-4 in
+  der EU-Sommerzeit) ab 2021-03 - 2021-03/2024-03 eindeutig, 2021-10/2024-10
+  bis auf einen Ruecksprung im geschlossenen Wochenendmarkt. Beide Regeln
+  rechnen nur in den EU/US-Lueckenwochen verschieden (Maerz: US-Beginn 2. So
+  07:00 UTC bis EU-Beginn letzter So 01:00 UTC; Okt/Nov: EU-Ende letzter So
+  Okt 01:00 UTC bis US-Ende 1. So Nov 06:00 UTC). Die Marktzeiten (Anker)
+  bleiben New York/CME: 17:00/18:00 America/New_York.
+  "undecided" (UndecidedRule, rule_for): raw_to_utc_ms rechnet alle
+  Kandidaten; identisch -> Ergebnis, sonst RuleUndecided. Ein UTC-Monat, in
+  den ein verschieden umgerechneter Tick (unter irgendeinem Kandidaten) fallen
+  kann, wird NICHT geschrieben: Laufreport months_rule_undecided (Rohbereiche),
+  manueller Fall (Exit 4, 3 hat Vorrang), kein Marker, keine Requests, jeder
+  Lauf prueft neu aus dem Cache. Pruefung sonst unter dem ersten Kandidaten
+  (mit abweichenden Ticks: bestanden, wenn ein Kandidat passt).
 - m1: fixed_est = Etc/GMT+5 (fest UTC-5) laut HistData-Angabe, fuer M1 NICHT
   verifiziert: mit --mode m1 --verify-month 2024-07 (Sommermonat) pruefen.
 Andere Regeln offline gegen den Roh-Cache abgleichen: evaluate_raw_month
@@ -58,7 +68,7 @@ Umstellungsnaechten) werden NIE geraten: TimezoneError -> Quarantaene (Exit
 M-1 (dessen letzte 4 bzw. 5 h, aus dem Fahrplan berechnet) und M; er gilt nur
 als vollstaendig, wenn beide da sind (oder M-1 vor Historienbeginn bzw.
 bestaetigt leer ist).
-Die Zeitzone wird JE ROHMONAT aus den Daten geprueft (check_timezone, v5):
+Die Zeitzone wird JE ROHMONAT aus den Daten geprueft (check_timezone, v6):
 je Marktluecke ein Schluss- und ein Oeffnungsanker - Wochenende (>= 24 h,
 Schluss Do/Fr, Oeffnung So/Mo: Fr 17:00 -> So 18:00 New York; andere Luecken >= 24 h sind Ausfaelle, nur Bericht), bei Metallen
 die Tagespause Mo-Do (17:00-18:00 New York; nur wenn alle pausenartigen
@@ -87,8 +97,11 @@ ein bestaetigter Wechsel im Folge-Rohmonat in Monat M zurueck, wird M nicht
 geschrieben (check_following). Zu wenige Anker -> gemeinsam mit dem
 Nachbar-Rohmonat pruefen.
 Parquet-Metadatum source_timezone = store_tz_label(mode, ym): Regel(n) der
-Rohmonate mit Zone/Verschiebung und TZ_CHECK_VERSION (5), z.B.
-"berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v5)".
+Rohmonate mit Zone/Verschiebung und TZ_CHECK_VERSION (6), z.B.
+"berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v6)".
+v5-Dateien mit berlin_minus_6 fuer Monate, die jetzt ny_local/undecided sind:
+in den Lueckenwochen verschoben -> metals/stale/ und neu gebaut (bzw. als
+rule_undecided zurueckgehalten), sonst nur neu gekennzeichnet.
 Zu Beginn JEDES Laufs werden alle Monatsdateien
 des Symbols/Modus geprueft (classify_store_file):
 - andere oder aeltere Kennzeichnung, im UTC-Monat aber dieselben UTC-Zeiten
@@ -112,10 +125,18 @@ tz_check_version. Nicht freigegebene Marker aelterer Version/anderer Regel
 fuer dieselbe Regel (Zone + Verschiebung); eine Freigabe unter anderer
 Regel wird neu geprueft - besteht: Marker weg, sonst neuer Marker accepted
 false mit Hinweis. Unlesbarer Marker: ERROR, bleibt, sperrt weiter.
-Nicht eindeutige Ortszeit sperrt per Default; liegen alle betroffenen Ticks im
-geschlossenen Wochenendmarkt (roh Sa oder So vor 12:00), ist der Marker
-freigebbar (tz_error_releasable): mit "accepted": true werden genau diese
-Ticks verworfen (nie umgerechnet) und im Monatsreport gemeldet.
+Ruecksprung >= 30 min (large_reversals mit at_raw, back_to_raw, minutes,
+n_ticks, first_raw, last_raw, weekend_closed; betroffen = alle Ticks mit
+Rohzeit in [back_to_raw, at_raw]) und nicht eindeutige Ortszeit sperren per
+Default. Liegen ALLE betroffenen Ticks (Ruecksprung und verbotene Stunden) im
+geschlossenen Wochenendmarkt nach Rohuhr (WEEKEND_CLOSED_RAW: Fr ab 18:00,
+ganzer Sa, So vor 16:00 - konservativ ueber alle Regeln/Offsets), traegt
+Bericht und Marker releasable_weekend (reversal_ticks, impossible_hour_ticks,
+raw_ranges). Freigabe mit --accept-weekend-ticks YYYY-MM (ROHmonat, mit
+--symbol/--mode; gibt die Ticks aus, kein Download; sonst Exit 2): genau
+diese Ticks werden VERWORFEN (nie umgerechnet), der Rest neu geprueft und
+bei Erfolg geschrieben; Monatsreport dropped_ticks, dropped_raw, warning.
+Ausserhalb des geschlossenen Wochenendmarkts nie freigebbar.
 EURUSD-Storeverzeichnisse aus Pruefversion 4 verschiebt jeder Lauf nach
 metals/stale/ (retired_removed_symbols).
 
@@ -148,7 +169,9 @@ Exit-Codes (Vorrang in dieser Reihenfolge, wie fetch_dukascopy.py):
      Daten", 3 leere Antworten in Folge innerhalb der Historie, 429-Budget
      erschoepft, Schutzschalter, SIGTERM, Symbol-Lock belegt -> spaeter erneut
   4  manuelle Pruefung noetig: Quarantaene (Zeitzone, Format), bestaetigt
-     leerer Monat INNERHALB der Historie, Monatsdatei mit anderem Modus
+     leerer Monat INNERHALB der Historie, Monatsdatei mit anderem Modus,
+     Fahrplan "undecided" mit verschieden umgerechneten Ticks
+     (months_rule_undecided; status "rule_undecided", wenn nur das)
   0  vollstaendig
   3 geht bewusst vor 4: die systemd-Units starten bei 3 neu, bei 4 nicht -
   ein Exit 4 bei offenen Luecken wuerde den Backfill anhalten. Quarantaene
@@ -162,6 +185,7 @@ Usage:
     python fetch_histdata.py --symbol XAUUSD --start 2009-03
     python fetch_histdata.py --symbol XAGUSD --start 2024-01 --end 2024-06 --mode m1
     python fetch_histdata.py --symbol XAUUSD --verify-month 2024-03
+    python fetch_histdata.py --symbol XAUUSD --accept-weekend-ticks 2024-10   # Exit 0/2
     python fetch_histdata.py --symbol XAUUSD --mode m1 --verify-month 2024-07   # M1-Zeitzone pruefen
 """
 from __future__ import annotations
@@ -233,9 +257,14 @@ HOUR_MS, MIN_MS, DAY_MS = 3_600_000, 60_000, 86_400_000
 # Umstellungsfenster), v4 = hart nur Systematisches/Bestaetigtes (>= 2 unabhaengige
 # Luecken), Einzelausreisser nur Warnung, vorlaeufige Ergebnisse nie gespeichert,
 # v5 = Stempelungsregel je Rohmonat (TzRule, config/histdata_timezone.yaml;
-# Ticks: Europe/Berlin - 6 h statt America/New_York, im Homelab gemessen).
+# Ticks: Europe/Berlin - 6 h statt America/New_York, im Homelab gemessen),
+# v6 = vorlaeufiger Fahrplan nach Survey (ny_local bis 2018-11, "undecided"
+# 2018-12..2021-02, berlin_minus_6 ab 2021-03), Rueckspruenge mit betroffenen
+# Ticks, verwerfbare Wochenend-Ticks (releasable_weekend). v5-Dateien mit
+# berlin_minus_6 fuer heute ny_local/undecided-Monate: verschoben -> metals/stale/
+# und neu gebaut, gleich -> nur neu gekennzeichnet.
 # Nicht freigegebene Marker und Store-Dateien aelterer Version werden neu geprueft.
-TZ_CHECK_VERSION = 5
+TZ_CHECK_VERSION = 6
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TZ_CONFIG = REPO_ROOT / "config" / "histdata_timezone.yaml"
 TZ_CONFIG_ENV = "HISTDATA_TZ_CONFIG"
@@ -471,6 +500,53 @@ class TzRule:
         return f"{self.name} ({self.zone} {self.shift_h:+d} h)"
 
 
+@dataclass(frozen=True)
+class UndecidedRule:
+    """Fahrplan-Eintrag "undecided": welche der Kandidatenregeln gilt, ist noch
+    nicht belegt (z.B. Wechsel ny_local -> berlin_minus_6 irgendwann zwischen
+    2018-11 und 2021-03). Umrechnung nur, wo ALLE Kandidaten dasselbe ergeben
+    (raw_to_utc_ms), sonst RuleUndecided; Pruefung unter dem ersten Kandidaten."""
+    name: str = "undecided"
+    candidates: tuple = ()
+
+    @property
+    def first(self) -> TzRule:
+        return self.candidates[0]
+
+    def describe(self) -> str:
+        # Label wie die erste Regel (gleiche Umrechnung, wo geschrieben wird) plus Kandidaten
+        return (f"{self.first.describe()} [undecided: "
+                + "|".join(c.name for c in self.candidates) + ", hier identisch]")
+
+
+class RuleUndecided(Exception):
+    """Kandidatenregeln eines "undecided"-Zeitraums rechnen Ticks verschieden um:
+    nicht schreiben, nicht raten (kein Marker; jeder Lauf prueft neu aus dem Cache).
+    differing_raw: Rohzeit-ms der abweichenden Ticks; ranges: [(von, bis)] roh."""
+
+    def __init__(self, msg: str, differing_raw=None, ranges=None):
+        super().__init__(msg)
+        self.differing_raw = differing_raw if differing_raw is not None else np.array([], dtype=np.int64)
+        self.ranges = ranges or []
+        self.raw_month = None
+
+
+def concrete_rule(rule) -> TzRule:
+    """Konkrete Regel fuer Pruefung/Offsets: bei "undecided" der erste Kandidat."""
+    return rule.first if isinstance(rule, UndecidedRule) else rule
+
+
+def rule_candidates(rule) -> tuple:
+    return rule.candidates if isinstance(rule, UndecidedRule) else (rule,)
+
+
+def rule_identity(rule) -> tuple[str, int]:
+    """(Zone, Verschiebung) bzw. fuer "undecided" ein eigener Schluessel (Marker)."""
+    if isinstance(rule, UndecidedRule):
+        return "undecided:" + "|".join(c.name for c in rule.candidates), 0
+    return rule.zone, rule.shift_h
+
+
 TZ_RULES = {"berlin_minus_6": TzRule("berlin_minus_6", "Europe/Berlin", -6),
             "ny_local": TzRule("ny_local", "America/New_York", 0),
             "fixed_est": TzRule("fixed_est", "Etc/GMT+5", 0)}
@@ -539,14 +615,31 @@ def build_tz_config(data: dict | None, path: str | None = None) -> TzConfig:
         out = []
         for i, e in enumerate(entries):
             where = f"{path}: schedule.{mode}[{i}]"
-            if not isinstance(e, dict) or set(e) != {"from", "rule"}:
-                raise ValueError(f"{where}: genau from, rule erwartet, nicht {e!r}")
+            if not isinstance(e, dict) or "from" not in e or "rule" not in e:
+                raise ValueError(f"{where}: from, rule erwartet, nicht {e!r}")
             ym = _parse_ym_str(e["from"], where)
-            if e["rule"] not in rules:
-                raise ValueError(f"{where}: unbekannte Regel {e['rule']!r}; bekannt: {sorted(rules)}")
+            if e["rule"] == "undecided":
+                if set(e) != {"from", "rule", "candidates"}:
+                    raise ValueError(f"{where}: undecided braucht genau from, rule, candidates")
+                cands = e["candidates"]
+                if not isinstance(cands, list) or len(cands) < 2 or len(set(map(str, cands))) != len(cands):
+                    raise ValueError(f"{where}: candidates = Liste von >= 2 verschiedenen Regeln, "
+                                     f"nicht {cands!r}")
+                bad = [c for c in cands if c not in rules]
+                if bad:
+                    raise ValueError(f"{where}: unbekannte Kandidaten {bad}; bekannt: {sorted(rules)}")
+                rule = UndecidedRule(candidates=tuple(rules[c] for c in cands))
+            else:
+                if set(e) != {"from", "rule"}:
+                    raise ValueError(f"{where}: genau from, rule erwartet (candidates nur bei "
+                                     f"undecided), nicht {e!r}")
+                if e["rule"] not in rules:
+                    raise ValueError(f"{where}: unbekannte Regel {e['rule']!r}; bekannt: "
+                                     f"{sorted(rules)} oder undecided")
+                rule = rules[e["rule"]]
             if out and ym <= out[-1][0]:
                 raise ValueError(f"{where}: 'from' {e['from']} nicht aufsteigend/doppelt")
-            out.append((ym, rules[e["rule"]]))
+            out.append((ym, rule))
         earliest = _ym_add(min(HISTORY_START.values()), -1)   # Rohmonat vor dem ersten UTC-Monat
         if out[0][0] > earliest:
             raise ValueError(f"{path}: schedule.{mode} beginnt erst {out[0][0][0]}-{out[0][0][1]:02d}; "
@@ -580,8 +673,9 @@ def load_tz_config(path: str | Path | None = None) -> TzConfig:
     return _TZ_CFG_CACHE[key]
 
 
-def rule_for(mode: str, ym: tuple[int, int], cfg: TzConfig | None = None) -> TzRule:
-    """Stempelungsregel fuer den ROHmonat ym (Wechsel nur an Rohmonatsgrenzen)."""
+def rule_for(mode: str, ym: tuple[int, int], cfg: TzConfig | None = None) -> "TzRule | UndecidedRule":
+    """Stempelungsregel fuer den ROHmonat ym (Wechsel nur an Rohmonatsgrenzen);
+    UndecidedRule fuer Zeitraeume mit "undecided"."""
     cfg = cfg or load_tz_config()
     if mode not in cfg.schedule:
         raise ValueError(f"unbekannter Modus {mode}")
@@ -596,7 +690,7 @@ def rule_for(mode: str, ym: tuple[int, int], cfg: TzConfig | None = None) -> TzR
 
 
 def as_rule(rule: "TzRule | str", cfg: TzConfig | None = None) -> TzRule:
-    if isinstance(rule, TzRule):
+    if isinstance(rule, (TzRule, UndecidedRule)):
         return rule
     cfg = cfg or load_tz_config()
     if rule not in cfg.rules:
@@ -607,7 +701,7 @@ def as_rule(rule: "TzRule | str", cfg: TzConfig | None = None) -> TzRule:
 def source_tz_label(rules) -> str:
     """Parquet-Metadatum source_timezone: Regel(n) mit Zone/Verschiebung und
     Pruefversion (abgeleitet, nie von Hand gepflegt)."""
-    rules = [rules] if isinstance(rules, TzRule) else list(dict.fromkeys(rules))
+    rules = [rules] if isinstance(rules, (TzRule, UndecidedRule)) else list(dict.fromkeys(rules))
     return " + ".join(r.describe() for r in rules) + \
         f" -> UTC, je Rohmonat geprueft (tz_check v{TZ_CHECK_VERSION})"
 
@@ -646,11 +740,51 @@ def _zone_offset_ms(zone: str, utc_ms: np.ndarray) -> np.ndarray:
 
 
 def utc_to_raw_ms(utc_ms: np.ndarray, rule: TzRule) -> np.ndarray:
-    """UTC-ms -> Rohzeit-ms nach `rule` (Ortszeit in rule.zone + shift_h); immer eindeutig."""
+    """UTC-ms -> Rohzeit-ms nach `rule` (Ortszeit in rule.zone + shift_h); immer eindeutig.
+    "undecided": nach dem ersten Kandidaten (nur fuer Monatsgrenzen/Planung)."""
+    rule = concrete_rule(rule)
     utc_ms = np.asarray(utc_ms, dtype=np.int64)
     if not len(utc_ms):
         return utc_ms.copy()
     return utc_ms + _zone_offset_ms(rule.zone, utc_ms) + rule.shift_h * HOUR_MS
+
+
+def _ranges_of(raw_ms: np.ndarray, gap_ms: int = HOUR_MS) -> list[tuple[str, str]]:
+    """Zusammenhaengende Rohzeit-Bereiche (Luecke > gap_ms trennt) als ISO-Paare."""
+    u = np.unique(np.asarray(raw_ms, dtype=np.int64))
+    if not len(u):
+        return []
+    cuts = np.nonzero(np.diff(u) > gap_ms)[0]
+    starts = np.concatenate([[0], cuts + 1])
+    ends = np.concatenate([cuts, [len(u) - 1]])
+    return [(_raw_iso(int(u[a]), ms_digits=True), _raw_iso(int(u[b]), ms_digits=True))
+            for a, b in zip(starts, ends)]
+
+
+def _raw_to_utc_undecided(raw_ms: np.ndarray, rule: "UndecidedRule") -> np.ndarray:
+    """Alle Kandidaten rechnen; nur bei identischem Ergebnis zurueck, sonst RuleUndecided."""
+    outs, errs = [], []
+    for c in rule.candidates:
+        try:
+            outs.append(raw_to_utc_ms(raw_ms, c))
+            errs.append(None)
+        except TimezoneError as e:
+            outs.append(None)
+            errs.append(e)
+    if all(e is not None for e in errs):
+        raise errs[0]                            # ueberall nicht eindeutig: normale Behandlung
+    diff = np.zeros(len(raw_ms), dtype=bool)
+    ref = next(o for o in outs if o is not None)
+    for o, e in zip(outs, errs):
+        diff |= getattr(e, "bad_mask", np.ones(len(raw_ms), bool)) if o is None else (o != ref)
+    if diff.any():
+        ranges = _ranges_of(raw_ms[diff])
+        raise RuleUndecided(
+            f"{int(diff.sum())} Tick(s), die die Kandidaten "
+            f"{', '.join(c.name for c in rule.candidates)} verschieden umrechnen (Zeitraum "
+            f"'undecided'), roh z.B. {', '.join(f'{a}..{b}' for a, b in ranges[:5])} - nicht "
+            "geschrieben, bis der Fahrplan entschieden ist", raw_ms[diff], ranges)
+    return ref
 
 
 def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
@@ -668,6 +802,8 @@ def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
     if not len(raw_ms):
         return raw_ms.copy()
+    if isinstance(rule, UndecidedRule):
+        return _raw_to_utc_undecided(raw_ms, rule)
     local = raw_ms - rule.shift_h * HOUR_MS
     T, O = _table_for(rule.zone, local)
     cands = np.unique(O)
@@ -695,14 +831,81 @@ def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
     return out
 
 
+# Geschlossener Wochenendmarkt nach ROHuhr, konservativ ueber alle Regeln und
+# Offsets (Schluss Fr 17:00 New York = roh 16:00-18:00, Oeffnung So 18:00 New
+# York = roh 17:00-19:00 je nach Regel/Woche): Freitag ab 18:00, ganzer Samstag,
+# Sonntag vor 16:00. (Wochentag Mo = 0, Stunde) von inklusive bis exklusive.
+# Nur Ticks hier duerfen nach menschlicher Freigabe verworfen werden.
+WEEKEND_CLOSED_RAW = ((4, 18), (6, 16))
+
+
 def weekend_closed_raw(raw_ms: np.ndarray) -> np.ndarray:
-    """Rohzeit am Samstag oder Sonntag vor 12:00 (Markt geschlossen, weit weg von
-    jeder Oeffnung) - dort liegen die verbotenen Stunden der Regeln
-    (berlin_minus_6: Sa 20:00-20:59, ny_local: So 01:00-02:59)."""
+    """Rohzeit im geschlossenen Wochenendmarkt (WEEKEND_CLOSED_RAW: Fr >= 18:00,
+    Sa, So < 16:00) - dort liegen die verbotenen Stunden der Regeln
+    (berlin_minus_6: Sa 20:00-20:59, ny_local: So 01:00-02:59) und verirrte
+    Ticks der Umstellungsnaechte."""
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
-    wd = (raw_ms // DAY_MS + 3) % 7
-    hour = (raw_ms % DAY_MS) // HOUR_MS
-    return (wd == 5) | ((wd == 6) & (hour < 12))
+    (wa, ha), (wb, hb) = WEEKEND_CLOSED_RAW
+    pos = (raw_ms + 3 * DAY_MS) % (7 * DAY_MS)          # ms seit Montag 00:00 (roh)
+    return (pos >= wa * DAY_MS + ha * HOUR_MS) & (pos < wb * DAY_MS + hb * HOUR_MS)
+
+
+def _reversal_mask(raw_ms: np.ndarray) -> tuple[np.ndarray, list[dict]]:
+    """Ruecksprung >= REGRESSION_MAX_MS in Dateireihenfolge: betroffen sind alle
+    Ticks mit Rohzeit in [zurueck_auf, bei] -> (Maske, Details je Ruecksprung)."""
+    raw_ms = np.asarray(raw_ms, dtype=np.int64)
+    mask = np.zeros(len(raw_ms), dtype=bool)
+    out = []
+    d0 = np.diff(raw_ms)
+    for i in np.nonzero(d0 <= -REGRESSION_MAX_MS)[0]:
+        at, back = int(raw_ms[i]), int(raw_ms[i + 1])
+        m = (raw_ms >= back) & (raw_ms <= at)
+        mask |= m
+        idx = np.nonzero(m)[0]
+        out.append({"at_raw": _raw_iso(at), "back_to_raw": _raw_iso(back),
+                    "minutes": round((at - back) / MIN_MS, 1), "n_ticks": int(len(idx)),
+                    "first_raw": _raw_iso(int(raw_ms[idx[0]]), ms_digits=True),
+                    "last_raw": _raw_iso(int(raw_ms[idx[-1]]), ms_digits=True),
+                    "weekend_closed": bool(weekend_closed_raw(raw_ms[m]).all())})
+    return mask, out
+
+
+def _impossible_mask(raw_ms: np.ndarray, mode: str = "tick", rule=None) -> np.ndarray:
+    """Ticks in nicht eindeutiger Ortszeit (verbotene Stunden) unter `rule` bzw.
+    der Regel ihres Rohmonats ("undecided": erster Kandidat)."""
+    raw_ms = np.asarray(raw_ms, dtype=np.int64)
+    bad = np.zeros(len(raw_ms), dtype=bool)
+    if not len(raw_ms):
+        return bad
+    idx = _raw_month_index(raw_ms)
+    for k in np.unique(idx):
+        sel = idx == k
+        r = rule if rule is not None else rule_for(mode, (int(k) // 12, int(k) % 12 + 1))
+        try:
+            raw_to_utc_ms(raw_ms[sel], concrete_rule(r))
+        except TimezoneError as e:
+            m = getattr(e, "bad_mask", None)
+            sub = np.zeros(int(sel.sum()), dtype=bool) if m is None else m
+            bad[np.nonzero(sel)[0][sub]] = True
+    return bad
+
+
+def weekend_release(raw_ms: np.ndarray, mode: str = "tick", rule=None) -> tuple[np.ndarray, dict | None]:
+    """
+    Verwerfbare Ticks eines Rohmonats -> (Maske, releasable_weekend oder None).
+    Kandidaten: alle von Rueckspruengen >= 30 min betroffenen Ticks (Rohzeit in
+    [zurueck_auf, bei]) und alle Ticks in verbotenen Stunden. Freigebbar
+    (dict) nur, wenn es solche gibt und ALLE im geschlossenen Wochenendmarkt
+    liegen (WEEKEND_CLOSED_RAW); sonst None (nie freigebbar).
+    """
+    raw_ms = np.asarray(raw_ms, dtype=np.int64)
+    rev, _ = _reversal_mask(raw_ms)
+    imp = _impossible_mask(raw_ms, mode, rule)
+    drop = rev | imp
+    if not drop.any() or not bool(weekend_closed_raw(raw_ms[drop]).all()):
+        return drop, None
+    return drop, {"reversal_ticks": int(rev.sum()), "impossible_hour_ticks": int(imp.sum()),
+                  "raw_ranges": [[a, b] for a, b in _ranges_of(raw_ms[drop])]}
 
 
 def _raw_month_index(ms: np.ndarray) -> np.ndarray:
@@ -727,8 +930,14 @@ def raw_to_utc_ms_mode(raw_ms: np.ndarray, mode: str, ym: tuple[int, int] | None
     return out
 
 
-def utc_to_raw_ms_mode(utc_ms: np.ndarray, mode: str, cfg: TzConfig | None = None) -> np.ndarray:
-    """UTC-ms -> Rohzeit-ms, Regel des resultierenden Rohmonats aus dem Fahrplan."""
+def utc_to_raw_ms_mode(utc_ms: np.ndarray, mode: str, cfg: TzConfig | None = None,
+                       pick: int = 0) -> np.ndarray:
+    """UTC-ms -> Rohzeit-ms, Regel des resultierenden Rohmonats aus dem Fahrplan
+    ("undecided": Kandidat Nr. pick, ueber die Zahl der Kandidaten hinaus der letzte)."""
+    def rf(k):
+        r = rule_for(mode, (int(k) // 12, int(k) % 12 + 1), cfg)
+        c = rule_candidates(r)
+        return c[min(pick, len(c) - 1)]
     utc_ms = np.asarray(utc_ms, dtype=np.int64)
     if not len(utc_ms):
         return utc_ms.copy()
@@ -736,23 +945,26 @@ def utc_to_raw_ms_mode(utc_ms: np.ndarray, mode: str, cfg: TzConfig | None = Non
     idx = _raw_month_index(utc_ms)
     for k in np.unique(idx):
         sel = idx == k
-        out[sel] = utc_to_raw_ms(utc_ms[sel], rule_for(mode, (int(k) // 12, int(k) % 12 + 1), cfg))
+        out[sel] = utc_to_raw_ms(utc_ms[sel], rf(k))
     # Rohmonat weicht vom UTC-Monat ab und hat eine andere Regel: damit neu rechnen
     ridx = _raw_month_index(out)
     for k in np.unique(ridx[ridx != idx]):
         sel = ridx == k
-        out[sel] = utc_to_raw_ms(utc_ms[sel], rule_for(mode, (int(k) // 12, int(k) % 12 + 1), cfg))
+        out[sel] = utc_to_raw_ms(utc_ms[sel], rf(k))
     return out
 
 
 def tz_offset_h(utc_ms: int, rule: TzRule) -> float:
-    """Offset (Rohzeit - UTC) nach `rule` im UTC-Zeitpunkt utc_ms, in Stunden."""
+    """Offset (Rohzeit - UTC) nach `rule` im UTC-Zeitpunkt utc_ms, in Stunden
+    ("undecided": erster Kandidat)."""
+    rule = concrete_rule(rule)
     return (_utcoff_ms(ZoneInfo(rule.zone), utc_ms // 1000) + rule.shift_h * HOUR_MS) / HOUR_MS
 
 
 def raw_month_end_utc(ym: tuple[int, int], mode: str = "tick") -> datetime:
     """Ende des Rohmonats ym in UTC (Regel des Rohmonats ym; nie in einer Umstellung)."""
-    end = raw_to_utc_ms(np.array([raw_month_bounds_ms(ym)[1]]), rule_for(mode, ym))[0]
+    end = max(int(raw_to_utc_ms(np.array([raw_month_bounds_ms(ym)[1]]), c)[0])
+              for c in rule_candidates(rule_for(mode, ym)))          # "undecided": spaetestes Ende
     return datetime.fromtimestamp(int(end) / 1000, UTC)
 
 
@@ -800,8 +1012,8 @@ class Unit:
     @property
     def end_utc(self) -> datetime:
         """Ende der Rohperiode in UTC (Regel ihres letzten Rohmonats)."""
-        end = raw_to_utc_ms(np.array([self.raw_bounds_ms()[1]]),
-                            rule_for(self.mode, (self.year, self.month or 12)))[0]
+        end = max(int(raw_to_utc_ms(np.array([self.raw_bounds_ms()[1]]), c)[0])
+                  for c in rule_candidates(rule_for(self.mode, (self.year, self.month or 12))))
         return datetime.fromtimestamp(int(end) / 1000, UTC)
 
     def page_url(self) -> str:
@@ -891,7 +1103,10 @@ def _zones_differ_in(old: list[tuple[str, int]] | None, mode: str, ym: tuple[int
     (Viertelstunden-Raster; mehrere alte Regeln: nur gleich, wenn identisch)."""
     if not old:
         return True
-    new_rules = [(r.zone, r.shift_h) for r in dict.fromkeys(rule_for(mode, m) for m in _raw_months_for(ym, mode))]
+    # "undecided": alle Kandidaten muessen hier dieselbe Rohzeit liefern wie die alte Regel
+    rules = [rule_for(mode, m) for m in _raw_months_for(ym, mode)]
+    cands = [c for r in rules for c in rule_candidates(r)]
+    new_rules = [(r.zone, r.shift_h) for r in dict.fromkeys(cands)]
     if old == new_rules:
         return False
     if len(set(old)) != 1:
@@ -901,7 +1116,9 @@ def _zones_differ_in(old: list[tuple[str, int]] | None, mode: str, ym: tuple[int
     hi = int(datetime(*_ym_add(ym, 1), 1, tzinfo=UTC).timestamp() * 1000)
     grid = np.arange(lo, hi, HOUR_MS // 4, dtype=np.int64)
     zone, shift = old[0]
-    return bool((utc_to_raw_ms_mode(grid, mode) != utc_to_raw_ms(grid, TzRule("alt", zone, shift))).any())
+    ref = utc_to_raw_ms(grid, TzRule("alt", zone, shift))
+    npick = max(len(rule_candidates(r)) for r in rules)
+    return any(bool((utc_to_raw_ms_mode(grid, mode, pick=k) != ref).any()) for k in range(npick))
 
 
 def classify_store_file(out: Path, mode: str, ym: tuple[int, int]) -> tuple[str, str | None]:
@@ -1194,7 +1411,7 @@ def parse_status(txt: str | None, mode: str = "tick") -> dict:
         r = datetime.strptime(digits, "%Y%m%d%H%M%S").replace(tzinfo=UTC)
         try:
             u = int(raw_to_utc_ms_mode(np.array([int(r.timestamp() * 1000)]), mode)[0])
-        except TimezoneError:
+        except (TimezoneError, RuleUndecided):
             return r.strftime("%Y-%m-%d %H:%M:%S"), None
         return r.strftime("%Y-%m-%d %H:%M:%S"), datetime.fromtimestamp(u / 1000, UTC).isoformat()
 
@@ -1286,7 +1503,7 @@ def _gap_fit(a: int, b: int, hours: tuple[int, int], rule_at) -> dict:
 
 def _transitions_ms(rule: TzRule, lo_ms: int, hi_ms: int) -> np.ndarray:
     """UTC-ms der Uhrumstellungen der Regel-Zone in [lo_ms, hi_ms] (leer bei fester Zone)."""
-    T, _ = _table_for(rule.zone, np.array([lo_ms, hi_ms], dtype=np.int64))
+    T, _ = _table_for(concrete_rule(rule).zone, np.array([lo_ms, hi_ms], dtype=np.int64))
     T = T[1:]
     return T[(T >= lo_ms) & (T <= hi_ms)]
 
@@ -1385,13 +1602,22 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
 
     rep: dict = {"rule": rule.name, "rule_detail": rule.describe(), "raw_tz": rule.describe(),
                  "mode": mode, "check_version": TZ_CHECK_VERSION, "rows": int(len(raw_ms))}
+    if isinstance(rule, UndecidedRule):
+        # Pruefung unter dem ersten Kandidaten (wo geschrieben wird, rechnen alle gleich)
+        rep.update(rule_checked=rule.first.name, candidates=[c.name for c in rule.candidates])
     d0 = np.diff(raw_ms)
     rep["reversals"] = int((d0 < 0).sum())
     rep["max_reversal_s"] = float(max(0, -int(d0.min())) / 1000) if len(d0) else 0.0
     large = np.nonzero(d0 <= -REGRESSION_MAX_MS)[0]
-    rep["large_reversals"] = [
-        {"at_raw": _raw_iso(int(raw_ms[i])), "back_to_raw": _raw_iso(int(raw_ms[i + 1])),
-         "minutes": round(-int(d0[i]) / MIN_MS, 1)} for i in large[:N_EXAMPLES]]
+    # betroffene Ticks je Ruecksprung: Rohzeit in [zurueck_auf, bei]
+    rev_mask, rev_rows = _reversal_mask(raw_ms)
+    rep["large_reversals"] = rev_rows[:N_EXAMPLES]
+    rep["reversal_ticks_total"] = int(rev_mask.sum())
+    _, rel = weekend_release(raw_ms, mode, fixed)
+    if rel is not None:
+        # alle Ruecksprung- und Verbotene-Stunden-Ticks im geschlossenen Wochenendmarkt:
+        # nach menschlicher Pruefung verwerfbar (--accept-weekend-ticks)
+        rep["releasable_weekend"] = rel
 
     own_lo = int(raw_ms.min()) if len(raw_ms) else 0
     own_hi = int(raw_ms.max()) if len(raw_ms) else -1
@@ -1566,7 +1792,11 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
     reasons = []
     if len(large):
         reasons.append(f"{len(large)} Ruecksprung/Rueckspruenge >= {REGRESSION_MAX_MS // MIN_MS} min "
-                       f"in Dateireihenfolge (max {rep['max_reversal_s'] / 60:.0f} min, Uhrumstellung?)")
+                       f"in Dateireihenfolge (max {rep['max_reversal_s'] / 60:.0f} min, Uhrumstellung?; "
+                       f"{rep['reversal_ticks_total']} Tick(s) betroffen"
+                       + (", alle im geschlossenen Wochenendmarkt: nach Pruefung freigebbar "
+                          "(--accept-weekend-ticks), diese Ticks werden dann verworfen)"
+                          if rel is not None else ", nicht freigebbar)"))
     for r in runs[:1]:
         reasons.append(f"{len(runs)} Stempelungswechsel: {len({x[2] for x in r})} unabhaengige Luecken in "
                        f"Folge mit {r[0][1]:+d} h Abweichung von {rule.describe()}, z.B. "
@@ -1676,6 +1906,9 @@ class Ctx:
         self.decoded: OrderedDict[Unit, Decoded] = OrderedDict()
         self.tz: dict[tuple, dict] = {}         # (unit, ym, links da, rechts da) -> endgueltige Pruefung
         self.edges: dict[tuple[tuple[int, int], bool], np.ndarray] = {}
+        # (unit, ym) -> (Rohzeit, [UTC je Kandidat]) der Ticks, die die Kandidaten einer
+        # "undecided"-Regel verschieden umrechnen (build_month entscheidet je UTC-Monat)
+        self.undecided: dict[tuple, tuple] = {}
         self.downloaded = 0
         self.empty_streak = self.content_streak = 0
         self.first_data = self._first_cached_month()
@@ -1760,6 +1993,7 @@ class Ctx:
         for q in u.path(self.data_root).parent.glob(f"{u.name}*.quarantine"):
             q.unlink(missing_ok=True)
         self.tz = {k: v for k, v in self.tz.items() if k[0] != u}
+        self.undecided = {k: v for k, v in self.undecided.items() if k[0] != u}
         self.edges.clear()
 
     def get(self, u: Unit) -> Outcome:
@@ -1919,8 +2153,7 @@ class Ctx:
                       "Marker reparieren (z.B. \"accepted\": true) oder loeschen", q)
             raise Quarantined(u, ym, f"Quarantaene-Marker {q.name} unlesbar (kein gueltiges JSON) - "
                               "reparieren oder loeschen (= neu pruefen)", None)
-        rule = rule_for(self.mode, ym)
-        same_tz = (info.get("raw_tz"), info.get("tz_shift_h", 0)) == (rule.zone, rule.shift_h)
+        same_tz = (info.get("raw_tz"), info.get("tz_shift_h", 0)) == rule_identity(rule_for(self.mode, ym))
         if info.get("accepted") and same_tz:
             return True, None
         if not info.get("accepted") and same_tz and info.get("tz_check_version") == TZ_CHECK_VERSION:
@@ -1952,6 +2185,54 @@ class Ctx:
         pad["provisional"] = pad["left_missing"] or pad["right_missing"]
         return (left, right), pad
 
+    def _convert(self, raw: np.ndarray, rule, u: Unit, ym: tuple[int, int]) -> np.ndarray:
+        """Rohzeit -> UTC nach der Regel des Rohmonats (TimezoneError wie raw_to_utc_ms).
+        "undecided": erster rechnender Kandidat; Ticks, die die Kandidaten verschieden
+        umrechnen, werden mit allen Kandidaten-UTC gemerkt (ctx.undecided) -
+        build_month schreibt einen UTC-Monat nicht, in den einer davon fallen kann."""
+        if not isinstance(rule, UndecidedRule):
+            return raw_to_utc_ms(raw, rule)
+        outs, errs = [], []
+        for c in rule.candidates:
+            try:
+                outs.append(raw_to_utc_ms(raw, c))
+                errs.append(None)
+            except TimezoneError as e:
+                outs.append(None)
+                errs.append(e)
+        if all(e is not None for e in errs):
+            raise errs[0]                        # ueberall nicht eindeutig: normale Behandlung
+        ref = next(o for o in outs if o is not None)
+        diff = np.zeros(len(raw), dtype=bool)
+        for o, e in zip(outs, errs):
+            diff |= getattr(e, "bad_mask", np.ones(len(raw), dtype=bool)) if o is None else (o != ref)
+        if diff.any():
+            self.undecided[(u, ym)] = (raw[diff], [(o if o is not None else ref)[diff] for o in outs])
+        else:
+            self.undecided.pop((u, ym), None)
+        return ref
+
+    def _check(self, raw: np.ndarray, ym, bounds, nb, rule=None) -> dict:
+        """check_timezone fuer Rohmonat ym (rule None = Regel je Rohmonat), bei zu
+        wenigen Ankern gemeinsam mit den gecachten Nachbar-Rohmonaten."""
+        chk = check_timezone(raw, self.symbol, bounds, self.mode, rule=rule, neighbours=nb)
+        if chk["status"] == "not_checkable":
+            # zu wenige Anker (kurzer erster Historienmonat, duenner Monat):
+            # gemeinsam mit gecachten Nachbar-Rohmonaten pruefen
+            parts = [self._neighbour_ms(_ym_add(ym, -1)), raw, self._neighbour_ms(_ym_add(ym, 1))]
+            used = [_ymstr(_ym_add(ym, k)) for k, p in zip((-1, 0, 1), parts) if p is not None]
+            if len(used) > 1:
+                joint = check_timezone(np.concatenate([p for p in parts if p is not None]),
+                                       self.symbol, bounds, self.mode, rule=rule)
+                joint["joint_with"] = used
+                joint["alone"] = {k: chk[k] for k in ("anchors", "reason")}
+                chk = joint
+            if chk["status"] == "not_checkable":
+                chk["reason"] = (f"Zeitzone NICHT PRUEFBAR: {chk['reason']} (auch gemeinsam mit "
+                                 f"Nachbarmonaten {used}) - manuell pruefen, dann im Marker "
+                                 "\"accepted\": true setzen")
+        return chk
+
     def raw_slice(self, u: Unit, ym: tuple[int, int]) -> tuple[pd.DataFrame, dict]:
         """
         Rohmonat ym aus Datei u, zeitzonengeprueft, mit Spalte utc_ms; Quarantined wenn nicht.
@@ -1959,14 +2240,18 @@ class Ctx:
         Nachbar, der existieren sollte (abgeschlossen, in der Historie), ist das
         Ergebnis VORLAEUFIG: weder gemerkt noch als Marker gespeichert (der
         naechste Aufruf mit Nachbar prueft neu); tz["padding"] sagt, was fehlte.
+        Freigegebener Marker mit releasable_weekend: genau die verwerfbaren
+        Wochenend-Ticks (weekend_release) werden VERWORFEN (nie umgerechnet), der
+        Rest normal geprueft; tz meldet dropped_ticks/dropped_raw.
         """
+        rule = rule_for(self.mode, ym)
         q = u.qmarker(self.data_root, ym)
         accepted, old = self._marker_decision(u, ym, q)
         note = None
         if old is not None and old.get("accepted"):
             note = (f"Fruehere Freigabe (\"accepted\": true, Pruefversion "
                     f"{old.get('tz_check_version', 1)}, {old.get('raw_tz') or 'fest UTC-5'}) galt "
-                    f"einer anderen Umrechnung; unter {rule_for(self.mode, ym).describe()} neu geprueft und "
+                    f"einer anderen Umrechnung; unter {rule.describe()} neu geprueft und "
                     "durchgefallen - erneut pruefen und ggf. neu freigeben")
         try:
             sel = self._month_rows(u, ym)
@@ -1974,62 +2259,62 @@ class Ctx:
             if accepted:
                 raise Quarantined(u, ym, f"Format nicht lesbar: {e}", None)
             self._quarantine(u, ym, f"Format nicht lesbar: {e}", None, note)
+        raw_all = sel["raw_ms"].to_numpy()
+        marker = (self.read_qmarker(q) or {}) if accepted else {}
+        released = marker.get("releasable_weekend")
+        dropped = None
+        if isinstance(released, dict) or marker.get("tz_error_releasable"):
+            # Freigabe verwerfbarer Wochenend-Ticks (v5: tz_error_releasable): genau
+            # diese Ticks verwerfen - nur wenn sie weiterhin ALLE im geschlossenen
+            # Wochenendmarkt liegen und (v6) dieselben Rohzeit-Bereiche sind
+            drop, rel = weekend_release(raw_all, self.mode, rule)
+            if rel is None or (isinstance(released, dict)
+                               and rel["raw_ranges"] != released.get("raw_ranges")):
+                raise Quarantined(u, ym, f"Freigabe im Marker {q.name} (releasable_weekend) passt nicht "
+                                  "mehr zu den Rohdaten (andere/zusaetzliche Ticks oder nicht mehr alle im "
+                                  "geschlossenen Wochenendmarkt) - Marker loeschen (= neu pruefen)", None)
+            dropped = {"dropped_ticks": int(drop.sum()),
+                       "dropped_raw": [_raw_iso(int(x), ms_digits=True) for x in raw_all[drop][:N_EXAMPLES]]}
+            log.warning("%s Rohmonat %s: %d Tick(s) im geschlossenen Wochenendmarkt nach Freigabe "
+                        "VERWORFEN (Ruecksprung/nicht eindeutige Ortszeit), z.B. %s", u.key, _ymstr(ym),
+                        dropped["dropped_ticks"], ", ".join(dropped["dropped_raw"][:3]))
+            sel = sel[~drop].reset_index(drop=True)
+            raw_all = raw_all[~drop]
         try:
-            sel = sel.assign(utc_ms=raw_to_utc_ms(sel["raw_ms"].to_numpy(), rule_for(self.mode, ym)))
-            dropped = None
+            sel = sel.assign(utc_ms=self._convert(raw_all, rule, u, ym))
         except TimezoneError as e:
-            # Default: nie raten -> Quarantaene. Liegen ALLE betroffenen Ticks im
-            # geschlossenen Wochenendmarkt (z.B. roh Sa 20:00-20:59 in den EU-
-            # Umstellungsnaechten), darf ein Mensch per "accepted": true freigeben:
-            # diese Ticks werden dann VERWORFEN (nie umgerechnet) und gemeldet.
-            bad = getattr(e, "bad_mask", None)
-            raw_all = sel["raw_ms"].to_numpy()
-            releasable = bad is not None and bool(weekend_closed_raw(raw_all[bad]).all())
+            # Default: nie raten -> Quarantaene. Liegen ALLE betroffenen Ticks (auch die
+            # von Rueckspruengen) im geschlossenen Wochenendmarkt, darf ein Mensch
+            # freigeben (--accept-weekend-ticks): diese Ticks werden dann verworfen.
+            drop, rel = weekend_release(raw_all, self.mode, rule)
             reason = (f"Rohzeit nicht eindeutig nach UTC umrechenbar: {e}" + (
-                " [nur Ticks im geschlossenen Wochenendmarkt: nach Pruefung mit \"accepted\": "
-                "true freigebbar, diese Ticks werden dann verworfen]" if releasable else
-                " [nicht freigebbar: Ticks ausserhalb des Wochenendes]"))
-            marker_info = self.read_qmarker(q) if q.exists() else None
-            if accepted and releasable and (marker_info or {}).get("tz_error_releasable"):
-                keep = ~bad
-                dropped = {"dropped_ticks": int(bad.sum()),
-                           "dropped_raw": [_raw_iso(int(x), ms_digits=True) for x in raw_all[bad][:N_EXAMPLES]]}
-                log.warning("%s Rohmonat %s: %d Tick(s) in nicht eindeutiger Ortszeit (geschlossener "
-                            "Wochenendmarkt) nach Freigabe verworfen, z.B. %s", u.key, _ymstr(ym),
-                            dropped["dropped_ticks"], ", ".join(dropped["dropped_raw"][:3]))
-                sel = sel[keep].assign(utc_ms=raw_to_utc_ms(raw_all[keep], rule_for(self.mode, ym)))
-            elif accepted:
+                f" [nur Ticks im geschlossenen Wochenendmarkt: nach Pruefung freigebbar mit "
+                f"--accept-weekend-ticks {_ymstr(ym)}, diese {int(drop.sum())} Tick(s) werden dann "
+                "verworfen]" if rel is not None else
+                " [nicht freigebbar: Ticks ausserhalb des geschlossenen Wochenendmarkts]"))
+            if accepted:
                 raise Quarantined(u, ym, reason, None)
-            else:
-                self._tz_error_releasable = releasable
-                self._quarantine(u, ym, reason, None, note)
-        if accepted:
-            return sel, {"accepted_manually": True, "marker": str(q), **(dropped or {})}
+            self._quarantine(u, ym, reason, None, note, releasable=rel)
+        if accepted and dropped is None:
+            return sel, {"accepted_manually": True, "marker": str(q)}
         if not len(sel):
-            return sel, {}
+            return sel, dict(dropped or {})
         nb, pad = self._neighbours(ym)
-        key = (u, ym, pad["left"], pad["right"])
+        key = (u, ym, pad["left"], pad["right"], dropped is not None)
         chk = self.tz.get(key)
         if chk is None:
             bounds = raw_month_bounds_ms(ym)
-            chk = check_timezone(sel["raw_ms"].to_numpy(), self.symbol, bounds, self.mode,
-                                 neighbours=nb)
-            if chk["status"] == "not_checkable":
-                # zu wenige Anker (kurzer erster Historienmonat, duenner Monat):
-                # gemeinsam mit gecachten Nachbar-Rohmonaten pruefen
-                parts = [self._neighbour_ms(_ym_add(ym, -1)), sel["raw_ms"].to_numpy(),
-                         self._neighbour_ms(_ym_add(ym, 1))]
-                used = [_ymstr(_ym_add(ym, k)) for k, p in zip((-1, 0, 1), parts) if p is not None]
-                if len(used) > 1:
-                    joint = check_timezone(np.concatenate([p for p in parts if p is not None]),
-                                           self.symbol, bounds, self.mode)
-                    joint["joint_with"] = used
-                    joint["alone"] = {k: chk[k] for k in ("anchors", "reason")}
-                    chk = joint
-                if chk["status"] == "not_checkable":
-                    chk["reason"] = (f"Zeitzone NICHT PRUEFBAR: {chk['reason']} (auch gemeinsam mit "
-                                     f"Nachbarmonaten {used}) - manuell pruefen, dann im Marker "
-                                     "\"accepted\": true setzen")
+            # Fahrplan "undecided" und Kandidaten rechnen hier verschieden: unter jedem
+            # Kandidaten pruefen, bestanden wenn einer passt (welcher gilt, entscheidet
+            # der Mensch im Fahrplan; build_month haelt betroffene UTC-Monate zurueck).
+            # Sonst (auch "undecided" mit identischer Umrechnung): Regel je Rohmonat
+            # (undecided -> erster Kandidat)
+            cands = (list(rule.candidates) if isinstance(rule, UndecidedRule)
+                     and (u, ym) in self.undecided else [None])
+            results = [self._check(sel["raw_ms"].to_numpy(), ym, bounds, nb, c) for c in cands]
+            chk = next((c for c in results if c["ok"]), results[0])
+            if cands != [None]:
+                chk = {**chk, "candidates_checked": {c.name: r["status"] for c, r in zip(cands, results)}}
             chk["padding"] = pad
             if not pad["provisional"]:
                 self.tz[key] = chk
@@ -2045,18 +2330,50 @@ class Ctx:
                               f"{', '.join(hold)}", chk)
         if not chk["ok"]:
             reason = ("" if chk["status"] == "not_checkable" else
-                      f"Zeitzone passt nicht zu {rule_for(self.mode, ym).describe()}: ") + chk["reason"]
+                      f"Zeitzone passt nicht zu {rule.describe()}: ") + chk["reason"]
             if pad["provisional"]:
                 miss = [_ymstr(_ym_add(ym, k)) for k, s_ in ((-1, "left_missing"), (1, "right_missing"))
                         if pad[s_]]
                 raise Quarantined(u, ym, f"VORLAEUFIG (Nachbar-Rohmonat {', '.join(miss)} fehlt im "
                                   f"Cache, nicht gespeichert): {reason}", chk)
-            self._quarantine(u, ym, reason, chk, note)
+            if dropped is not None:
+                # freigegebener Marker bleibt; der Rest besteht trotzdem nicht
+                raise Quarantined(u, ym, f"nach Verwerfen von {dropped['dropped_ticks']} freigegebenen "
+                                  f"Wochenend-Tick(s) weiterhin: {reason}", chk)
+            self._quarantine(u, ym, reason, chk, note, releasable=chk.get("releasable_weekend"))
         if old is not None and q.exists() and not self.report_only and not pad["provisional"]:
             q.unlink(missing_ok=True)                  # neu geprueft und bestanden
             log.warning("Quarantaene-Marker %s (aeltere Pruefung) entfernt: %s besteht die Pruefung "
-                        "unter %s", q.name, _ymstr(ym), rule_for(self.mode, ym).describe())
+                        "unter %s", q.name, _ymstr(ym), rule.describe())
+        if dropped is not None:
+            chk = {**chk, "accepted_manually": True, "marker": str(q), **dropped}
         return sel, chk
+
+    def check_undecided(self, u: Unit, r: tuple[int, int], ym: tuple[int, int]) -> None:
+        """Fahrplan "undecided": Ticks des Rohmonats r, die die Kandidaten verschieden
+        umrechnen und unter IRGENDEINEM Kandidaten in den UTC-Monat ym fallen ->
+        RuleUndecided (UTC-Monat nicht schreiben; kein Marker)."""
+        und = self.undecided.get((u, r))
+        if und is None:
+            return
+        lo_ms = int(datetime(*ym, 1, tzinfo=UTC).timestamp() * 1000)
+        hi_ms = int(datetime(*_ym_add(ym, 1), 1, tzinfo=UTC).timestamp() * 1000)
+        d_raw, d_utcs = und
+        hit = np.zeros(len(d_raw), dtype=bool)
+        for x in d_utcs:
+            hit |= (x >= lo_ms) & (x < hi_ms)
+        if not hit.any():
+            return
+        ranges = _ranges_of(d_raw[hit])
+        e = RuleUndecided(
+            f"UTC-Monat {_ymstr(ym)}: {int(hit.sum())} Tick(s) aus Rohmonat {_ymstr(r)} rechnen "
+            f"die Kandidaten {', '.join(c.name for c in rule_candidates(rule_for(self.mode, r)))} "
+            f"verschieden um (Fahrplan 'undecided'), roh "
+            + ", ".join(f"{a}..{b}" for a, b in ranges[:5])
+            + " - nicht geschrieben (kein Marker; jeder Lauf prueft neu aus dem Cache, "
+            "bis der Fahrplan entschieden ist)", d_raw[hit], ranges)
+        e.raw_month, e.unit = r, u
+        raise e
 
     def check_following(self, ym: tuple[int, int]) -> None:
         """
@@ -2100,21 +2417,25 @@ class Ctx:
                 _, tz = self.raw_slice(u, r)
             except CorruptZip:
                 return None
+            self.check_undecided(u, r, ym)                 # RuleUndecided
             if r == ym:
                 pad = bool((tz.get("padding") or {}).get("right_final", True))
         self.check_following(ym)
         return pad
 
-    def _quarantine(self, u: Unit, ym, reason: str, check: dict | None, note: str | None = None):
+    def _quarantine(self, u: Unit, ym, reason: str, check: dict | None, note: str | None = None,
+                    releasable: dict | None = None):
         rule = rule_for(self.mode, ym)
+        zone, shift = rule_identity(rule)
         info = {"reason": reason, "check": check, "since": self.now().isoformat(),
-                "accepted": False, "tz_rule": rule.name, "raw_tz": rule.zone,
-                "tz_shift_h": rule.shift_h, "tz_check_version": TZ_CHECK_VERSION}
-        if getattr(self, "_tz_error_releasable", None) is not None:
-            # Quarantaene wegen nicht eindeutiger Ortszeit: freigebbar nur, wenn alle
-            # betroffenen Ticks im geschlossenen Wochenendmarkt liegen
-            info["tz_error_releasable"] = self._tz_error_releasable
-            self._tz_error_releasable = None
+                "accepted": False, "tz_rule": rule.name, "raw_tz": zone,
+                "tz_shift_h": shift, "tz_check_version": TZ_CHECK_VERSION}
+        if isinstance(rule, UndecidedRule):
+            info["tz_candidates"] = [c.name for c in rule.candidates]
+        if releasable:
+            # alle Ruecksprung-/Verbotene-Stunden-Ticks im geschlossenen Wochenendmarkt:
+            # "accepted": true (--accept-weekend-ticks) verwirft genau diese Ticks
+            info["releasable_weekend"] = releasable
         if note:
             info["note"] = note
             reason = f"{reason} [{note}]"
@@ -2131,8 +2452,12 @@ class Ctx:
 def _raw_months_for(ym: tuple[int, int], mode: str) -> list[tuple[int, int]]:
     lo = int(datetime(*ym, 1, tzinfo=UTC).timestamp() * 1000)
     hi = int(datetime(*_ym_add(ym, 1), 1, tzinfo=UTC).timestamp() * 1000) - 1
-    a, b = (datetime.fromtimestamp(int(x) / 1000, UTC)
-            for x in utc_to_raw_ms_mode(np.array([lo, hi]), mode))
+    # "undecided": alle Kandidaten (fruehester Anfang, spaetestes Ende)
+    los, his = [], []
+    for k in range(4):
+        los.append(int(utc_to_raw_ms_mode(np.array([lo]), mode, pick=k)[0]))
+        his.append(int(utc_to_raw_ms_mode(np.array([hi]), mode, pick=k)[0]))
+    a, b = (datetime.fromtimestamp(x / 1000, UTC) for x in (min(los), max(his)))
     out, r = [], (a.year, a.month)
     while r <= (b.year, b.month):
         out.append(r)
@@ -2163,8 +2488,13 @@ def build_month(ctx: Ctx, ym: tuple[int, int]) -> tuple[pd.DataFrame, dict]:
             # rechter Nachbar (Rohmonat M+1) fehlte bei der Pruefung von M: Datei
             # wird mit tz_right_padding=false geschrieben und spaeter nachgeprueft
             stats["tz_right_padding"] = bool((tz.get("padding") or {}).get("right_final", True))
+        lo_ms, hi_ms = ms.value // 1_000_000, me.value // 1_000_000
+        ctx.check_undecided(u, r, ym)
         utc_ms = sel["utc_ms"].to_numpy()
-        sel = sel[(utc_ms >= ms.value // 1_000_000) & (utc_ms < me.value // 1_000_000)]
+        sel = sel[(utc_ms >= lo_ms) & (utc_ms < hi_ms)]
+        if tz.get("dropped_ticks"):
+            stats["dropped_ticks"] = stats.get("dropped_ticks", 0) + tz["dropped_ticks"]
+            stats["dropped_raw"] = (stats.get("dropped_raw", []) + tz["dropped_raw"])[:N_EXAMPLES]
         info.update(file_rows=ctx.decode(u).stats, rows_in_month=int(len(sel)), timezone=tz)
         stats["histdata_status"][u.name] = ctx.decode(u).status
         parts.append(sel)
@@ -2186,6 +2516,11 @@ def month_report(df: pd.DataFrame, symbol: str, ym, mode: str, stats: dict) -> d
     rep = dk.validate(df, symbol, f"{symbol} {ym[0]}-{ym[1]:02d}", ms, ms + pd.offsets.MonthBegin(1))
     rep.update(stats)
     rep.update(source=SOURCE_BY_MODE[mode], mode=PARQUET_MODE[mode], spread_available=mode == "tick")
+    if stats.get("dropped_ticks"):
+        rep["warning"] = (f"{stats['dropped_ticks']} Tick(s) im geschlossenen Wochenendmarkt nach "
+                          "manueller Freigabe (releasable_weekend) VERWORFEN, nicht umgerechnet: "
+                          + ", ".join(stats["dropped_raw"][:5]))
+        log.warning("%s %s: %s", symbol, _ymstr(ym), rep["warning"])
     if mode == "m1":
         rep["note"] = ("M1 enthaelt nur Bid: ask = bid, Spread 0 - Spread kommt aus dem "
                        "Kostenmodell; tick_count = 1 je Bar (kein Tick-Zaehler)")
@@ -2270,9 +2605,10 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
                 # gleiche Umrechnung: aus dem Roh-Cache neu pruefen (kein Download)
                 try:
                     pad = ctx.reverify(ym)
-                except Quarantined as q:
+                except (Quarantined, RuleUndecided) as q:
                     moved = retire_stale_store_file(data_root, out)
-                    retired_recheck[_ymstr(ym)] = {"reason": q.reason, "retired_to": str(moved)}
+                    retired_recheck[_ymstr(ym)] = {"reason": getattr(q, "reason", str(q)),
+                                                   "retired_to": str(moved)}
                     log.error("%s: Nachpruefung (%s) durchgefallen - aus dem Store genommen (%s): %s",
                               out.name, st, moved, q.reason)
                     if ym in in_range:
@@ -2338,6 +2674,7 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
 
     outcomes: dict[Unit, Outcome] = {}
     written, validation_errors, quarantine, pending, missing = [], {}, {}, {}, {}
+    undecided: dict[tuple[int, int], dict] = {}      # Fahrplan "undecided", Kandidaten verschieden
     state = {"status": None, "error": None}
     reported_gaps: dict[str, dict] = {}
 
@@ -2353,6 +2690,10 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
         except Quarantined as q:
             quarantine[ym] = {"file": q.unit.name, "raw_month": _ymstr(q.ym), "reason": q.reason,
                               "path": str(q.unit.qmarker(data_root, q.ym)), "check": q.check}
+            return
+        except RuleUndecided as e:
+            undecided[ym] = undecided_entry(e)
+            log.error("REGEL OFFEN %s: %s", label, e)
             return
         reported_gaps.update(stats["histdata_status"])
         if df.empty:
@@ -2436,7 +2777,7 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
         rep = _run_report(ctx, start, end, started, todo, outcomes, written, validation_errors,
                           quarantine, pending, unavailable, missing, conflicts, skipped_existing,
                           state, reported_gaps, rebuild, stale_tz, stale_out, relabelled,
-                          retired_recheck, unverified, removed_stores)
+                          retired_recheck, unverified, removed_stores, undecided)
         dk.write_json_atomic(run_report_path(data_root, sym, mode), rep)
         log.info("FERTIG %s: status=%s exit=%d, %d Monate geschrieben, %d Requests (Report %s)", sym,
                  rep["status"], rep["exit_code"], len(written), client.requests,
@@ -2447,8 +2788,9 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
 def _run_report(ctx, start, end, started, todo, outcomes, written, validation_errors, quarantine,
                 pending, unavailable, missing, conflicts, skipped_existing, state, reported_gaps,
                 rebuild, stale_tz=None, stale_out=None, relabelled=None, retired_recheck=None,
-                unverified=None, removed_stores=None) -> dict:
+                unverified=None, removed_stores=None, undecided=None) -> dict:
     stale_tz, stale_out, relabelled = stale_tz or {}, stale_out or {}, relabelled or []
+    undecided = undecided or {}
     client = ctx.client
     manual = [{"month": _ymstr(k), "kind": "quarantine", **{x: v[x] for x in ("reason", "path")}}
               for k, v in quarantine.items()]
@@ -2456,9 +2798,13 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
                for k, v in missing.items()]
     manual += [{"month": _ymstr(k), "kind": "store_mode_conflict", "reason": v}
                for k, v in conflicts.items()]
+    # Fahrplan "undecided" und Kandidaten rechnen hier verschieden: manueller Fall
+    # (Fahrplan entscheiden), kein Marker
+    manual += [{"month": _ymstr(k), "kind": "rule_undecided", "reason": v["reason"]}
+               for k, v in undecided.items()]
     manual.sort(key=lambda r: r["month"])
     done = set(written) | set(validation_errors) | set(quarantine) | set(unavailable) | \
-        set(missing) | set(conflicts)
+        set(missing) | set(conflicts) | set(undecided)
     incomplete = [ym for ym in todo if ym not in done]
     gaps = {u: o for u, o in outcomes.items() if o.status in ("failed", "skipped")}
     content = {u: o for u, o in outcomes.items() if o.status in ("content_error", "deferred")}
@@ -2481,7 +2827,8 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
                   "pending" if pend_units and not (gaps or unconfirmed or content) else "gaps")
         code = EXIT_GAPS
     elif manual:
-        status, code = "quarantine", EXIT_MANUAL
+        status = "rule_undecided" if all(r["kind"] == "rule_undecided" for r in manual) else "quarantine"
+        code = EXIT_MANUAL
     else:
         status, code = "complete", EXIT_OK
     if manual and code != EXIT_MANUAL:
@@ -2490,6 +2837,10 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
     if manual:
         log.error("MANUELLE PRUEFUNG NOETIG %s (%s): %s", ctx.symbol, ctx.mode,
                   "; ".join(f"{r['month']} {r['kind']}" for r in manual))
+        if undecided:
+            hints.append(f"{len(undecided)} Monat(e) im Fahrplan-Zeitraum 'undecided' mit Ticks, die die "
+                         "Kandidatenregeln verschieden umrechnen (months_rule_undecided): nicht "
+                         "geschrieben; Regel in config/histdata_timezone.yaml entscheiden (Survey).")
         hints.append("Quarantaene/manuelle Pruefung: Zeitzonen-Pruefung im Report ansehen, "
                      "--verify-month fuer den Monat. <zip>.quarantine loeschen = erneut pruefen "
                      "(ohne Download); ZIP loeschen = neu laden und neu pruefen (Marker wird "
@@ -2536,6 +2887,8 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
         "unverified_after_version_bump": [_ymstr(k) for k in sorted(unverified or [])],
         # Store-Verzeichnisse nicht mehr unterstuetzter Symbole (EURUSD) nach metals/stale/
         "retired_removed_symbols": removed_stores or [],
+        # Fahrplan "undecided": UTC-Monate mit verschieden umgerechneten Ticks (roh)
+        "months_rule_undecided": {_ymstr(k): v for k, v in sorted(undecided.items())},
         "started": started.isoformat(), "finished": dk.utc_now().isoformat(),
         "range": {"start": f"{start:%Y-%m}", "end": f"{end:%Y-%m}"},
         "options": {"pause": client.pause, "attempts": client.attempts,
@@ -2554,6 +2907,7 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
             "months_pending": {_ymstr(k): v for k, v in sorted(pending.items())},
             "months_incomplete": [_ymstr(k) for k in incomplete],
             "months_quarantine": [_ymstr(k) for k in sorted(quarantine)],
+            "months_rule_undecided": {_ymstr(k): v for k, v in sorted(undecided.items())},
             "months_store_conflict": [_ymstr(k) for k in sorted(conflicts)],
             "months_validation_error": [_ymstr(k) for k in sorted(validation_errors)],
             "months_rebuilt_timezone": [_ymstr(k) for k in sorted(stale_tz) if k in written],
@@ -2579,6 +2933,13 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
         "quarantine": [{"month": _ymstr(k), **v} for k, v in sorted(quarantine.items())],
         "histdata_reported_gaps": reported_gaps,
     }
+
+
+def undecided_entry(e: RuleUndecided) -> dict:
+    """Berichtszeile fuer einen wegen "undecided" nicht geschriebenen UTC-Monat."""
+    return {"raw_month": _ymstr(e.raw_month) if e.raw_month else None,
+            "raw_ranges": [list(r) for r in e.ranges],
+            "differing_ticks": int(len(e.differing_raw)), "reason": str(e)}
 
 
 def _check_symbol(symbol: str) -> None:
@@ -2645,6 +3006,9 @@ def verify_month(symbol: str, ym: tuple[int, int], data_root: Path | None = None
         except Quarantined as q:
             rep.update(ok=False, exit_code=EXIT_MANUAL, reason=q.reason, timezone=q.check,
                        quarantine=str(q.unit.qmarker(data_root, q.ym)))
+        except RuleUndecided as e:
+            rep.update(ok=False, exit_code=EXIT_MANUAL, status="rule_undecided", reason=str(e),
+                       rule_undecided=undecided_entry(e))
         except dk.ValidationError as e:
             rep.update(ok=False, exit_code=EXIT_VALIDATION, reason=str(e))
         except CorruptZip as e:
@@ -2668,7 +3032,7 @@ def verify_month(symbol: str, ym: tuple[int, int], data_root: Path | None = None
 
 # ------------------------------------------------- regel offline abgleichen ---
 def evaluate_raw_month(data_root: Path, symbol: str, ym: tuple[int, int], mode: str = "tick",
-                       rule: "TzRule | str | None" = None) -> dict:
+                       rule: "TzRule | str | None" = None, drop_releasable_weekend: bool = False) -> dict:
     """
     Einen Rohmonat NUR aus dem Roh-Cache gegen eine Stempelungsregel pruefen
     (Default: Regel aus dem Fahrplan; z.B. fuer den Abgleich von Kandidaten).
@@ -2676,6 +3040,10 @@ def evaluate_raw_month(data_root: Path, symbol: str, ym: tuple[int, int], mode: 
     Kein Download, keine Marker, keine Store-Aenderung. Rueckgabe: Bericht von
     check_timezone plus cached, neighbours (prev/next vorhanden, *_missing =
     sollte existieren, fehlt im Cache) und convert_error (nicht eindeutige Ortszeit).
+    releasable_weekend: verwerfbare Wochenend-Ticks unter dieser Regel (weekend_release,
+    vor dem Verwerfen) oder None. drop_releasable_weekend=True: diese Ticks vor der
+    Pruefung verwerfen (wie nach --accept-weekend-ticks); dropped_weekend_ticks = Anzahl.
+    "undecided": rule_undecided = verschieden umgerechnete Ticks (oder None).
     """
     _check_symbol(symbol)
     data_root = Path(data_root)
@@ -2693,10 +3061,19 @@ def evaluate_raw_month(data_root: Path, symbol: str, ym: tuple[int, int], mode: 
         return {**base, "cached": True, "status": "unreadable", "ok": False,
                 "reason": f"Rohdatei nicht lesbar: {e}", "neighbours": {}}
     nb, pad = ctx._neighbours(tuple(ym))
+    drop, rel = weekend_release(raw, mode, rule)
+    dropped = 0
+    if drop_releasable_weekend and rel is not None:
+        dropped = int(drop.sum())
+        raw = raw[~drop]
     rep = check_timezone(raw, symbol, raw_month_bounds_ms(tuple(ym)), mode, rule=rule, neighbours=nb)
-    rep["convert_error"] = None
+    rep.update(convert_error=None, releasable_weekend=rel, dropped_weekend_ticks=dropped,
+               rule_undecided=None)
     try:
         raw_to_utc_ms(raw, rule)
+    except RuleUndecided as e:
+        rep["rule_undecided"] = {"raw_ranges": [list(r) for r in e.ranges],
+                                 "differing_ticks": int(len(e.differing_raw))}
     except TimezoneError as e:
         rep.update(convert_error=str(e), status="failed", ok=False,
                    reason="; ".join(x for x in (rep.get("reason"), f"nicht eindeutige Ortszeit: {e}") if x))
@@ -2705,6 +3082,81 @@ def evaluate_raw_month(data_root: Path, symbol: str, ym: tuple[int, int], mode: 
                                         "prev_missing": pad["left_missing"],
                                         "next_missing": pad["right_missing"]})
     return rep
+
+
+# ------------------------------------------------- wochenend-ticks freigeben ---
+def accept_weekend_ticks(symbol: str, ym: tuple[int, int], data_root: Path | None = None, *,
+                         mode: str = "tick", out=None) -> int:
+    """
+    --accept-weekend-ticks: Quarantaene-Marker des ROHmonats ym freigeben
+    ("accepted": true), aber NUR wenn er releasable_weekend traegt (alle
+    betroffenen Ticks im geschlossenen Wochenendmarkt, WEEKEND_CLOSED_RAW) und
+    zur aktuellen Regel gehoert. Gibt die zu verwerfenden Ticks aus (aus dem
+    Roh-Cache neu berechnet und mit dem Marker abgeglichen). Kein Download.
+    Exit 0 freigegeben, 2 nicht freigebbar (Grund auf stderr), 3 Lock belegt.
+    """
+    out = out or sys.stdout
+    _check_symbol(symbol)
+    data_root = Path(data_root or dk.default_data_root())
+    ym = tuple(ym)
+
+    def refuse(msg: str) -> int:
+        log.error("--accept-weekend-ticks %s %s: %s", symbol, _ymstr(ym), msg)
+        print(f"NICHT freigegeben: {msg}", file=sys.stderr)
+        return EXIT_VALIDATION
+
+    lock = acquire_lock(data_root, symbol)
+    if lock is None:
+        log.error("%s: Lock belegt (anderer Lauf aktiv) - spaeter erneut", symbol)
+        return EXIT_GAPS
+    try:
+        ctx = Ctx(symbol, mode, data_root, None, dk.utc_now, report_only=True)
+        u = ctx.unit(ym)
+        q = u.qmarker(data_root, ym)
+        if not q.exists():
+            return refuse(f"kein Quarantaene-Marker {q}")
+        info = ctx.read_qmarker(q)
+        if info is None:
+            return refuse(f"Marker {q} unlesbar (kein gueltiges JSON)")
+        rel = info.get("releasable_weekend")
+        if not isinstance(rel, dict):
+            return refuse(f"Marker {q.name} ist nicht freigebbar (Ticks ausserhalb des geschlossenen "
+                          f"Wochenendmarkts oder andere Ursache): {info.get('reason')}")
+        rule = rule_for(mode, ym)
+        if (info.get("raw_tz"), info.get("tz_shift_h", 0)) != rule_identity(rule) or \
+                info.get("tz_check_version") != TZ_CHECK_VERSION:
+            return refuse(f"Marker {q.name} stammt aus einer anderen Regel/Pruefversion "
+                          f"({info.get('tz_rule')}, v{info.get('tz_check_version')}) - erst einen "
+                          "normalen Lauf neu pruefen lassen")
+        ticks = None
+        if u.path(data_root).exists():
+            try:
+                raw = ctx._month_rows(u, ym)["raw_ms"].to_numpy()
+            except (CorruptZip, FormatError) as e:
+                return refuse(f"Rohdatei {u.name} nicht lesbar: {e}")
+            drop, now_rel = weekend_release(raw, mode, rule)
+            if now_rel is None or now_rel["raw_ranges"] != rel.get("raw_ranges"):
+                return refuse("verwerfbare Ticks im Roh-Cache passen nicht (mehr) zum Marker - "
+                              "Marker loeschen (= neu pruefen)")
+            ticks = [_raw_iso(int(x), ms_digits=True) for x in raw[drop]]
+        print(f"{symbol} {mode} Rohmonat {_ymstr(ym)}: folgende Ticks (roh, geschlossener "
+              f"Wochenendmarkt) werden beim naechsten Lauf VERWORFEN, nicht umgerechnet:", file=out)
+        print(f"  Ruecksprung-Ticks: {rel.get('reversal_ticks')}, Ticks in verbotenen Stunden: "
+              f"{rel.get('impossible_hour_ticks')}", file=out)
+        for a, b in rel.get("raw_ranges") or []:
+            print(f"  Bereich {a} .. {b}", file=out)
+        for t in (ticks or [])[:500]:
+            print(f"  {t}", file=out)
+        if ticks and len(ticks) > 500:
+            print(f"  ... ({len(ticks)} insgesamt)", file=out)
+        info.update(accepted=True, accepted_via="--accept-weekend-ticks",
+                    accepted_at=dk.utc_now().isoformat())
+        dk.write_json_atomic(q, info)
+        log.warning("%s Rohmonat %s: Wochenend-Ticks freigegeben (%s) - werden verworfen", symbol,
+                    _ymstr(ym), q)
+        return EXIT_OK
+    finally:
+        lock.close()
 
 
 # -------------------------------------------------------------------- cli ---
@@ -2744,6 +3196,10 @@ def main(argv: list[str] | None = None) -> int:
                         "leere Monate innerhalb der Historie erneut anfragen")
     p.add_argument("--verify-month", metavar="YYYY-MM",
                    help="einen Monat laden, decodieren, Zeitzone pruefen, validieren (Report)")
+    p.add_argument("--accept-weekend-ticks", metavar="YYYY-MM",
+                   help="Quarantaene des ROHmonats freigeben, wenn alle betroffenen Ticks im "
+                        "geschlossenen Wochenendmarkt liegen (releasable_weekend): diese Ticks "
+                        "werden dann verworfen; sonst Exit 2. Kein Download")
     p.add_argument("-v", "--verbose", action="store_true")
     a = p.parse_args(argv)
     try:
@@ -2759,8 +3215,11 @@ def main(argv: list[str] | None = None) -> int:
         start = _ym(a.start) if a.start else HISTORY_START[a.symbol]
         end = _ym(a.end) if a.end else (dk.utc_now().year, dk.utc_now().month)
         verify = _ym(a.verify_month) if a.verify_month else None
+        accept = _ym(a.accept_weekend_ticks) if a.accept_weekend_ticks else None
     except ValueError:
         p.error("Monate als YYYY-MM angeben")
+    if verify and accept:
+        p.error("--verify-month und --accept-weekend-ticks nicht zusammen")
 
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(message)s")
@@ -2772,6 +3231,8 @@ def main(argv: list[str] | None = None) -> int:
               max_consecutive_failures=a.max_consecutive_failures,
               timeout=(a.connect_timeout, a.read_timeout), stop=stop,
               sleep=lambda s: stop.wait(s))          # Schlaf durch SIGTERM unterbrechbar
+    if accept:
+        return accept_weekend_ticks(a.symbol, accept, mode=a.mode)
     if verify:
         try:
             return verify_month(a.symbol, verify, mode=a.mode, **kw)["exit_code"]

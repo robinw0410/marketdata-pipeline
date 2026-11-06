@@ -35,6 +35,27 @@ OLD_TZ_META = b"EST fixed UTC-5, converted to UTC, checked per month"
 NOW = datetime(2025, 3, 1, 12, tzinfo=UTC)
 
 
+BERLIN_EVERYWHERE = """\
+rules: []
+schedule:
+  tick:
+    - {from: "2000-01", rule: berlin_minus_6}
+  m1:
+    - {from: "2000-01", rule: fixed_est}
+"""
+
+
+@pytest.fixture
+def berlin_schedule(tmp_path_factory, monkeypatch):
+    """Fahrplan wie v5 (berlin_minus_6 fuer ALLE Rohmonate): fuer Logiktests, die
+    ueber viele Jahre mit einer einzigen Regel rechnen (der vorlaeufige v6-
+    Fahrplan hat ny_local bis 2018-11 und "undecided" 2018-12..2021-02)."""
+    p = tmp_path_factory.mktemp("cfg") / "berlin_everywhere.yaml"
+    p.write_text(BERLIN_EVERYWHERE)
+    monkeypatch.setenv(fh.TZ_CONFIG_ENV, str(p))
+    return p
+
+
 # ------------------------------------------------------------ synthetik ---
 def _ms(*args) -> int:
     """Rohzeit-ms: Wanduhr-Ziffern als UTC gelesen (wie parse_csv)."""
@@ -235,7 +256,7 @@ def test_rule_constants_and_error_type():
     assert tick_meta != OLD_TZ_META               # sonst erkennt der Lauf alte Dateien nicht
     assert tick_meta != _meta_value(fh.SOURCE_TZ_META["m1"])
     assert b"berlin_minus_6" in tick_meta and b"Europe/Berlin" in tick_meta
-    assert f"v{fh.TZ_CHECK_VERSION}".encode() in tick_meta and fh.TZ_CHECK_VERSION == 5
+    assert f"v{fh.TZ_CHECK_VERSION}".encode() in tick_meta and fh.TZ_CHECK_VERSION == 6
 
 
 # =========================================== 1. Anker wie beobachtet: ok ---
@@ -1021,6 +1042,7 @@ def _written_with_wrong_ticks(sym, how, y0, y1, step_s, thin=None):
     return out, fails
 
 
+@pytest.mark.usefixtures("berlin_schedule")
 @pytest.mark.parametrize("sym", ["XAUUSD", "XAGUSD"])
 @pytest.mark.parametrize("how", ["ny", "us2006"])
 def test_other_dst_rules_never_written_2001_2026(sym, how):
@@ -1032,12 +1054,14 @@ def test_other_dst_rules_never_written_2001_2026(sym, how):
     assert len(fails) >= 30                                     # die Abweichungen werden gesehen
 
 
+@pytest.mark.usefixtures("berlin_schedule")
 @pytest.mark.parametrize("sym", ["XAUUSD", "XAGUSD"])
 def test_berlin_minus_6_stamping_passes_every_month_2001_2026(sym):
     wrong, fails = _written_with_wrong_ticks(sym, "eu", 2001, 2026, step_s=180)
     assert wrong == [] and fails == []
 
 
+@pytest.mark.usefixtures("berlin_schedule")
 @pytest.mark.parametrize("how", ["eu", "est", "ny"])
 def test_thin_silver_one_tick_per_20_min(how):
     """Review 8: ~1 Tick je 20 min (XAGUSD nachts/frueh). Vorher fiel jeder Monat
@@ -1241,6 +1265,7 @@ def _thin_silver_us_rule_2010(seed):
     return utc, files
 
 
+@pytest.mark.usefixtures("berlin_schedule")
 @pytest.mark.parametrize("seed", [1, 5])     # mit der alten Logik: UTC-Oktober mit 43/35 falschen Minuten
 def test_v5_ambiguous_weekend_zero_side_does_not_hide_switch(tmp_path, seed):
     """Review v5 (1): der Null-Eintrag DESSELBEN mehrdeutigen Wochenendes (sein

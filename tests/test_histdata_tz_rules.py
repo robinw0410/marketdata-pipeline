@@ -1,4 +1,4 @@
-"""Regressionstests: HistData-Tick-Stempelung = Europe/Berlin - 6 h (TzRule, tz_check v5).
+"""Regressionstests: HistData-Tick-Stempelung = Europe/Berlin - 6 h (TzRule, ab tz_check v5).
 
 Befund (Homelab, echte HistData-Ticks XAUUSD/XAGUSD/EURUSD): von der US-Umstellung
 (2. So Maerz) bis zur EU-Umstellung (letzter So Maerz) bleibt die Rohzeit bei
@@ -529,9 +529,17 @@ def test_tz_rule_dataclass_and_builtin_rules():
 
 
 def test_default_config():
+    """Zeitplan nach Survey (LXC): ny_local bis 2018 belegt, berlin_minus_6 ab 2021-03
+    belegt, dazwischen undecided (v6). M1 unveraendert fixed_est."""
     cfg = fh.load_tz_config()
-    for ym in ((2000, 1), (2009, 3), (2015, 12), (2016, 1), (2024, 3), (2024, 10), (2026, 11)):
+    for ym in ((2000, 1), (2009, 3), (2015, 12), (2016, 1), (2018, 11)):
+        assert fh.rule_for("tick", ym, cfg) == rule("ny_local"), ym
+    for ym in ((2018, 12), (2019, 3), (2020, 11), (2021, 2)):
+        r = fh.rule_for("tick", ym, cfg)
+        assert r.name == "undecided" and {c.name for c in r.candidates} == {"ny_local", "berlin_minus_6"}, ym
+    for ym in ((2021, 3), (2024, 3), (2024, 10), (2026, 11)):
         assert fh.rule_for("tick", ym, cfg) == rule("berlin_minus_6"), ym
+    for ym in ((2000, 1), (2009, 3), (2019, 3), (2024, 3), (2026, 11)):
         assert fh.rule_for("m1", ym, cfg) == rule("fixed_est"), ym
     assert fh.rule_for("tick", (2024, 3)) == rule("berlin_minus_6")      # cfg=None
 
@@ -690,8 +698,8 @@ def test_end_to_end_march_2024_default_config(tmp_path):
     assert df["ts"].min() == pd.Timestamp("2024-03-01 00:00", tz="UTC")
     assert df["ts"].max() == pd.Timestamp("2024-03-31 23:59", tz="UTC")
     lab = label_of(out)
-    assert "berlin_minus_6" in lab and re.search(r"v5\b", lab), lab
-    assert fh.TZ_CHECK_VERSION == 5
+    assert "berlin_minus_6" in lab and re.search(rf"v{fh.TZ_CHECK_VERSION}\b", lab), lab
+    assert fh.TZ_CHECK_VERSION >= 5
 
 
 @pytest.mark.parametrize("ym", [(2024, 10), (2024, 11)])
@@ -752,7 +760,7 @@ def test_v4_shifted_store_file_is_retired_and_rebuilt_from_cache(tmp_path):
     pd.testing.assert_series_equal(pd.read_parquet(st[0])["ts"], v4["ts"], check_names=False)
     pd.testing.assert_frame_equal(pd.read_parquet(out), good)
     lab = label_of(out)
-    assert "berlin_minus_6" in lab and "v5" in lab and lab != V4_NY_LABEL
+    assert "berlin_minus_6" in lab and f"v{fh.TZ_CHECK_VERSION}" in lab and lab != V4_NY_LABEL
     _check_march_breaks(set(int(x) for x in bars_ms(out)))
     # danach stabil: nichts mehr zu tun
     rep = do_run(tmp_path, site, (2024, 3))
@@ -784,7 +792,7 @@ def test_v4_unshifted_store_file_is_relabelled_not_moved(tmp_path, ym):
     assert out.exists() and stale_files(tmp_path) == []
     pd.testing.assert_frame_equal(pd.read_parquet(out), good)
     lab = label_of(out)
-    assert "berlin_minus_6" in lab and "v5" in lab
+    assert "berlin_minus_6" in lab and f"v{fh.TZ_CHECK_VERSION}" in lab
     assert f"{ym[0]}-{ym[1]:02d}" in rep["relabelled_timezone"]
 
 

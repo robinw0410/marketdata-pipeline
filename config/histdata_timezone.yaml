@@ -4,12 +4,74 @@
 # Eingebaut (nicht neu definieren):
 #   berlin_minus_6  Europe/Berlin - 6 h: UTC-5 im EU-Winter, UTC-4 in der EU-
 #                   Sommerzeit; Wechsel letzter So Maerz/Oktober 01:00 UTC.
-#                   Im Homelab an echten Ticks gemessen (XAUUSD, XAGUSD, EURUSD):
-#                   2024-03 bleibt nach der US-Umstellung (10.03.) bis 31.03. bei
-#                   -5 h (Tagespause roh 15:59:59 -> 17:00:00), 2024-10 schon ab
-#                   27.10. (EU) wieder -5 h; Januar und Juli passen.
-#   ny_local        America/New_York (Pruefversion 4, fuer Ticks widerlegt)
+#   ny_local        America/New_York: UTC-5/UTC-4, Wechsel 2. So Maerz 07:00 UTC
+#                   und 1. So November 06:00 UTC.
 #   fixed_est       Etc/GMT+5 = fest UTC-5 (HistData-Angabe; fuer M1 NICHT verifiziert)
+#   undecided       kein Regelname, sondern ein Fahrplan-Eintrag mit candidates
+#                   (>= 2 bekannte Regeln): Umrechnung nur, wo alle Kandidaten
+#                   dasselbe ergeben; sonst wird der UTC-Monat nicht geschrieben
+#                   (Laufreport months_rule_undecided, Exit 4, kein Marker).
+#
+# VORLAEUFIGER Tick-Fahrplan nach dem Survey des Owners (Homelab,
+# scripts/histdata_tz_survey.py, 124 Requests). Belege je Jahr/Zeitraum:
+#
+#   Jahr  Zeitraum   XAUUSD           XAGUSD           Ergebnis
+#   2010  Maerz      ny_local         ny_local         ny_local eindeutig
+#   2010  Okt/Nov    ny_local         ny_local         ny_local eindeutig
+#   2012  Maerz      ny_local         ny_local         ny_local eindeutig
+#   2012  Okt/Nov    ny_local         ny_local         ny_local eindeutig
+#   2015  Maerz      ny_local         ny_local         ny_local eindeutig
+#   2015  Okt/Nov    ny_local         ny_local         ny_local eindeutig
+#   2018  Maerz      ny_local         ny_local         ny_local eindeutig
+#   2018  Okt/Nov    ny_local         ny_local         ny_local eindeutig
+#   2021  Maerz      berlin_minus_6   berlin_minus_6   berlin_minus_6 eindeutig (ny_local faellt durch)
+#   2021  Okt        (keine passt)    (keine passt)    berlin_minus_6 bis auf EINEN 60-min-
+#                                                      Ruecksprung (roh Sa 21:00 -> 20:00,
+#                                                      verirrte Ticks im geschlossenen Markt)
+#   2024  Maerz      berlin_minus_6   berlin_minus_6   berlin_minus_6 eindeutig (ny_local faellt durch)
+#   2024  Okt        (keine passt)    (keine passt)    wie 2021-10 (ein Ruecksprung Sa-Nacht)
+#   (2010-2018: beide Symbole gemeldet; 2021/2024: Ergebnis je Monat gemeldet,
+#   nicht getrennt nach Symbol)
+#   nicht untersucht: 2009, 2011, 2013, 2014, 2016, 2017, 2019, 2020, 2022, 2023, 2025
+#
+# Der Wechsel ny_local -> berlin_minus_6 liegt also nach den Okt/Nov-Wochen 2018
+# und vor 2021-03: 2018-12 .. 2021-02 = "undecided" (bis ein erweiterter Survey
+# ihn findet). Ruecksprung-Monate wie 2021-10/2024-10: Quarantaene, nach Pruefung
+# freigeben mit  fetch_histdata.py --symbol XAUUSD --accept-weekend-ticks 2024-10
+# (verwirft nur Ticks im geschlossenen Wochenendmarkt, WEEKEND_CLOSED_RAW).
+#
+# Warum Monate ohne Umstellungswoche unter beiden Regeln identisch sind:
+# ausserhalb der folgenden Fenster liefern ny_local UND berlin_minus_6 im Winter
+# UTC-5 und im Sommer UTC-4 - die Abbildung roh -> UTC ist dort gleich. Nur in
+# den Fenstern rechnet ny_local mit UTC-4, berlin_minus_6 mit UTC-5 (1 h
+# verschieden). Fenster (UTC; Maerz = US-Beginn 2. So 07:00 bis EU-Beginn
+# letzter So 01:00; Okt/Nov = EU-Ende letzter So Okt 01:00 bis US-Ende 1. So Nov
+# 06:00), mit zoneinfo auf der Viertelstunde nachgerechnet (keine weiteren
+# Abweichungen im Jahr):
+#
+#   Jahr  Maerz (UTC)                       Okt/Nov (UTC)
+#   2009  03-08 07:00 .. 03-29 01:00  (20d18h)   10-25 01:00 .. 11-01 06:00  (7d05h)
+#   2010  03-14 07:00 .. 03-28 01:00  (13d18h)   10-31 01:00 .. 11-07 06:00  (7d05h)
+#   2011  03-13 07:00 .. 03-27 01:00  (13d18h)   10-30 01:00 .. 11-06 06:00  (7d05h)
+#   2012  03-11 07:00 .. 03-25 01:00  (13d18h)   10-28 01:00 .. 11-04 06:00  (7d05h)
+#   2013  03-10 07:00 .. 03-31 01:00  (20d18h)   10-27 01:00 .. 11-03 06:00  (7d05h)
+#   2014  03-09 07:00 .. 03-30 01:00  (20d18h)   10-26 01:00 .. 11-02 06:00  (7d05h)
+#   2015  03-08 07:00 .. 03-29 01:00  (20d18h)   10-25 01:00 .. 11-01 06:00  (7d05h)
+#   2016  03-13 07:00 .. 03-27 01:00  (13d18h)   10-30 01:00 .. 11-06 06:00  (7d05h)
+#   2017  03-12 07:00 .. 03-26 01:00  (13d18h)   10-29 01:00 .. 11-05 06:00  (7d05h)
+#   2018  03-11 07:00 .. 03-25 01:00  (13d18h)   10-28 01:00 .. 11-04 06:00  (7d05h)
+#   2019  03-10 07:00 .. 03-31 01:00  (20d18h)   10-27 01:00 .. 11-03 06:00  (7d05h)
+#   2020  03-08 07:00 .. 03-29 01:00  (20d18h)   10-25 01:00 .. 11-01 06:00  (7d05h)
+#   2021  03-14 07:00 .. 03-28 01:00  (13d18h)   10-31 01:00 .. 11-07 06:00  (7d05h)
+#   2022  03-13 07:00 .. 03-27 01:00  (13d18h)   10-30 01:00 .. 11-06 06:00  (7d05h)
+#   2023  03-12 07:00 .. 03-26 01:00  (13d18h)   10-29 01:00 .. 11-05 06:00  (7d05h)
+#   2024  03-10 07:00 .. 03-31 01:00  (20d18h)   10-27 01:00 .. 11-03 06:00  (7d05h)
+#   2025  03-09 07:00 .. 03-30 01:00  (20d18h)   10-26 01:00 .. 11-02 06:00  (7d05h)
+#
+# Folge: Der Wechsel kann an JEDER Rohmonatsgrenze zwischen dem letzten
+# ny_local- und dem ersten berlin_minus_6-Umstellungszeitraum liegen - die
+# Monate dazwischen sind unter beiden Regeln gleich. Nur Monate mit Ticks in
+# einem Fenster (Maerz, Oktober, November) koennen ihn eingrenzen.
 #
 # Eigene Regeln (optional), Namen eindeutig, nur a-z 0-9 _:
 #   rules:
@@ -34,6 +96,8 @@ rules: []
 
 schedule:
   tick:
-    - {from: "2000-01", rule: berlin_minus_6}
+    - {from: "2000-01", rule: ny_local}
+    - {from: "2018-12", rule: undecided, candidates: [ny_local, berlin_minus_6]}
+    - {from: "2021-03", rule: berlin_minus_6}
   m1:
     - {from: "2000-01", rule: fixed_est}     # M1 unverifiziert: --mode m1 --verify-month 2024-07

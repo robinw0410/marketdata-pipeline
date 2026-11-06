@@ -242,16 +242,30 @@ Two modes (`--mode`):
 
 Time zone:
 
-- **Tick timestamps follow the rule `berlin_minus_6`**: raw wall clock =
-  Europe/Berlin local time minus 6 hours, i.e. UTC-5 during EU winter time
-  and UTC-4 during EU summer time; the switch is the last Sunday of March and
-  October at 01:00 UTC. Measured in the homelab on real ticks of all three
-  symbols: in March 2024 the raw time stays at -5 h from the US change
-  (10 March) to the end of March (daily break raw 15:59:59 -> 17:00:00 instead
-  of 16:59 -> 18:00) and switches to -4 h only at the EU change (31 March);
-  from 27 October (EU) it is -5 h again, not only from 3 November. January
-  and July fit. This overturns both HistData's "EST without daylight saving"
-  and the America/New_York rule of check version 4.
+- **Tick timestamps follow a per-period stamping schedule (provisional,
+  check version 6)**, from the owner's survey on real XAUUSD/XAGUSD ticks:
+  `ny_local` (America/New_York) up to 2018-11 (2010, 2012, 2015 and 2018
+  clearly `ny_local` in March and Oct/Nov), `undecided` (candidates
+  `ny_local`, `berlin_minus_6`) for 2018-12..2021-02, and `berlin_minus_6`
+  (Europe/Berlin local time minus 6 h: UTC-5 in EU winter, UTC-4 in EU summer)
+  from 2021-03 (2021-03 and 2024-03 clearly `berlin_minus_6`; 2021-10 and
+  2024-10 fit except for one 60-minute reversal of stray ticks in the closed
+  weekend market). Years 2009, 2011, 2013, 2014, 2016, 2017, 2019, 2020, 2022,
+  2023 and 2025 are not surveyed yet.
+- **Why the switch can sit at any raw-month boundary in between**: the two
+  rules differ only in two windows a year, where `ny_local` gives UTC-4 and
+  `berlin_minus_6` UTC-5: March from the US start (2nd Sunday of March, 07:00
+  UTC) to the EU start (last Sunday of March, 01:00 UTC), and Oct/Nov from the
+  EU end (last Sunday of October, 01:00 UTC) to the US end (1st Sunday of
+  November, 06:00 UTC). Everywhere else both give UTC-5 in winter and UTC-4 in
+  summer. The list per year 2009-2025 (checked with zoneinfo) is in
+  `config/histdata_timezone.yaml`.
+- **`undecided`**: the conversion runs under every candidate. Where they
+  agree, the result is used (and the check runs under the first candidate).
+  A UTC month into which a tick converted differently by the candidates could
+  fall is **not written**: run report `months_rule_undecided` (with the raw
+  ranges, also in `summary`), a manual case (exit 4; 3 still wins), no
+  quarantine marker, no extra requests, re-evaluated from the cache every run.
 - **The market stays New York-based**: the expected anchors are still the
   CME/New York session times (17:00/18:00 `America/New_York`); only the
   stamping rule changed.
@@ -265,6 +279,8 @@ Time zone:
   (America/New_York, 0), `fixed_est` (Etc/GMT+5, 0); the file may define more.
   `schedule` lists per mode `{from: "YYYY-MM", rule: name}` keyed on **raw**
   months, sorted; a rule change takes effect only at a raw-month boundary.
+  `{from: "YYYY-MM", rule: undecided, candidates: [ny_local, berlin_minus_6]}`
+  marks an open period (at least two known rules).
   To use another rule for a period, add an entry, e.g.
 
   ```yaml
@@ -294,7 +310,7 @@ Time zone:
   M; the raw months are computed from the schedule. M is written only when
   both are present, or when M-1 is before the symbol's history or confirmed
   empty.
-- The time zone is **checked in code for every raw month** (check version 5).
+- The time zone is **checked in code for every raw month** (check version 6).
   Every market gap gives a close anchor and an open anchor:
   - weekend (gap of 24 h or more, closing on Thursday/Friday and opening on
     Sunday/Monday): close 17:00, open 18:00 New York. Other gaps of 24 h or
@@ -358,32 +374,45 @@ Time zone:
     release made under another rule is re-checked: if the month passes, the
     marker is removed; if not, it is rewritten with `"accepted": false` and a
     note that the earlier release applied to the old conversion.
-  - A tick at an ambiguous or nonexistent local time quarantines the raw
-    month (default: error, never a guess). If **all** such ticks lie in the
-    closed weekend market (raw Saturday, or Sunday before 12:00; for
-    `berlin_minus_6` that is raw Saturday 20:00–20:59 in the transition
-    nights), the marker says `"tz_error_releasable": true` and a human may set
-    `"accepted": true`: those ticks are then **dropped** (never converted) and
-    their count and raw timestamps go into the monthly report
-    (`dropped_ticks`, `dropped_raw`). A tick outside the weekend is never
-    releasable.
+  - A tick at an ambiguous or nonexistent local time, or a reversal of 30
+    minutes or more in file order, quarantines the raw month (default: error,
+    never a guess). Each `large_reversals` entry reports `at_raw`,
+    `back_to_raw`, `minutes`, `n_ticks`, `first_raw`, `last_raw` and
+    `weekend_closed`; the affected ticks are all ticks with a raw time in
+    [`back_to_raw`, `at_raw`]. If **all** affected reversal ticks and all
+    impossible-hour ticks lie in the closed weekend market by the **raw**
+    clock (`WEEKEND_CLOSED_RAW`: Friday from 18:00, all of Saturday, Sunday
+    before 16:00 - conservative across rules and offsets), the report and the
+    marker carry `releasable_weekend` (`reversal_ticks`,
+    `impossible_hour_ticks`, `raw_ranges`). After a manual check run
+    `fetch_histdata.py --symbol XAUUSD --accept-weekend-ticks 2024-10` (raw
+    month; prints the ticks to drop, no download; exit 2 with the reason if
+    the marker is not releasable). Those ticks are then **dropped** (never
+    converted), the rest is re-checked and written if it passes; the monthly
+    report gets `dropped_ticks`, `dropped_raw` and a `warning`. Ticks outside
+    the closed weekend market are never releasable.
   - An unreadable marker (invalid JSON, e.g. a typo while setting
     `"accepted": true`) is kept, logged as ERROR and keeps blocking.
 - Monthly files carry the parquet metadata `source_timezone`, derived from
   the stamping rule(s) of their raw months and the check version, e.g.
-  `berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v5)`.
+  `berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v6)`.
+  v5 wrote every tick month under `berlin_minus_6`; under the v6 schedule its
+  March, October and November files before 2021-03 count as shifted (moved
+  to `metals/stale/`, rebuilt under `ny_local` or held as `rule_undecided`),
+  the other months are only relabelled.
   At the start of **every** run, all monthly files of the symbol and mode
   are checked, not only those in `--start`/`--end`:
   - an older or different label whose conversion gives the **same UTC times
-    in this month** (an older check version, or e.g. `ny_local` files of
-    January or July, where both rules agree): the raw months are re-checked
+    in this month** (an older check version, or e.g. `ny_local` or
+    `berlin_minus_6` files of January or July, where both rules agree): the raw months are re-checked
     from the cache under the current rule, with no download. If they pass,
     only the metadata is rewritten (`relabelled_timezone`). If they fail,
     the file is moved to `metals/stale/` and quarantined
     (`retired_after_recheck`). Without the raw cache the file stays and is
     listed under `unverified_after_version_bump`;
   - a different conversion that **shifts UTC times in this month** (`ny_local`
-    files of March, October and November, i.e. the weeks between the US and
+    versus `berlin_minus_6` files of March, October and November; for an
+    `undecided` month any differing candidate counts, i.e. the weeks between the US and
     EU clock changes; fixed-UTC-5 files of every month with EU summer time):
     the file is **moved to `metals/stale/` at once**, so the bot sees a gap
     rather than a shifted month, and rebuilt if the month is in range.
@@ -483,7 +512,8 @@ Exit codes are the same as Dukascopy:
   Restarting later is fine.
 - **4**: manual check needed. This covers quarantine (time zone mismatch,
   not checkable, unreadable format), a confirmed empty month inside the
-  history, and a store mode conflict. No restart.
+  history, a store mode conflict, and a month held as `rule_undecided`
+  (status `rule_undecided` when that is the only manual case). No restart.
 - **0**: complete.
 
 Exit 3 deliberately wins over 4, for the same restart reason as above. The
