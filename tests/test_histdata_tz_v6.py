@@ -43,9 +43,26 @@ V5_BERLIN_LABEL = "berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat gepru
 YEARS = range(2009, 2026)
 
 
+# Ab v7 ist der Default-Fahrplan ny_local -> berlin_minus_6_utc_midnight (2018-12).
+# Diese Tests pruefen die v6-Mechanik (undecided, berlin_minus_6) und laufen daher mit
+# einem EXPLIZITEN Fahrplan im v6-Stand (einzelne Tests setzen ihren eigenen).
+V6_SCHEDULE = ['{from: "2000-01", rule: ny_local}',
+               '{from: "2018-12", rule: undecided, candidates: [ny_local, berlin_minus_6]}',
+               '{from: "2021-03", rule: berlin_minus_6}']
+
+
+@pytest.fixture(scope="session")
+def v6_config_file(tmp_path_factory) -> Path:
+    p = tmp_path_factory.mktemp("v6cfg") / "histdata_timezone_v6.yaml"
+    lines = ["rules: []", "schedule:", "  tick:"] + [f"    - {x}" for x in V6_SCHEDULE] + \
+        ["  m1:", '    - {from: "2000-01", rule: fixed_est}']
+    p.write_text("\n".join(lines) + "\n")
+    return p
+
+
 @pytest.fixture(autouse=True)
-def _no_env_config(monkeypatch):
-    monkeypatch.delenv(ENV, raising=False)
+def _v6_config(monkeypatch, v6_config_file):
+    monkeypatch.setenv(ENV, str(v6_config_file))
 
 
 @pytest.fixture
@@ -408,8 +425,9 @@ def test_jan_jul_and_apr_sep_raw_months_convert_identically(year):
         assert (fh.raw_to_utc_ms(raw[ok], rule(NYL)) != fh.raw_to_utc_ms(raw[ok], rule(B6))).any()
 
 
-def test_default_tick_schedule_v6():
-    assert fh.TZ_CHECK_VERSION == 6
+def test_v6_schedule_config():
+    """Der v6-Fahrplan (explizit, s. _v6_config) wird weiter geladen: undecided-Eintrag."""
+    assert fh.TZ_CHECK_VERSION >= 6
     cfg = fh.load_tz_config()
     for ym in ((2000, 1), (2009, 3), (2015, 3), (2018, 11)):
         assert fh.rule_for("tick", ym, cfg) == rule(NYL), ym
@@ -469,7 +487,7 @@ def test_run_undecided_identical_month_is_written(tmp_path):
         "XAUUSD", (2019, 7), {(2019, 6): NYL, (2019, 7): NYL})
     assert "2019-07" in summary_get(rep, "months_written")
     assert not summary_get(rep, "months_rule_undecided")
-    assert "v6" in label_of(out)
+    assert f"v{fh.TZ_CHECK_VERSION}" in label_of(out)
     assert markers(tmp_path) == []
 
 
@@ -520,7 +538,7 @@ def test_run_decided_march_written_correctly(tmp_path, ym, st):
     assert utc_dt(y, 3, wed.day, 20, 59) in ts and utc_dt(y, 3, wed.day, 22, 0) in ts
     assert not any(utc_dt(y, 3, wed.day, 21) <= x < utc_dt(y, 3, wed.day, 22) for x in ts)
     assert wed < eu
-    assert st in label_of(out) and "v6" in label_of(out)
+    assert st in label_of(out) and f"v{fh.TZ_CHECK_VERSION}" in label_of(out)
 
 
 # ==================================================================== 3 ====
@@ -831,7 +849,7 @@ def test_v5_berlin_store_file_of_2015_03_is_retired_and_rebuilt_as_ny_local(tmp_
     pd.testing.assert_series_equal(pd.read_parquet(st[0])["ts"], df["ts"], check_names=False)
     pd.testing.assert_frame_equal(pd.read_parquet(out), good)
     lab = label_of(out)
-    assert "ny_local" in lab and "v6" in lab and "berlin" not in lab
+    assert "ny_local" in lab and f"v{fh.TZ_CHECK_VERSION}" in lab and "berlin" not in lab
     rep = do_run(tmp_path, site, (2015, 3))
     assert rep["exit_code"] == 0 and site.requests == 0 and len(stale_files(tmp_path)) == 1
 
@@ -881,8 +899,12 @@ def test_survey_preset_full_plan(tmp_path, monkeypatch, capsys, no_http):
     months = set(month_rows(res))
     first = min(ym[0] for ym in fh.HISTORY_START.values())
     assert first == 2009
-    assert months == {f"{y}-{m:02d}" for y in range(first, 2026) for m in (3, 10, 11)}
-    assert all(m["kind"] != "control" for m in res["months"])
+    # ab v7 gehoeren Kontrollmonate (mindestens 07) zum Preset (Kontroll-Ausschluss, s. v7)
+    trans = {f"{y}-{m:02d}" for y in range(first, 2026) for m in (3, 10, 11)}
+    assert trans | {f"{y}-07" for y in range(first, 2026)} <= months
+    kinds = {m["month"]: m["kind"] for m in res["months"]}
+    assert all(kinds[m] == "transition" for m in trans)
+    assert all(kinds[m] == "control" for m in months - trans)
     assert code == 3                                     # offline, nichts im Cache
     assert res["schedule"] == []
 
@@ -931,7 +953,10 @@ def test_survey_switch_without_open_period_has_no_undecided_block(tmp_path, monk
     assert rows["2019-03"]["winner"] == NYL and rows["2019-10"]["winner"] == NYL
     assert rows["2020-03"]["decisive"] and rows["2020-03"]["winner"] == B6
     assert code == 3, out                              # 2020-10/11 fehlen (offline)
-    assert sched(res) == [("2000-01", NYL), ("2020-03", B6)]
+    # v7: keine offenen Umstellungsmonate zwischen dem letzten ny_local-Beleg (2019-11) und
+    # dem ersten berlin_minus_6-Beleg (2020-03); dazwischen stempeln beide gleich -> der
+    # Wechsel wird direkt nach dem letzten alten Beleg vorgeschlagen
+    assert sched(res) == [("2000-01", NYL), ("2019-12", B6)]
     assert "undecided" not in [e["rule"] for e in res["schedule"]]
 
 

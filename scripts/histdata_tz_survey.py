@@ -29,12 +29,26 @@ letzter So Oktober bis US-Ende 1. So November) verschieden um; welche ROH-
 monate Fensterstunden haben, rechnet der Survey je Rohmonat nach
 (month_windows: Rohzeit -> UTC unter beiden Regeln). Alle anderen Rohmonate
 sind unter beiden Regeln identisch.
-- Rohmonat entscheidend (je Symbol): GENAU EINE Regel besteht, alle anderen
-  fallen durch. Rohmonats-Urteil ueber XAUUSD/XAGUSD: wo beide entscheiden,
-  muessen sie uebereinstimmen, sonst Konflikt. Nicht entscheidende Monate
-  (alle/keine bestehen, nicht pruefbar, fehlt) widersprechen nicht.
+- Kandidaten: alle Regeln aus fh.TZ_RULES (auch berlin_minus_6_utc_midnight,
+  Art dst_daily_utc: Wechsel Mo 00:00 UTC nach dem EU-Sonntag) plus eigene.
+- Kontroll-Ausschluss: Kontrollmonate eines Jahres (Art "control" oder ohne
+  Fenster zwischen den Sommerzeit-Regeln) - faellt dort eine Regel durch (z.B.
+  fixed_est im Juli: -4 h statt -5 h), zaehlt sie in den Umstellungsmonaten
+  DESSELBEN Jahres nicht mit ("fixed_est ausgeschlossen (2019-07: +1.0 h)").
+- Regelfamilien: Regeln, die sich je Jahr nur wenige Stunden unterscheiden
+  (berlin_minus_6 und berlin_minus_6_utc_midnight: nur die EU-Sonntage).
+- Rohmonat entscheidend (je Symbol): alle bestehenden, nicht ausgeschlossenen
+  Regeln gehoeren zu EINER Familie, alle anderen fallen durch. Zwischen den
+  Varianten entscheiden die Umstellungsnaechte des Fetchers (transition_nights,
+  nur eigene Umstellungen): Oktober-Rueckfall an der Faltung gefunden ->
+  utc_midnight; Ticks in der Maerz-Luecke (roh So 19:00-19:59) -> nicht die
+  Variante. Sonst ist der Monat fuer die Familie entscheidend. Rohmonats-
+  Urteil ueber XAUUSD/XAGUSD: Schnitt der zugelassenen Regeln, leer =
+  Konflikt. Nicht entscheidende Monate (alle/keine bestehen, nicht pruefbar,
+  fehlt) widersprechen nicht.
 - Wechselanalyse ueber die ENTSCHEIDENDEN ROHmonate (chronologisch, nicht
-  ueber Perioden - ein entscheidender Oktober bestaetigt NICHT den November):
+  ueber Perioden - ein entscheidender Oktober bestaetigt NICHT den November;
+  Familie und Variante vertragen sich, Block-Regel = spezifischste belegte):
   Zahl der Wechsel, Konflikte, letzter entscheidender Rohmonat der alten und
   erster der neuen Regel, jeder Rohmonat dazwischen mit seinen Fenstern.
   Verlangt: hoechstens EIN Wechsel und kein Konflikt; sonst Exit 4 mit
@@ -45,7 +59,8 @@ sind unter beiden Regeln identisch.
     {from: <Monat nach dem letzten entscheidenden alten Rohmonat>,
      rule: undecided, candidates: [<alt>, <neu>]}
                        (nur wenn dazwischen Rohmonate mit Fenster liegen)
-    {from: <erster entscheidender neuer Rohmonat>, rule: <neu>}
+    {from: <erster entscheidender neuer Rohmonat; ohne undecided der Monat
+     nach dem letzten alten>, rule: <neu>}
   Begruendung (justify): jeder Rohmonat zwischen beiden Belegen mit
   Fensterstunden liegt im undecided-Block, sonst kein Vorschlag (Exit 4);
   Rohmonate ohne Fenster sind identisch, ihre Zuordnung ist beliebig. Ein
@@ -53,12 +68,16 @@ sind unter beiden Regeln identisch.
   Symbole im selben Monat, sonst "zu wenig Evidenz" (JSON "weak_evidence")
   und kein Vorschlag. Die Periodentabelle (Maerz = 03, Okt/Nov = 10 + 11) ist
   nur Anzeige. --markdown PATH schreibt dasselbe als Markdown (fuer die Doku).
+- Umstellungsnaechte: Tabelle je Jahr x Symbol x Maerz/Oktober (EU-Sonntag,
+  erwartetes Muster, letzter/erster Tick roh, Rueckfall bzw. Ticks in
+  Faltung/Luecke, Status) und je Jahr "Maerz-Sprung bestaetigt / Oktober-
+  Rueckfall bestaetigt / keine Daten / abweichend"; auch in JSON und Markdown.
 
 Monate: Default Jahre 2010 2012 2015 2018 2021 2024, Umstellungsmonate 3 4 10
 11, Kontrollmonate 1 7 (dort haben alle Sommerzeit-Regeln dieselben Offsets;
 sie muessen alle bestehen, sonst Warnung "Kontrolle gescheitert").
 --preset full: alle Jahre ab dem fruehesten Historienbeginn (fh.HISTORY_START)
-bis 2025, Monate 3 10 11, keine Kontrollmonate. --periods YYYY-MM ...:
+bis 2025, Monate 3 10 11, Kontrollmonate 1 7. --periods YYYY-MM ...:
 einzelne Rohmonate, kombinierbar mit --preset/--years (allein: nur diese).
 
 Nur Tick-Modus, nur XAUUSD und XAGUSD.
@@ -67,7 +86,8 @@ Exit-Codes (Vorrang von oben nach unten):
   4  Befund: die konfigurierte Regel (fh.rule_for) hat in einem Monat Status
      "failed" (Liste "KONFIGURIERTE REGEL FAELLT DURCH", JSON
      "configured_failed"; entscheidend anders = zusaetzlich "WIDERSPRUCH",
-     JSON "contradictions"), ODER mehr als ein Wechsel, ODER ein Konflikt -
+     JSON "contradictions"; auch eine unerwartete Umstellungsnacht unter der
+     konfigurierten Regel), ODER mehr als ein Wechsel, ODER ein Konflikt -
      auch wenn noch Monate fehlen. Monate, die der Fahrplan als "undecided"
      fuehrt, stehen als "offen" da und zaehlen nie als Fehler.
   3  unvollstaendig: Download gescheitert, 429 (Sperre aktiv oder neu),
@@ -98,7 +118,8 @@ import threading
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+
+import numpy as np
 
 import fetch_dukascopy as dk
 import fetch_histdata as fh
@@ -111,7 +132,8 @@ DEFAULT_YEARS = (2010, 2012, 2015, 2018, 2021, 2024)
 DEFAULT_MONTHS = (3, 4, 10, 11)      # Umstellungsmonate EU/US
 DEFAULT_CONTROLS = (1, 7)            # Kontrollmonate (alle Sommerzeit-Regeln gleich)
 PRESET_LAST_YEAR = 2025
-PRESET_MONTHS = (3, 10, 11)          # --preset full: nur die Monate der Umstellungsperioden
+PRESET_MONTHS = (3, 10, 11)          # --preset full: Monate der Umstellungsperioden ...
+PRESET_CONTROLS = (1, 7)             # ... und Kontrollmonate (Ausschluss je Jahr, z.B. fixed_est)
 PRESETS = ("full",)
 MAX_DOWNLOADS = 80                   # Rohmonate je Aufruf (Default-Plan: 72)
 PAUSE_S = 5.0
@@ -181,9 +203,10 @@ def configured(ym: tuple[int, int], cfg) -> tuple[str | None, list[str]]:
 
 
 def rule_offset_h(rule, when: datetime) -> float:
-    """Offset der Rohzeit gegen UTC in h (Zone der Regel + Verschiebung)."""
-    off = ZoneInfo(rule.zone).utcoffset(when.replace(tzinfo=None))
-    return off.total_seconds() / 3600 + float(rule.shift_h)
+    """Offset der Rohzeit gegen UTC in h im UTC-Zeitpunkt `when` (naiv = UTC),
+    ueber fh.utc_to_raw_ms - gilt fuer jede Regelart (auch dst_daily_utc)."""
+    ms = int(when.replace(tzinfo=UTC).timestamp() * 1000)
+    return (int(fh.utc_to_raw_ms(np.array([ms], dtype=np.int64), rule)[0]) - ms) / fh.HOUR_MS
 
 
 def dst_rules(rules: dict, year: int) -> list[str]:
@@ -191,6 +214,54 @@ def dst_rules(rules: dict, year: int) -> list[str]:
     sie dieselben Offsets (berlin_minus_6 = ny_local) - Kontrollmonate."""
     jan, jul = datetime(year, 1, 15, 12), datetime(year, 7, 15, 12)
     return [n for n, r in rules.items() if rule_offset_h(r, jan) != rule_offset_h(r, jul)]
+
+
+# ----------------------------------------------------- regelfamilien ---
+VARIANT_MAX_H = 7 * 24      # so viele Stunden je Jahr hoechstens verschieden = Varianten einer Familie
+FAMILY_REF_YEAR = 2019
+
+
+def _diff_utc(a, b, lo_ms: int, hi_ms: int):
+    """(UTC-Raster, Rohzeit a, Rohzeit b, Maske verschieden), halbstuendlich,
+    Stichprobe in der Slotmitte (Umstellungen liegen auf vollen Stunden)."""
+    u = np.arange(lo_ms + 15 * fh.MIN_MS, hi_ms, 30 * fh.MIN_MS, dtype=np.int64)
+    ra, rb = fh.utc_to_raw_ms(u, a), fh.utc_to_raw_ms(u, b)
+    return u, ra, rb, ra != rb
+
+
+@functools.lru_cache(maxsize=None)
+def diff_hours_per_year(a, b, year: int = FAMILY_REF_YEAR) -> float:
+    lo = int(datetime(year, 1, 1, tzinfo=UTC).timestamp() * 1000)
+    hi = int(datetime(year + 1, 1, 1, tzinfo=UTC).timestamp() * 1000)
+    return float(_diff_utc(a, b, lo, hi)[3].sum()) / 2
+
+
+def rule_families(rules: dict) -> dict[str, frozenset]:
+    """Regel -> Familie (frozenset der Namen). Varianten = Regeln, die sich je Jahr
+    nur in wenigen Stunden unterscheiden (<= VARIANT_MAX_H, z.B. berlin_minus_6
+    und berlin_minus_6_utc_midnight: nur die EU-Umstellungssonntage). Ein Monat,
+    der nur die Familie gegen andere Regeln trennt, ist fuer die FAMILIE
+    entscheidend; die Variante entscheiden die Umstellungsnaechte."""
+    names = list(rules)
+    fam = {n: {n} for n in names}
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            if diff_hours_per_year(rules[a], rules[b]) <= VARIANT_MAX_H:
+                merged = fam[a] | fam[b]
+                for n in merged:
+                    fam[n] = merged
+    return {n: frozenset(v) for n, v in fam.items()}
+
+
+def label(allowed) -> str:
+    """Anzeigename einer Regelmenge: eine Regel = ihr Name, sonst Familie."""
+    allowed = sorted(allowed)
+    return allowed[0] if len(allowed) == 1 else "Familie " + "/".join(allowed)
+
+
+def allowed_of(r: dict) -> frozenset:
+    """Regeln, die ein entscheidender Rohmonat zulaesst (1 = genau eine Regel)."""
+    return frozenset(r.get("allowed") or ([r["winner"]] if r.get("winner") else []))
 
 
 def plan_months(years, months, controls, periods=()) -> list[tuple[tuple[int, int], str]]:
@@ -209,11 +280,12 @@ def plan_months(years, months, controls, periods=()) -> list[tuple[tuple[int, in
 
 def preset_plan(name: str) -> tuple[list[int], list[int], list[int]]:
     """(Jahre, Monate, Kontrollmonate) eines Presets. full: alle Jahre ab dem
-    fruehesten Historienbeginn bis PRESET_LAST_YEAR, Maerz/Oktober/November."""
+    fruehesten Historienbeginn bis PRESET_LAST_YEAR, Maerz/Oktober/November und
+    die Kontrollmonate Januar/Juli (fuer den Ausschluss je Jahr)."""
     if name != "full":
         raise ValueError(f"unbekanntes Preset {name!r}; bekannt: {', '.join(PRESETS)}")
     first = min(ym[0] for ym in fh.HISTORY_START.values())
-    return list(range(first, PRESET_LAST_YEAR + 1)), list(PRESET_MONTHS), []
+    return list(range(first, PRESET_LAST_YEAR + 1)), list(PRESET_MONTHS), list(PRESET_CONTROLS)
 
 
 def month_closed(sym: str, ym: tuple[int, int], now: datetime) -> bool:
@@ -325,7 +397,10 @@ def evaluate(data_root: Path, sym: str, ym: tuple[int, int], rules: dict) -> dic
                      "cached": bool(rep.get("cached", True)),
                      "dropped_weekend_ticks": int(rep.get("dropped_weekend_ticks") or 0),
                      "releasable_weekend": rep.get("releasable_weekend"),
-                     "large_reversals": list(rep.get("large_reversals") or [])}
+                     "large_reversals": list(rep.get("large_reversals") or []),
+                     # Umstellungsnaechte (Fetcher, Pruefversion 7): Sprung/Rueckfall je Regel
+                     "transition_nights": list(rep.get("transition_nights") or []),
+                     "expected_reversals": list(rep.get("expected_reversals") or [])}
     # Verworfene Ruecksprung-Ticks fehlen im Bericht (geprueft wird ohne sie): fuer
     # die Liste "grosse Ruecksprunge" einmal ohne Verwerfen nachlesen (Rohdaten,
     # regelunabhaengig) und als verworfen markieren.
@@ -346,14 +421,62 @@ def evaluate(data_root: Path, sym: str, ym: tuple[int, int], rules: dict) -> dic
     return res
 
 
-def classify(results: dict, kind: str, dst: list[str]) -> dict:
-    """Ergebnis eines Rohmonats: decisive (genau eine Regel ok, alle anderen
-    failed) + winner; sonst Text. Kontrollmonat: alle Sommerzeit-Regeln ok?"""
-    passing = [n for n, r in results.items() if r["status"] == "ok"]
-    unclear = [n for n, r in results.items() if r["status"] not in ("ok", "failed")]
-    out: dict = {"passing": passing, "decisive": False, "winner": None}
-    if len(passing) == 1 and not unclear:
-        out.update(decisive=True, winner=passing[0], text=f"entscheidend: {passing[0]}")
+def nights_verdict(res: dict) -> str | None:
+    """Umstellungsnaechte EINER Regel in einem Rohmonat: "unexpected" (mindestens
+    eine Nacht widerspricht der Regel), "ok" (mindestens eine bestaetigt, keine
+    widerspricht) oder None (keine Nacht mit Daten)."""
+    st = [x.get("status") for x in res.get("transition_nights") or ()
+          if x.get("rule_transition", True)]        # nur eigene Umstellungen der Regel
+    return "unexpected" if "unexpected" in st else "ok" if "ok" in st else None
+
+
+def resolve_by_nights(allowed: set, results: dict) -> tuple[set, str | None]:
+    """Varianten einer Familie ueber die Umstellungsnaechte trennen (Oktober:
+    Rueckfall an der Faltung gefunden -> utc_midnight-Variante; Maerz: Ticks in
+    der Luecke -> nicht die Variante). Regeln mit unerwarteter Nacht fallen
+    heraus; bleibt genau eine (oder bestaetigt genau eine), entscheidet sie."""
+    if len(allowed) <= 1:
+        return set(allowed), None
+    v = {n: nights_verdict(results[n]) for n in allowed}
+    contra = {n for n in allowed if v[n] == "unexpected"}
+    rest = set(allowed) - contra
+    support = {n for n in rest if v[n] == "ok"}
+    note = ", ".join(f"{n}: {'Nacht bestaetigt' if v[n] == 'ok' else 'Nacht widerspricht'}"
+                     for n in sorted(allowed) if v[n]) or None
+    if len(rest) == 1:
+        return rest, note
+    if len(support) == 1:
+        return support, note
+    return (rest or set(allowed)), note
+
+
+def classify(results: dict, kind: str, dst: list[str], excluded: dict | None = None,
+             families: dict | None = None) -> dict:
+    """
+    Ergebnis eines Rohmonats. Entscheidend: alle bestehenden (nicht
+    ausgeschlossenen) Regeln gehoeren zu EINER Familie, alle anderen fallen
+    durch (keine "nicht pruefbar"); allowed = die bestehenden Regeln, ueber die
+    Umstellungsnaechte verengt (1 Regel = genau diese, sonst Familie).
+    excluded: {regel: Grund} - in Kontrollmonaten desselben Jahres
+    durchgefallen, zaehlt hier nicht mit (nur Umstellungsmonate).
+    Kontrollmonat: alle Sommerzeit-Regeln ok?
+    """
+    excluded = excluded or {}
+    fam = families or {}
+    cands = {n: r for n, r in results.items() if n not in excluded}
+    passing = [n for n, r in cands.items() if r["status"] == "ok"]
+    unclear = [n for n, r in cands.items() if r["status"] not in ("ok", "failed")]
+    out: dict = {"passing": [n for n, r in results.items() if r["status"] == "ok"],
+                 "decisive": False, "winner": None, "allowed": [],
+                 "excluded": dict(excluded)}
+    groups = {fam.get(n, frozenset([n])) for n in passing}
+    if passing and not unclear and len(groups) == 1:
+        allowed, note = resolve_by_nights(set(passing), results)
+        out.update(decisive=True, allowed=sorted(allowed), winner=label(allowed),
+                   text=f"entscheidend: {label(allowed)}")
+        if note and len(passing) > 1:
+            out["text"] += f" ({note})"
+            out["nights_note"] = note
     elif not passing and not unclear:
         out["text"] = "keine Regel passt"
         out["none_pass"] = True
@@ -363,14 +486,44 @@ def classify(results: dict, kind: str, dst: list[str]) -> dict:
         out["text"] = "mehrere passen: " + ", ".join(passing)
     else:
         out["text"] = f"nicht entscheidbar ({passing[0]} ok, {', '.join(unclear)} nicht pruefbar)"
+    if excluded:
+        out["text"] += " | " + "; ".join(f"{n} ausgeschlossen ({why})" for n, why in excluded.items())
     if kind == "control" and dst:
         bad = [n for n in dst if n in results and results[n]["status"] != "ok"]
         out["control_ok"] = not bad
         if bad:
             out["text"] += " | Kontrolle gescheitert: " + ", ".join(bad)
         elif not out["decisive"]:
-            out["text"] = "Kontrolle ok: " + ", ".join(passing)
+            out["text"] = "Kontrolle ok: " + ", ".join(out["passing"])
     return out
+
+
+def control_like(ym: tuple[int, int], kind: str, rules: dict) -> bool:
+    """Kontrollmonat (fuer den Ausschluss): Art "control" oder ein Rohmonat, in
+    dem alle Sommerzeit-Regeln paarweise identisch stempeln (kein Fenster)."""
+    if kind == "control":
+        return True
+    dst = dst_rules(rules, ym[0])
+    return all(not month_windows(rules[a], rules[b], ym)
+               for i, a in enumerate(dst) for b in dst[i + 1:])
+
+
+def year_exclusions(rows: list[dict]) -> dict[int, dict[str, str]]:
+    """{jahr: {regel: Grund}}: Regeln, die in einem Kontrollmonat des Jahres
+    (irgendein Symbol) durchfallen - z.B. fixed_est im Juli (-4 h statt -5 h).
+    Sie zaehlen in den Umstellungsmonaten desselben Jahres nicht mit."""
+    out: dict[int, dict[str, list]] = {}
+    for r in rows:
+        if not (r["evaluated"] and r.get("control_like")):
+            continue
+        for n, res in r["results"].items():
+            if res["status"] == "failed":
+                dev = res.get("median_deviation_h")
+                why = f"{r['month']}" + (f": {dev:+.1f} h" if isinstance(dev, (int, float)) else "")
+                lst = out.setdefault(r["ym"][0], {}).setdefault(n, [])
+                if why not in lst:
+                    lst.append(why)
+    return {y: {n: ", ".join(w) for n, w in v.items()} for y, v in out.items()}
 
 
 def _runs(items: list[tuple[tuple[int, int], str]]) -> list[dict]:
@@ -384,24 +537,6 @@ def _runs(items: list[tuple[tuple[int, int], str]]) -> list[dict]:
     return runs
 
 
-def decisive_by_month(rows: list[dict], support: dict | None = None) -> tuple[dict, list[str]]:
-    """{ym: regel} aus allen Symbolen; Monate mit verschiedenen Gewinnern je
-    Symbol sind Konflikte (nicht im Fahrplan). support (optional, wird
-    gefuellt): {ym: Menge der Symbole, die den Gewinner stuetzen}."""
-    winners: dict[tuple[int, int], set] = {}
-    syms: dict[tuple[int, int], set] = {}
-    for r in rows:
-        if r["decisive"]:
-            winners.setdefault(r["ym"], set()).add(r["winner"])
-            syms.setdefault(r["ym"], set()).add(r["symbol"])
-    good = {ym: next(iter(w)) for ym, w in winners.items() if len(w) == 1}
-    if support is not None:
-        support.update({ym: syms[ym] for ym in good})
-    conflicts = [f"{ymstr(ym)}: {', '.join(sorted(w))}" for ym, w in sorted(winners.items())
-                 if len(w) > 1]
-    return good, conflicts
-
-
 def year_verdicts(rows: list[dict]) -> dict[int, dict]:
     """Urteil je Jahr ueber alle Symbole."""
     out = {}
@@ -411,14 +546,15 @@ def year_verdicts(rows: list[dict]) -> dict[int, dict]:
         winners = Counter(r["winner"] for r in dec)
         none_pass = [r for r in yr if r.get("none_pass")]
         notes = []
+        common = frozenset.intersection(*[allowed_of(r) for r in dec]) if dec else frozenset()
         if not winners:
             if none_pass and not any(r["passing"] for r in yr if r["evaluated"]):
                 text = "keine Regel passt"
             else:
                 text = "nicht entscheidbar"
-        elif len(winners) == 1:
-            w = next(iter(winners))
-            agrees = all(r["configured"] == w for r in dec)
+        elif common:            # alle Belege vertragen sich (Familie + Variante = Variante)
+            w = label(common)
+            agrees = all(r["configured"] in allowed_of(r) for r in dec)
             text = f"{w} passt" if agrees else f"nur {w} passt"
         else:
             runs = _runs([(r["ym"], r["winner"]) for r in dec])
@@ -476,10 +612,10 @@ def _month_note(r: dict) -> str:
 def build_months(rows: list[dict], symbols) -> list[dict]:
     """
     Urteil je ROHmonat ueber die Symbole (chronologisch, alle Monate des Plans):
-    status "decisive" (rule; mindestens ein Symbol entscheidend, alle
-    entscheidenden Symbole einig), "conflict" (Symbole entscheiden verschieden)
-    oder "open" (kein Symbol entscheidend: alle/keine bestehen, nicht
-    pruefbar, fehlt - widerspricht nicht).
+    status "decisive" (allowed = Schnitt der zugelassenen Regeln aller
+    entscheidenden Symbole, nicht leer; rule = Anzeigename), "conflict"
+    (Symbole lassen disjunkte Regeln zu) oder "open" (kein Symbol entscheidend:
+    alle/keine bestehen, nicht pruefbar, fehlt - widerspricht nicht).
     """
     by: dict[tuple[int, int], dict[str, dict]] = {}
     for r in rows:
@@ -487,15 +623,16 @@ def build_months(rows: list[dict], symbols) -> list[dict]:
     out = []
     for ym in sorted(by):
         per = {s: by[ym][s] for s in symbols if s in by[ym]}
-        win = {s: r["winner"] for s, r in per.items() if r["decisive"]}
-        v = {"ym": ym, "month": ymstr(ym), "winners": win, "rule": None,
-             "support": sorted(win, key=list(symbols).index),
+        win = {s: allowed_of(r) for s, r in per.items() if r["decisive"]}
+        common = frozenset.intersection(*win.values()) if win else frozenset()
+        v = {"ym": ym, "month": ymstr(ym), "winners": {s: label(a) for s, a in win.items()},
+             "rule": None, "allowed": [], "support": [s for s in symbols if s in win],
              "notes": {s: _month_note(r) for s, r in per.items() if not r["decisive"]}}
-        if len(set(win.values())) > 1:
+        if win and not common:
             v.update(status="conflict", text="KONFLIKT (Symbole: " + ", ".join(
-                f"{s} {w}" for s, w in win.items()) + ")")
+                f"{s} {label(a)}" for s, a in win.items()) + ")")
         elif win:
-            v.update(status="decisive", rule=next(iter(win.values())))
+            v.update(status="decisive", rule=label(common), allowed=sorted(common))
             v["text"] = f"{v['rule']} ({', '.join(v['support'])})"
         else:
             v.update(status="open", text="offen (" + "; ".join(
@@ -510,37 +647,39 @@ def _block_weak(b: dict) -> bool:
     return len(b["support"]) < MIN_BLOCK_MONTHS and not any(len(v) >= 2 for v in b["support"].values())
 
 
-def _raw_to_utc_set(rule, raw: datetime) -> frozenset:
-    """UTC-Zeitpunkte, auf die eine Rohzeit (naiv) unter `rule` faellt: einer,
-    zwei (mehrdeutig, Sommerzeitende) oder keiner (nicht existent)."""
-    local = raw - timedelta(hours=rule.shift_h)
-    z = ZoneInfo(rule.zone)
-    out = set()
-    for fold in (0, 1):
-        u = local.replace(tzinfo=z, fold=fold).astimezone(UTC)
-        if u.astimezone(z).replace(tzinfo=None) == local:      # existiert in der Zone
-            out.add(u)
-    return frozenset(out)
-
-
 @functools.lru_cache(maxsize=None)
 def month_windows(a, b, ym: tuple[int, int]) -> tuple[tuple[datetime, datetime], ...]:
     """Rohzeit-Bereiche [von, bis) im ROHmonat ym, in denen die Regeln a und b
-    eine Rohzeit verschieden auf UTC abbilden (auch: nur unter einer Regel nicht
-    existent oder mehrdeutig). Halbstuendliches Raster, Stichprobe in der
-    Slotmitte (Umstellungen liegen auf vollen Stunden, Verschiebungen sind ganze
-    Stunden). Leer = Rohmonat unter beiden Regeln identisch."""
-    t, end, step = datetime(*ym, 1), datetime(*ym_add(ym, 1), 1), timedelta(minutes=30)
+    verschieden stempeln: fuer jeden UTC-Zeitpunkt (halbstuendlich), an dem
+    a und b verschiedene Rohzeiten liefern, sind BEIDE Rohzeiten betroffen.
+    Ueber fh.utc_to_raw_ms, gilt fuer jede Regelart. Leer = Rohmonat unter
+    beiden Regeln identisch."""
+    lo_raw, hi_raw = fh.raw_month_bounds_ms(ym)
+    _, ra, rb, d = _diff_utc(a, b, lo_raw - 2 * fh.DAY_MS, hi_raw + 2 * fh.DAY_MS)
+    slot = 30 * fh.MIN_MS
+    marks = np.unique(np.concatenate([ra[d], rb[d]]) // slot * slot)
+    marks = marks[(marks >= lo_raw) & (marks < hi_raw)]
+    out: list[list[int]] = []
+    for m in marks.tolist():
+        if out and out[-1][1] == m:
+            out[-1][1] = m + slot
+        else:
+            out.append([m, m + slot])
+    naive = lambda ms: datetime(1970, 1, 1) + timedelta(milliseconds=ms)
+    return tuple((naive(x), naive(y)) for x, y in out)
+
+
+def sets_windows(old, new, ym, rules: dict) -> tuple:
+    """Fenster zwischen zwei Regelmengen (alle Paare alt x neu)."""
+    ivs = sorted({w for x in old for y in new if x != y
+                  for w in month_windows(rules[x], rules[y], ym)})
     out: list[list[datetime]] = []
-    while t < end:
-        s = t + timedelta(minutes=15)
-        if _raw_to_utc_set(a, s) != _raw_to_utc_set(b, s):
-            if out and out[-1][1] == t:
-                out[-1][1] = t + step
-            else:
-                out.append([t, t + step])
-        t += step
-    return tuple((x, y) for x, y in out)
+    for a, b in ivs:
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return tuple((a, b) for a, b in out)
 
 
 def _win_text(wins) -> str:
@@ -559,29 +698,33 @@ def _months_from_to(a: tuple[int, int], b: tuple[int, int]) -> list[tuple[int, i
 def analyze_switches(months: list[dict], rules: dict | None = None) -> dict:
     """
     Wechselanalyse ueber die ENTSCHEIDENDEN ROHmonate (chronologisch): Bloecke =
-    Folgen entscheidender Monate mit gleicher Regel (offene Monate unterbrechen
-    nicht). switches = Bloecke - 1. ok: hoechstens ein Wechsel und kein
-    Konflikt (Symbole uneinig im selben Rohmonat). Ein Wechsel zwischen Oktober
-    und November derselben Periode ist ein gueltiger Wechsel an der Rohmonats-
-    grenze 10/11. Bei genau einem Wechsel: letzter entscheidender Rohmonat der
-    alten Regel (last_old), erster der neuen (first_new) und JEDER Rohmonat
-    dazwischen (auch nicht untersuchte), mit den Fenstern, in denen beide Regeln
-    verschieden umrechnen (rules noetig); Monate mit Fenster ohne Entscheidung
-    gehoeren in den undecided-Block (undecided_months).
+    Folgen entscheidender Monate, deren zugelassene Regeln einen nicht leeren
+    Schnitt haben (Familie und Variante vertragen sich; offene Monate
+    unterbrechen nicht); Block-Regel = dieser Schnitt (die spezifischste
+    belegte Regel). switches = Bloecke - 1. ok: hoechstens ein Wechsel und kein
+    Konflikt (Symbole uneinig im selben Rohmonat). Oktober alt / November neu
+    ist ein gueltiger Wechsel an der Rohmonatsgrenze 10/11. Bei genau einem
+    Wechsel: letzter entscheidender Rohmonat der alten Regel (last_old), erster
+    der neuen (first_new) und JEDER Rohmonat dazwischen mit den Fenstern, in
+    denen alte und neue Regeln verschieden stempeln (rules noetig); Monate mit
+    Fenster ohne Entscheidung gehoeren in den undecided-Block.
     """
     by_ym = {m["ym"]: m for m in months}
     blocks: list[dict] = []
     for m in months:
         if m["status"] != "decisive":
             continue
-        if blocks and blocks[-1]["rule"] == m["rule"]:
+        a = frozenset(m["allowed"])
+        if blocks and blocks[-1]["allowed"] & a:
             b = blocks[-1]
+            b["allowed"] &= a
             b["last"] = m["ym"]
         else:
-            b = {"rule": m["rule"], "first": m["ym"], "last": m["ym"], "support": {}}
+            b = {"allowed": a, "first": m["ym"], "last": m["ym"], "support": {}}
             blocks.append(b)
         b["support"][m["month"]] = m["support"]
     for b in blocks:
+        b["rule"] = label(b["allowed"])
         b["weak"] = _block_weak(b)
         b["months"] = list(b["support"])
     conflicts = [{"month": m["month"], "text": m["text"]} for m in months if m["status"] == "conflict"]
@@ -603,7 +746,7 @@ def analyze_switches(months: list[dict], rules: dict | None = None) -> dict:
         an["last_old"], an["first_new"] = ymstr(old["last"]), ymstr(new["first"])
         for ym in _months_from_to(ym_add(old["last"], 1), ym_add(new["first"], -1)):
             m = by_ym.get(ym)
-            wins = month_windows(rules[old["rule"]], rules[new["rule"]], ym) if rules else ()
+            wins = sets_windows(old["allowed"], new["allowed"], ym, rules) if rules else ()
             st = "nicht untersucht" if m is None else m["text"]
             an["between"].append({"month": ymstr(ym), "window": bool(wins),
                                   "windows": _win_text(wins) if wins else "", "state": st})
@@ -624,46 +767,49 @@ def justify(an: dict, rules: dict) -> dict:
     """
     Begruendung der Grenze (genau ein Wechsel), je ROHmonat nachgerechnet: fuer
     jeden Rohmonat zwischen dem letzten entscheidenden alten und dem ersten
-    entscheidenden neuen Monat, ob die beiden Regeln irgendeine Rohzeit
-    verschieden umrechnen. Jeder solche Monat muss im undecided-Block liegen
-    (from = Monat nach dem letzten alten, bis vor den ersten neuen), sonst
-    equivalent=False (kein Vorschlag, Exit 4). Monate ohne Fenster sind unter
-    beiden Regeln identisch, ihre Zuordnung ist beliebig.
+    entscheidenden neuen Monat, ob alte und neue Regeln irgendeine Zeit
+    verschieden stempeln. Gibt es solche Monate, kommt ein undecided-Block
+    (from = Monat nach dem letzten alten, bis vor den ersten neuen), der jeden
+    davon abdecken muss, sonst equivalent=False (kein Vorschlag, Exit 4). Ohne
+    solche Monate gilt die neue Regel ab dem Monat nach dem letzten alten
+    Beleg: die Monate dazwischen sind unter beiden Regeln identisch.
     """
     old, new = an["blocks"][0], an["blocks"][1]
     names = (old["rule"], new["rule"])
     und = an["undecided_months"]
-    und_lo = ymstr(ym_add(old["last"], 1)) if und else None
+    after_old = ymstr(ym_add(old["last"], 1))
+    und_lo = after_old if und else None
     und_hi = ymstr(ym_add(new["first"], -1)) if und else None
+    new_from = ymstr(new["first"]) if und else after_old
     windowed = [b for b in an["between"] if b["window"]]
     uncovered = [b["month"] for b in windowed
                  if und_lo is None or not und_lo <= b["month"] <= und_hi]
     plain = [b["month"] for b in an["between"] if not b["window"]]
-    lines = [f"{names[0]} und {names[1]} rechnen Rohzeiten nur in den Umstellungsfenstern "
-             "verschieden nach UTC um"
+    pair = {r for b in (old, new) for r in b["allowed"]}
+    lines = [f"{names[0]} und {names[1]} stempeln nur in den Umstellungsfenstern verschieden"
              + (" (Maerz: US-Beginn 2. So Maerz bis EU-Beginn letzter So Maerz; Okt/Nov: "
                 "EU-Ende letzter So Oktober bis US-Ende 1. So November)"
-                if set(names) == {"ny_local", "berlin_minus_6"} else "")
-             + "; je Rohmonat halbstuendlich nachgerechnet (Rohzeit -> UTC unter beiden Regeln).",
+                if "ny_local" in pair and any(r.startswith("berlin_minus_6") for r in pair) else "")
+             + "; je Rohmonat halbstuendlich nachgerechnet (UTC -> Rohzeit unter beiden Regeln).",
              f"Letzter entscheidender {names[0]}-Rohmonat: {an['last_old']}; erster "
              f"entscheidender {names[1]}-Rohmonat: {an['first_new']}."]
     if windowed:
         lines.append("Rohmonate dazwischen MIT Fenster, ohne entscheidendes Ergebnis: " + "; ".join(
             f"{b['month']} ({b['windows']}; {b['state']})" for b in windowed)
-            + f" -> rule: {UNDECIDED} ab {und_lo} (Kandidaten {names[0]}, {names[1]}): dort "
-            "wird nur umgerechnet, wo beide Regeln dasselbe ergeben.")
+            + f" -> rule: {UNDECIDED} ab {und_lo}: dort wird nur umgerechnet, wo alle "
+            "Kandidaten dasselbe ergeben.")
     else:
         lines.append("Dazwischen liegt kein Rohmonat mit Fenster: kein undecided-Block noetig.")
     lines.append(f"Rohmonate dazwischen ohne Fenster ({_month_span(plain)}) sind unter beiden "
                  "Regeln identisch; ihre Zuordnung ist beliebig. Der Vorschlag fuehrt "
-                 f"{names[0]} bis einschliesslich {an['last_old']} und {names[1]} ab "
-                 f"{an['first_new']}.")
+                 f"{names[0]} bis einschliesslich {an['last_old']} und {names[1]} ab {new_from}.")
     if uncovered:
         lines.append("ACHTUNG: Rohmonate mit Fenster ausserhalb des undecided-Blocks ("
                      + ", ".join(uncovered) + ") - Grenze NICHT gleichwertig, kein Vorschlag.")
     return {"equivalent": not uncovered, "uncovered": uncovered,
             "window_months": {b["month"]: b["windows"] for b in windowed},
-            "undecided": [und_lo, und_hi] if und else None, "plain_months": plain, "text": lines}
+            "undecided": [und_lo, und_hi] if und else None, "new_from": new_from,
+            "plain_months": plain, "text": lines}
 
 
 def _month_span(months: list[str]) -> str:
@@ -681,6 +827,16 @@ def _month_span(months: list[str]) -> str:
     return ", ".join(ymstr(a) if a == b else f"{ymstr(a)}..{ymstr(b)}" for a, b in runs)
 
 
+def _entry(frm: str, allowed, note: str) -> dict:
+    """Fahrplan-Eintrag fuer eine Regelmenge: eine Regel direkt, eine nicht
+    aufgeloeste Familie als undecided mit ihren Mitgliedern."""
+    allowed = sorted(allowed)
+    if len(allowed) == 1:
+        return {"from": frm, "rule": allowed[0], "note": note}
+    return {"from": frm, "rule": UNDECIDED, "candidates": allowed,
+            "note": note + " (Familie nicht aufgeloest)"}
+
+
 def propose_schedule(an: dict, first_from: tuple[int, int], rules: dict) -> tuple[list[dict], dict | None]:
     """
     Fahrplan nach der Regel des Eigentuemers, auf Rohmonatsebene (nur bei
@@ -689,7 +845,9 @@ def propose_schedule(an: dict, first_from: tuple[int, int], rules: dict) -> tupl
       {from: Monat nach dem letzten entscheidenden alten Rohmonat, rule:
        undecided, candidates: [alt, neu]}    (nur wenn dazwischen Rohmonate mit
                                               Umstellungsfenster liegen)
-      {from: erster entscheidender neuer Rohmonat, rule: neu}
+      {from: erster entscheidender neuer Rohmonat - bzw. ohne undecided der
+       Monat nach dem letzten alten -, rule: neu}
+    Regel eines Blocks = die spezifischste belegte (Variante statt Familie).
     Rueckgabe: (Eintraege, Begruendung oder None).
     """
     blocks = an["blocks"]
@@ -699,7 +857,7 @@ def propose_schedule(an: dict, first_from: tuple[int, int], rules: dict) -> tupl
     def note(b):
         return f"belegt {ymstr(b['first'])}..{ymstr(b['last'])} ({len(b['months'])} entscheidende Rohmonate)"
     old = blocks[0]
-    sched = [{"from": ymstr(min(first_from, old["first"])), "rule": old["rule"], "note": note(old)}]
+    sched = [_entry(ymstr(min(first_from, old["first"])), old["allowed"], note(old))]
     if len(blocks) == 1:
         return sched, None
     new = blocks[1]
@@ -707,39 +865,40 @@ def propose_schedule(an: dict, first_from: tuple[int, int], rules: dict) -> tupl
     if not just["equivalent"]:
         return [], just
     if just["undecided"]:
-        sched.append({"from": just["undecided"][0], "rule": UNDECIDED,
-                      "candidates": [old["rule"], new["rule"]],
+        cands = sorted(old["allowed"]) + sorted(new["allowed"] - old["allowed"])
+        sched.append({"from": just["undecided"][0], "rule": UNDECIDED, "candidates": cands,
                       "note": "offen (Fenster ohne Entscheidung): " + ", ".join(an["undecided_months"])})
-    sched.append({"from": ymstr(new["first"]), "rule": new["rule"], "note": note(new)})
+    sched.append(_entry(just["new_from"], new["allowed"], note(new)))
     return sched, just
 
 
 # ------------------------------------------------- umstellungsperioden ---
 def symbol_period(rows: list[dict]) -> dict:
-    """Anzeige: EIN Symbol in EINER Umstellungsperiode. status "rule" (eine
-    Regel entscheidend), "split" (Monate mit verschiedenen Gewinnern, z.B. 10
-    ny_local, 11 berlin_minus_6 - ob das ein gueltiger Wechsel ist, entscheidet
-    die Wechselanalyse ueber die Rohmonate) oder "open"."""
+    """Anzeige: EIN Symbol in EINER Umstellungsperiode. status "rule" (die
+    entscheidenden Monate vertragen sich: Schnitt der zugelassenen Regeln),
+    "split" (Monate mit unvertraeglichen Gewinnern, z.B. 10 ny_local, 11
+    berlin_minus_6 - ob das ein gueltiger Wechsel ist, entscheidet die
+    Wechselanalyse ueber die Rohmonate) oder "open"."""
     rows = sorted(rows, key=lambda r: r["ym"])
-    winners = {r["month"]: r["winner"] for r in rows if r["decisive"]}
+    dec = [r for r in rows if r["decisive"]]
     dropped = {}
-    for r in rows:
-        if r["decisive"]:
-            n = (r["results"].get(r["winner"]) or {}).get("dropped_weekend_ticks") or 0
-            if n:
-                dropped[r["month"]] = int(n)
+    for r in dec:
+        n = sum((r["results"].get(x) or {}).get("dropped_weekend_ticks") or 0
+                for x in allowed_of(r))
+        if n:
+            dropped[r["month"]] = int(n)
     out = {"months": {r["month"]: (r["winner"] if r["decisive"] else None) for r in rows},
-           "decisive_months": sorted(winners), "dropped_weekend_ticks": dropped,
+           "decisive_months": [r["month"] for r in dec], "dropped_weekend_ticks": dropped,
            "notes": {r["month"]: _month_note(r) for r in rows if not r["decisive"]}}
-    distinct = sorted(set(winners.values()))
+    common = frozenset.intersection(*[allowed_of(r) for r in dec]) if dec else frozenset()
     drop_txt = (" [" + ", ".join(f"{m[-2:]}: {n} Wochenend-Ticks verworfen"
                                  for m, n in sorted(dropped.items())) + "]") if dropped else ""
-    if len(distinct) > 1:
+    if dec and not common:
         out.update(status="split", rule=None, cell=" -> ".join(
-            f"{m[-2:]}: {w}" for m, w in sorted(winners.items())) + drop_txt)
-    elif distinct:
-        out.update(status="rule", rule=distinct[0],
-                   cell=f"{distinct[0]} ({'+'.join(m[-2:] for m in sorted(winners))})" + drop_txt)
+            f"{r['month'][-2:]}: {r['winner']}" for r in dec) + drop_txt)
+    elif dec:
+        out.update(status="rule", rule=label(common),
+                   cell=f"{label(common)} ({'+'.join(r['month'][-2:] for r in dec)})" + drop_txt)
     else:
         out.update(status="open", rule=None, cell="offen (" + ", ".join(
             f"{m[-2:]}: {t}" for m, t in sorted(out["notes"].items())) + ")")
@@ -749,8 +908,9 @@ def symbol_period(rows: list[dict]) -> dict:
 def build_periods(rows: list[dict], symbols, months: list[dict] | None = None) -> list[dict]:
     """Umstellungsperioden (chronologisch) fuer die Evidenztabelle: Zelle je
     Symbol und Gesamt aus den Rohmonats-Urteilen (months, sonst neu gebaut):
-    "confirmed" (eine Regel), "split" (Wechsel innerhalb der Periode, z.B. an
-    der Grenze 10/11), "conflict" (Symbole uneinig im selben Rohmonat), "open"."""
+    "confirmed" (eine Regel/Familie), "split" (Wechsel innerhalb der Periode,
+    z.B. an der Grenze 10/11), "conflict" (Symbole uneinig im selben
+    Rohmonat), "open"."""
     months = months if months is not None else build_months(rows, symbols)
     mv = {m["ym"]: m for m in months}
     by_key: dict[tuple[int, int], dict[str, list]] = {}
@@ -766,14 +926,16 @@ def build_periods(rows: list[dict], symbols, months: list[dict] | None = None) -
              "symbols": per, "rule": None}
         conf = [v for v in vs if v["status"] == "conflict"]
         dec = [v for v in vs if v["status"] == "decisive"]
+        common = frozenset.intersection(*[frozenset(v["allowed"]) for v in dec]) if dec else None
         if conf:
             p.update(status="conflict", text="; ".join(f"{v['month'][-2:]}: {v['text']}" for v in conf))
-        elif len({v["rule"] for v in dec}) > 1:
+        elif dec and not common:
             p.update(status="split", text="Wechsel: " + " -> ".join(
                 f"{v['month'][-2:]} {v['rule']}" for v in dec))
         elif dec:
             syms = [s for s in symbols if any(s in v["support"] for v in dec)]
-            p.update(status="confirmed", rule=dec[0]["rule"], text=f"{dec[0]['rule']} ({', '.join(syms)})")
+            p.update(status="confirmed", rule=label(common),
+                     text=f"{label(common)} ({', '.join(syms)})")
         else:
             p.update(status="open", text="offen")
         out.append(p)
@@ -899,8 +1061,9 @@ def _conf_text(r: dict) -> str:
 def format_table(sym: str, rows: list[dict], rule_names: list[str]) -> str:
     cells = [[_cell(r["results"].get(n)) if r["evaluated"] else "-" for n in rule_names] for r in rows]
     w = [max([len(n) + 2] + [len(c[i]) + 2 for c in cells] + [10]) for i, n in enumerate(rule_names)]
+    wc = max([16] + [len(_conf_text(r)) + 2 for r in rows])
     head = f"{'Rohmonat':<9} {'Art':<4}" + "".join(f"{n:<{w[i]}}" for i, n in enumerate(rule_names)) + \
-        f"{'konfiguriert':<16}Ergebnis"
+        f"{'konfiguriert':<{wc}}Ergebnis"
     lines = [f"{sym} (Tick-Rohmonate; Zelle = Status + Median-Abweichung in h; "
              "Art T = Umstellung, K = Kontrolle; konfiguriert offen = undecided)", head, "-" * len(head)]
     for r, cs in zip(rows, cells):
@@ -911,7 +1074,7 @@ def format_table(sym: str, rows: list[dict], rule_names: list[str]) -> str:
             text += "  <-- konfigurierte Regel faellt durch"
         lines.append(f"{ymstr(r['ym']):<9} {'K' if r['kind'] == 'control' else 'T':<4}"
                      + "".join(f"{c:<{w[i]}}" for i, c in enumerate(cs))
-                     + f"{_conf_text(r):<16}{text}")
+                     + f"{_conf_text(r):<{wc}}{text}")
     rev = reversal_lines(rows)
     if rev:
         lines.append("Grosse Ruecksprunge in der Dateireihenfolge (roh, Status nach Verwerfen "
@@ -952,6 +1115,76 @@ def reversal_lines(rows: list[dict]) -> list[str]:
     return out
 
 
+NIGHT_KIND = {"spring": "Maerz", "fall": "Oktober"}
+NIGHT_OK_TEXT = {"spring": "Maerz-Sprung bestaetigt", "fall": "Oktober-Rueckfall bestaetigt"}
+
+
+def _night_ticks(x: dict) -> str:
+    if x.get("kind") == "fall":
+        rev = x.get("reversal_found")
+        return (f"Rueckfall {'ja' if rev else 'nein' if rev is not None else '?'}, "
+                f"{x.get('ticks_in_fold', '?')} Ticks in der Faltung")
+    return f"{x.get('ticks_in_gap', '?')} Ticks in der Luecke"
+
+
+def night_rows(rows: list[dict], rules: set | None = None) -> list[dict]:
+    """Umstellungsnaechte aus den Berichten (je Rohmonat, Symbol, Regel; nur die
+    eigenen Umstellungen der Regel, rule_transition): Datum, erwartetes Muster,
+    beobachtet letzter/erster Tick roh, Rueckfall bzw. Ticks in Faltung/Luecke,
+    Status. rules: nur diese Regeln (Default alle)."""
+    out = []
+    for r in rows:
+        if not r["evaluated"]:
+            continue
+        for name, res in r["results"].items():
+            if rules is not None and name not in rules:
+                continue
+            for x in res.get("transition_nights") or ():
+                if not x.get("rule_transition", True):
+                    continue
+                out.append({"year": int(str(x.get("date") or r["month"])[:4]), "symbol": r["symbol"],
+                            "month": r["month"], "rule": name, "kind": x.get("kind"),
+                            "date": x.get("date"), "expected": x.get("expected"),
+                            "last_before_raw": x.get("last_before_raw"),
+                            "first_after_raw": x.get("first_after_raw"),
+                            "reversal_found": x.get("reversal_found"),
+                            "ticks_in_fold": x.get("ticks_in_fold"),
+                            "ticks_in_gap": x.get("ticks_in_gap"), "status": x.get("status"),
+                            "ticks": _night_ticks(x)})
+    # stabil: innerhalb von Jahr/Regel/Nacht bleibt die Symbolreihenfolge des Plans
+    return sorted(out, key=lambda x: (x["year"], x["rule"], x["kind"] != "spring"))
+
+
+def night_summary(nights: list[dict]) -> list[str]:
+    """Je Jahr und Regel: "Maerz-Sprung bestaetigt / Oktober-Rueckfall bestaetigt /
+    keine Daten / abweichend" (abweichend, sobald ein Symbol unerwartet ist)."""
+    out = []
+    keys = sorted({(x["year"], x["rule"]) for x in nights})
+    for y, rule in keys:
+        parts = []
+        for kind in ("spring", "fall"):
+            xs = [x for x in nights if (x["year"], x["rule"], x["kind"]) == (y, rule, kind)]
+            bad = [x["symbol"] for x in xs if x["status"] == "unexpected"]
+            ok = [x["symbol"] for x in xs if x["status"] == "ok"]
+            if bad:
+                parts.append(f"{NIGHT_KIND[kind]} abweichend ({', '.join(bad)})")
+            elif ok:
+                parts.append(f"{NIGHT_OK_TEXT[kind]} ({', '.join(ok)})")
+            else:
+                parts.append(f"{NIGHT_KIND[kind]}: keine Daten")
+        out.append(f"{y} {rule}: " + "; ".join(parts))
+    return out
+
+
+def night_table(nights: list[dict]) -> tuple[list[str], list[list[str]]]:
+    head = ["Jahr", "Symbol", "Nacht", "Regel", "EU-Sonntag", "erwartet", "letzter vor (roh)",
+            "erster nach (roh)", "Rueckfall/Ticks", "Status"]
+    return head, [[str(x["year"]), x["symbol"], NIGHT_KIND.get(x["kind"], str(x["kind"])), x["rule"],
+                   str(x["date"]), str(x["expected"] or "-"), str(x["last_before_raw"] or "-"),
+                   str(x["first_after_raw"] or "-"), x["ticks"], str(x["status"])]
+                  for x in nights]
+
+
 def render_markdown(res: dict) -> str:
     """Survey-Ergebnis (JSON von survey()) als Markdown fuer die Doku."""
     syms = res["symbols"]
@@ -966,6 +1199,20 @@ def render_markdown(res: dict) -> str:
             "entscheidenden Rohmonate); offen = kein entscheidender Monat (Grund je Monat); "
             "KONFLIKT = Monate oder Symbole widersprechen sich.", ""]
     out += md_table(res["evidence_table"]["head"], res["evidence_table"]["rows"]) + [""]
+    if res.get("exclusions"):
+        out += ["## Ausgeschlossene Kandidaten", "",
+                "In einem Kontrollmonat desselben Jahres durchgefallen; zaehlen in den "
+                "Umstellungsmonaten des Jahres nicht mit.", ""]
+        out += md_table(["Jahr", "Regel", "Kontrollmonat: Abweichung"],
+                        [[y, n, why] for y, ex in res["exclusions"].items() for n, why in ex.items()])
+        out += [""]
+    if res.get("transition_nights"):
+        out += ["## Umstellungsnaechte", "",
+                "EU-Umstellungssonntage je Jahr und Symbol: erwartetes Muster der Regel, "
+                "beobachteter letzter/erster Tick (roh), Rueckfall bzw. Ticks in Faltung/Luecke.", ""]
+        out += md_table(*night_table(res["transition_nights"])) + [""]
+        out += ["Zusammenfassung je Jahr:", ""] + \
+            [f"- {x}" for x in res["transition_nights_summary"]] + [""]
     out += ["## Wechselanalyse", ""] + [f"- {x}" for x in res["analysis_lines"]] + [""]
     out += ["## Fahrplan-Vorschlag", ""]
     if res["schedule"]:
@@ -1086,24 +1333,41 @@ def survey(symbols=SYMBOLS, years=DEFAULT_YEARS, months=DEFAULT_MONTHS,
                 r["state"], r["text"] = "not_cached", "nicht im Cache"
                 continue
             r["evaluated"] = True
-            r.update(classify(r["results"], r["kind"], dst_rules(sel, r["ym"][0])))
-            conf = r["configured"]
-            if conf is None or conf == UNDECIDED:
-                # "undecided" im Fahrplan: offen, nie Widerspruch oder Fehler
-                r["configured_result"] = None
-                continue
-            if r["decisive"] and r["winner"] != conf:
-                r["contradiction"] = True
-            # konfigurierte Regel selbst durchgefallen (auch ohne/mit mehreren Gewinnern)
-            if conf not in r["results"] and cfg is not None and conf in cfg.rules:
-                r["configured_result"] = evaluate(data_root, r["symbol"], r["ym"],
-                                                  {conf: cfg.rules[conf]})[conf]
-            else:
-                r["configured_result"] = r["results"].get(conf)
-            if (r["configured_result"] or {}).get("status") == "failed":
-                r["configured_failed"] = True
+            r["control_like"] = control_like(r["ym"], r["kind"], sel)
         elif "text" not in r:
             r["text"] = texts.get(r["state"], f"nicht geladen ({r['state']})")
+    # Kandidaten, die in einem Kontrollmonat desselben Jahres durchfallen, zaehlen in
+    # den Umstellungsmonaten nicht mit (z.B. fixed_est: Juli -4 h statt -5 h)
+    exclusions = year_exclusions(rows)
+    families = rule_families(sel)
+    for r in rows:
+        if not r["evaluated"]:
+            continue
+        excl = None if r["control_like"] else exclusions.get(r["ym"][0])
+        r.update(classify(r["results"], r["kind"], dst_rules(sel, r["ym"][0]), excl, families))
+        conf = r["configured"]
+        if conf is None or conf == UNDECIDED:
+            # "undecided" im Fahrplan: offen, nie Widerspruch oder Fehler
+            r["configured_result"] = None
+            continue
+        if r["decisive"] and conf not in r["allowed"]:
+            r["contradiction"] = True
+        # konfigurierte Regel selbst durchgefallen (auch ohne/mit mehreren Gewinnern)
+        if conf not in r["results"] and cfg is not None and conf in cfg.rules:
+            r["configured_result"] = evaluate(data_root, r["symbol"], r["ym"],
+                                              {conf: cfg.rules[conf]})[conf]
+        else:
+            r["configured_result"] = r["results"].get(conf)
+        cres = r["configured_result"] or {}
+        if cres.get("status") == "failed":
+            r["configured_failed"] = True
+        elif nights_verdict(cres) == "unexpected":
+            # unerwartete Umstellungsnacht unter der konfigurierten Regel = Fehler (Exit 4)
+            bad = [x for x in cres.get("transition_nights") or () if x.get("status") == "unexpected"]
+            r["configured_failed"] = True
+            r["configured_result"] = dict(cres, reason="unerwartete Umstellungsnacht: " + "; ".join(
+                f"{x.get('date')} {x.get('kind')}: {x.get('last_before_raw')} -> "
+                f"{x.get('first_after_raw')}" for x in bad))
     incomplete = [r for r in rows if r["state"] not in INCOMPLETE_OK]
     contradictions = [r for r in rows if r.get("contradiction")]
     configured_failed = [r for r in rows if r.get("configured_failed")]
@@ -1112,7 +1376,7 @@ def survey(symbols=SYMBOLS, years=DEFAULT_YEARS, months=DEFAULT_MONTHS,
     month_v = build_months(rows, symbols)
     an = analyze_switches(month_v, all_rules)
     periods_ = build_periods(rows, symbols, month_v)
-    _, month_conflicts = decisive_by_month(rows)
+    month_conflicts = [f"{c['month']}: {c['text']}" for c in an["conflicts"]]
     # erster Eintrag ab dem Beginn des aktuellen Fahrplans (deckt alles davor ab)
     first_from = cfg.schedule[MODE][0][0] if cfg is not None else \
         ym_add(min(fh.HISTORY_START[s] for s in symbols), -1)
@@ -1146,6 +1410,27 @@ def survey(symbols=SYMBOLS, years=DEFAULT_YEARS, months=DEFAULT_MONTHS,
     head, erows = evidence_rows(periods_, symbols)
     print("\nUmstellungsperioden (Periode x Symbol):", file=out)
     print("\n".join(text_table(head, erows, "  ")), file=out)
+    if exclusions:
+        print("\nAusgeschlossen fuer die Umstellungsmonate (in einem Kontrollmonat desselben "
+              "Jahres durchgefallen):", file=out)
+        for y, ex in sorted(exclusions.items()):
+            print(f"  {y}: " + "; ".join(f"{n} ({why})" for n, why in ex.items()), file=out)
+    fams = sorted({f for f in families.values() if len(f) > 1}, key=sorted)
+    if fams:
+        print("\nRegelfamilien (unterscheiden sich nur in den Umstellungsnaechten): "
+              + "; ".join(label(f) for f in fams), file=out)
+    # Naechte-Tabelle: Varianten einer Familie (die Naechte an den EU-Sonntagen entscheiden
+    # zwischen ihnen); ohne Familien die konfigurierten Regeln
+    night_rules = {n for f in fams for n in f} or {r["configured"] for r in rows if r["configured"]}
+    nights = night_rows(rows, night_rules)
+    n_summary = night_summary(nights)
+    if nights:
+        print("\nUmstellungsnaechte (EU-Sonntage; je Jahr, Symbol, Regel mit Nachtbericht):",
+              file=out)
+        print("\n".join(text_table(*night_table(nights), "  ")), file=out)
+        print("Zusammenfassung je Jahr:", file=out)
+        for line in n_summary:
+            print(f"  {line}", file=out)
     a_lines = analysis_lines(an)
     print("\nWechselanalyse:", file=out)
     for line in a_lines:
@@ -1210,6 +1495,9 @@ def survey(symbols=SYMBOLS, years=DEFAULT_YEARS, months=DEFAULT_MONTHS,
             "leading_open": an["leading_open"], "trailing_open": an["trailing_open"],
             "explanation": an["explanation"]},
         "analysis_lines": a_lines,
+        "exclusions": {str(y): v for y, v in exclusions.items()},
+        "families": [sorted(f) for f in fams],
+        "transition_nights": nights, "transition_nights_summary": n_summary,
         "schedule": [{k: v for k, v in e.items() if k != "note"} for e in sched],
         "schedule_details": sched, "schedule_yaml": yaml_txt, "no_schedule_reason": no_reason,
         "justification": just,
@@ -1238,7 +1526,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--symbols", nargs="+", type=str.upper, choices=SYMBOLS, default=list(SYMBOLS))
     p.add_argument("--preset", choices=PRESETS,
                    help=f"full: Jahre ab Historienbeginn bis {PRESET_LAST_YEAR}, Monate "
-                        f"{' '.join(map(str, PRESET_MONTHS))}, keine Kontrollmonate "
+                        f"{' '.join(map(str, PRESET_MONTHS))}, Kontrollmonate "
+                        f"{' '.join(map(str, PRESET_CONTROLS))} "
                         "(--years/--months/--controls ueberschreiben)")
     p.add_argument("--years", nargs="+", type=int, default=None,
                    help=f"default {' '.join(map(str, DEFAULT_YEARS))} (ohne --preset/--periods)")

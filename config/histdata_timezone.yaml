@@ -1,9 +1,21 @@
 # Stempelungsregeln der HistData-Rohzeitstempel (scripts/fetch_histdata.py).
 #
-# Regel: Rohzeit (Wanduhr-Ziffern der Datei) = Ortszeit in `zone` + shift_h Stunden.
+# Regel (TzRule): Rohzeit (Wanduhr-Ziffern der Datei) - UTC = Offset(zone) + shift_h.
+#   kind zone_shift (Default): Offset der Zone im UTC-Zeitpunkt selbst
+#        (Rohzeit = Ortszeit in `zone` + shift_h).
+#   kind dst_daily_utc: Offset der Zone um 00:00 UTC des UTC-Kalendertags des
+#        Zeitpunkts; eine Umstellung wirkt also erst ab der naechsten UTC-Mitternacht.
 # Eingebaut (nicht neu definieren):
-#   berlin_minus_6  Europe/Berlin - 6 h: UTC-5 im EU-Winter, UTC-4 in der EU-
-#                   Sommerzeit; Wechsel letzter So Maerz/Oktober 01:00 UTC.
+#   berlin_minus_6_utc_midnight  Europe/Berlin - 6 h, kind dst_daily_utc: UTC-5 im
+#        EU-Winter, UTC-4 in der EU-Sommerzeit; Wechsel Mo 00:00 UTC nach dem
+#        letzten So im Maerz/Oktober (nicht So 01:00 UTC). Folge in Rohzeit:
+#        Herbst  roh So 19:59:59 (23:59:59 UTC) -> roh So 19:00:00 (Mo 00:00 UTC):
+#                die Rohstunde So 19:00-19:59:59.999 kommt ZWEIMAL vor (Markt
+#                offen); aufgeloest nach Dateireihenfolge am Ruecksprung
+#                (davor -4 h, ab ihm -5 h); ohne Ruecksprung -> Quarantaene.
+#        Fruehjahr roh So 18:59:59 (23:59:59 UTC) -> roh So 20:00:00 (Mo 00:00 UTC):
+#                roh So 19:00-19:59:59.999 existiert NICHT (Tick dort -> Quarantaene).
+#   berlin_minus_6  Europe/Berlin - 6 h (zone_shift), Wechsel So 01:00 UTC (v5/v6).
 #   ny_local        America/New_York: UTC-5/UTC-4, Wechsel 2. So Maerz 07:00 UTC
 #                   und 1. So November 06:00 UTC.
 #   fixed_est       Etc/GMT+5 = fest UTC-5 (HistData-Angabe; fuer M1 NICHT verifiziert)
@@ -12,77 +24,62 @@
 #                   dasselbe ergeben; sonst wird der UTC-Monat nicht geschrieben
 #                   (Laufreport months_rule_undecided, Exit 4, kein Marker).
 #
-# VORLAEUFIGER Tick-Fahrplan nach dem Survey des Owners (Homelab,
-# scripts/histdata_tz_survey.py, 124 Requests). Belege je Jahr/Zeitraum:
+# Tick-Fahrplan nach dem erweiterten Survey des Owners (Homelab,
+# scripts/histdata_tz_survey.py, 2009-2025, XAUUSD und XAGUSD):
 #
-#   Jahr  Zeitraum   XAUUSD           XAGUSD           Ergebnis
-#   2010  Maerz      ny_local         ny_local         ny_local eindeutig
-#   2010  Okt/Nov    ny_local         ny_local         ny_local eindeutig
-#   2012  Maerz      ny_local         ny_local         ny_local eindeutig
-#   2012  Okt/Nov    ny_local         ny_local         ny_local eindeutig
-#   2015  Maerz      ny_local         ny_local         ny_local eindeutig
-#   2015  Okt/Nov    ny_local         ny_local         ny_local eindeutig
-#   2018  Maerz      ny_local         ny_local         ny_local eindeutig
-#   2018  Okt/Nov    ny_local         ny_local         ny_local eindeutig
-#   2021  Maerz      (beide Symbole, gemeinsam    berlin_minus_6 eindeutig (ny_local faellt durch)
-#                     gemeldet)
-#   2021  Okt        (beide Symbole, gemeinsam    keine Regel passt - berlin_minus_6 bis auf
-#                     gemeldet)                    EINEN 60-min-Ruecksprung (roh Sa 21:00 ->
-#                                                  20:00, verirrte Ticks im geschlossenen Markt)
-#   2024  Maerz      (beide Symbole, gemeinsam    berlin_minus_6 eindeutig (ny_local faellt durch)
-#                     gemeldet)
-#   2024  Okt        (beide Symbole, gemeinsam    wie 2021-10 (ein Ruecksprung Sa-Nacht)
-#                     gemeldet)
-#   (2010-2018: je Symbol gemeldet; 2021/2024: Ergebnis je Monat fuer beide
-#   Symbole gemeinsam gemeldet, nicht getrennt)
-#   nicht untersucht: 2009, 2011, 2013, 2014, 2016, 2017, 2019, 2020, 2022, 2023, 2025
+#   Zeitraum                       Ergebnis
+#   2010, 2012, 2015, 2018         ny_local eindeutig (Maerz und Okt/Nov, beide Symbole)
+#   2019-03                        ny_local faellt durch; nur berlin_minus_6 und fixed_est
+#                                  bestehen, fixed_est ist durch die Juli-Kontrollmonate
+#                                  (-4 h) ausgeschlossen -> Berliner Familie
+#   2019-10 und jeder Oktober seit Ruecksprung in Dateireihenfolge am EU-Umstellungs-
+#                                  SONNTAG roh 19:59:59 -> 19:00:00 (2k-28k echte Ticks je
+#                                  Monat, Markt offen) - der Offset wechselt erst Mo
+#                                  00:00 UTC -> berlin_minus_6_utc_midnight
+#   2021-03, 2024-03               Berliner Familie (ny_local faellt durch); der erwartete
+#                                  Vorwaertssprung roh So 18:59:59 -> 20:00:00 wird vom
+#                                  Survey (transition_nights) noch an den Daten bestaetigt
+#   (Die fruehere Deutung "verirrte Wochenend-Ticks roh Sa 21:00 -> 20:00" war FALSCH.)
 #
-# Der Wechsel ny_local -> berlin_minus_6 liegt also nach den Okt/Nov-Wochen 2018
-# und vor 2021-03: 2018-12 .. 2021-02 = "undecided" (bis ein erweiterter Survey
-# ihn findet). Ruecksprung-Monate wie 2021-10/2024-10: Quarantaene, nach Pruefung
-# freigeben mit  fetch_histdata.py --symbol XAUUSD --accept-weekend-ticks 2024-10
-# (verwirft nur Ticks im geschlossenen Wochenendmarkt, WEEKEND_CLOSED_RAW).
+# Warum der Wechsel ab Rohmonat 2018-12 gesetzt werden kann: ny_local und
+# berlin_minus_6_utc_midnight unterscheiden sich nur in zwei Fenstern je Jahr
+# (ny_local UTC-4, die Tagesregel UTC-5): Maerz vom US-Beginn (2. So 07:00 UTC)
+# bis Mo 00:00 UTC nach dem EU-Beginn, Okt/Nov von Mo 00:00 UTC nach dem EU-Ende
+# bis zum US-Ende (1. So Nov 06:00 UTC). Ausserhalb sind beide im Winter UTC-5 und
+# im Sommer UTC-4, die Abbildung roh -> UTC ist gleich. Zwischen dem Ende des
+# Fensters 2018 (2018-11-04 06:00 UTC, ny_local belegt) und dem Beginn des
+# Fensters 2019 (2019-03-10 07:00 UTC, Berliner Familie belegt) liegt KEIN Fenster:
+# jede Rohmonatsgrenze 2018-12 .. 2019-03 ist gleichwertig. Fenster (UTC), mit
+# zoneinfo auf der Viertelstunde nachgerechnet (keine weiteren Abweichungen):
 #
-# Warum Monate ohne Umstellungswoche unter beiden Regeln identisch sind:
-# ausserhalb der folgenden Fenster liefern ny_local UND berlin_minus_6 im Winter
-# UTC-5 und im Sommer UTC-4 - die Abbildung roh -> UTC ist dort gleich. Nur in
-# den Fenstern rechnet ny_local mit UTC-4, berlin_minus_6 mit UTC-5 (1 h
-# verschieden). Fenster (UTC; Maerz = US-Beginn 2. So 07:00 bis EU-Beginn
-# letzter So 01:00; Okt/Nov = EU-Ende letzter So Okt 01:00 bis US-Ende 1. So Nov
-# 06:00), mit zoneinfo auf der Viertelstunde nachgerechnet (keine weiteren
-# Abweichungen im Jahr):
+#   Jahr  Maerz (UTC)                  Okt/Nov (UTC)
+#   2009  03-08 07:00 .. 03-30 00:00            10-26 00:00 .. 11-01 06:00
+#   2010  03-14 07:00 .. 03-29 00:00            11-01 00:00 .. 11-07 06:00
+#   2011  03-13 07:00 .. 03-28 00:00            10-31 00:00 .. 11-06 06:00
+#   2012  03-11 07:00 .. 03-26 00:00            10-29 00:00 .. 11-04 06:00
+#   2013  03-10 07:00 .. 04-01 00:00            10-28 00:00 .. 11-03 06:00
+#   2014  03-09 07:00 .. 03-31 00:00            10-27 00:00 .. 11-02 06:00
+#   2015  03-08 07:00 .. 03-30 00:00            10-26 00:00 .. 11-01 06:00
+#   2016  03-13 07:00 .. 03-28 00:00            10-31 00:00 .. 11-06 06:00
+#   2017  03-12 07:00 .. 03-27 00:00            10-30 00:00 .. 11-05 06:00
+#   2018  03-11 07:00 .. 03-26 00:00            10-29 00:00 .. 11-04 06:00   <- letzte ny_local
+#   2019  03-10 07:00 .. 04-01 00:00            10-28 00:00 .. 11-03 06:00   <- erste berlin
+#   2020  03-08 07:00 .. 03-30 00:00            10-26 00:00 .. 11-01 06:00
+#   2021  03-14 07:00 .. 03-29 00:00            11-01 00:00 .. 11-07 06:00
+#   2022  03-13 07:00 .. 03-28 00:00            10-31 00:00 .. 11-06 06:00
+#   2023  03-12 07:00 .. 03-27 00:00            10-30 00:00 .. 11-05 06:00
+#   2024  03-10 07:00 .. 04-01 00:00            10-28 00:00 .. 11-03 06:00
+#   2025  03-09 07:00 .. 03-31 00:00            10-27 00:00 .. 11-02 06:00
 #
-#   Jahr  Maerz (UTC)                       Okt/Nov (UTC)
-#   2009  03-08 07:00 .. 03-29 01:00  (20d18h)   10-25 01:00 .. 11-01 06:00  (7d05h)
-#   2010  03-14 07:00 .. 03-28 01:00  (13d18h)   10-31 01:00 .. 11-07 06:00  (7d05h)
-#   2011  03-13 07:00 .. 03-27 01:00  (13d18h)   10-30 01:00 .. 11-06 06:00  (7d05h)
-#   2012  03-11 07:00 .. 03-25 01:00  (13d18h)   10-28 01:00 .. 11-04 06:00  (7d05h)
-#   2013  03-10 07:00 .. 03-31 01:00  (20d18h)   10-27 01:00 .. 11-03 06:00  (7d05h)
-#   2014  03-09 07:00 .. 03-30 01:00  (20d18h)   10-26 01:00 .. 11-02 06:00  (7d05h)
-#   2015  03-08 07:00 .. 03-29 01:00  (20d18h)   10-25 01:00 .. 11-01 06:00  (7d05h)
-#   2016  03-13 07:00 .. 03-27 01:00  (13d18h)   10-30 01:00 .. 11-06 06:00  (7d05h)
-#   2017  03-12 07:00 .. 03-26 01:00  (13d18h)   10-29 01:00 .. 11-05 06:00  (7d05h)
-#   2018  03-11 07:00 .. 03-25 01:00  (13d18h)   10-28 01:00 .. 11-04 06:00  (7d05h)
-#   2019  03-10 07:00 .. 03-31 01:00  (20d18h)   10-27 01:00 .. 11-03 06:00  (7d05h)
-#   2020  03-08 07:00 .. 03-29 01:00  (20d18h)   10-25 01:00 .. 11-01 06:00  (7d05h)
-#   2021  03-14 07:00 .. 03-28 01:00  (13d18h)   10-31 01:00 .. 11-07 06:00  (7d05h)
-#   2022  03-13 07:00 .. 03-27 01:00  (13d18h)   10-30 01:00 .. 11-06 06:00  (7d05h)
-#   2023  03-12 07:00 .. 03-26 01:00  (13d18h)   10-29 01:00 .. 11-05 06:00  (7d05h)
-#   2024  03-10 07:00 .. 03-31 01:00  (20d18h)   10-27 01:00 .. 11-03 06:00  (7d05h)
-#   2025  03-09 07:00 .. 03-30 01:00  (20d18h)   10-26 01:00 .. 11-02 06:00  (7d05h)
-#
-# Folge: Zwischen dem letzten ny_local- und dem ersten berlin_minus_6-
-# Umstellungszeitraum ist der Wechsel an jeder Rohmonatsgrenze AUSSERHALB
-# eines Fensters gleichwertig - die Monate dazwischen sind unter beiden Regeln
-# gleich. NICHT gleichwertig ist die Grenze zwischen Rohmonat 10 und 11: das
-# Okt/Nov-Fenster ueberspannt beide (Ende Oktober bis Anfang November), ein
-# Wechsel dort teilte das Fenster. (Das Maerz-Fenster liegt ganz im Rohmaerz.)
-# Nur Monate mit Ticks in einem Fenster (Maerz, Oktober, November) koennen den
-# Wechsel eingrenzen.
+# Ein Wechsel an einer Rohmonatsgrenze INNERHALB eines Fensters (zwischen
+# Rohmonat 10 und 11; Maerz-Fenster liegen ganz im Rohmaerz, auch wenn sie bis
+# 01.04. 00:00 UTC = roh 31.03. 20:00 reichen) waere nicht gleichwertig.
 #
 # Eigene Regeln (optional), Namen eindeutig, nur a-z 0-9 _:
 #   rules:
 #     - {name: my_rule, zone: Europe/London, shift_h: -5}
+#     - {name: my_daily, zone: Europe/London, shift_h: -5, kind: dst_daily_utc}
+#   kind: zone_shift (Default) oder dst_daily_utc; anderes -> Abbruch beim Laden
 #
 # schedule: je Modus (tick, m1) die Regel ab einem ROH-Monat ("YYYY-MM",
 # aufsteigend, keine doppelten Monate). Ein Wechsel gilt nur an
@@ -104,7 +101,6 @@ rules: []
 schedule:
   tick:
     - {from: "2000-01", rule: ny_local}
-    - {from: "2018-12", rule: undecided, candidates: [ny_local, berlin_minus_6]}
-    - {from: "2021-03", rule: berlin_minus_6}
+    - {from: "2018-12", rule: berlin_minus_6_utc_midnight}
   m1:
     - {from: "2000-01", rule: fixed_est}     # M1 unverifiziert: --mode m1 --verify-month 2024-07

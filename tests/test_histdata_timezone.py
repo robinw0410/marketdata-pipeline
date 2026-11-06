@@ -45,11 +45,13 @@ schedule:
 """
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def berlin_schedule(tmp_path_factory, monkeypatch):
-    """Fahrplan wie v5 (berlin_minus_6 fuer ALLE Rohmonate): fuer Logiktests, die
-    ueber viele Jahre mit einer einzigen Regel rechnen (der vorlaeufige v6-
-    Fahrplan hat ny_local bis 2018-11 und "undecided" 2018-12..2021-02)."""
+    """Fahrplan wie v5 (berlin_minus_6 fuer ALLE Rohmonate) fuer ALLE Tests dieser
+    Datei: sie pruefen die Mechanik mit einer einzigen Regel ueber viele Jahre und
+    so gestempelten Daten. Der ausgelieferte Fahrplan (v7: ny_local bis 2018-11,
+    berlin_minus_6_utc_midnight ab 2018-12) wird in test_fetch_histdata.py
+    (Fixture v7_default) geprueft."""
     p = tmp_path_factory.mktemp("cfg") / "berlin_everywhere.yaml"
     p.write_text(BERLIN_EVERYWHERE)
     monkeypatch.setenv(fh.TZ_CONFIG_ENV, str(p))
@@ -256,7 +258,7 @@ def test_rule_constants_and_error_type():
     assert tick_meta != OLD_TZ_META               # sonst erkennt der Lauf alte Dateien nicht
     assert tick_meta != _meta_value(fh.SOURCE_TZ_META["m1"])
     assert b"berlin_minus_6" in tick_meta and b"Europe/Berlin" in tick_meta
-    assert f"v{fh.TZ_CHECK_VERSION}".encode() in tick_meta and fh.TZ_CHECK_VERSION == 6
+    assert f"v{fh.TZ_CHECK_VERSION}".encode() in tick_meta and fh.TZ_CHECK_VERSION == 7
 
 
 # =========================================== 1. Anker wie beobachtet: ok ---

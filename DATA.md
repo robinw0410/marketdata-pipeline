@@ -214,10 +214,10 @@ Quelle:   histdata.com, Generic ASCII; Default Ticks je Monat (--mode tick),
           liefert im Homelab HTTP 429 je IP.
 Format:   wie Dukascopy (Parquet/zstd, gleiche Spalten und dtypes), nur
           Partition source=histdata (Ticks) bzw. source=histdata_m1 (M1)
-Zeitzone: UTC; Rohzeit Ticks laut Survey (vorlaeufiger Fahrplan, v6):
-          America/New_York (ny_local) bis 2018-11, offen ("undecided":
-          ny_local oder berlin_minus_6) 2018-12..2021-02, Europe/Berlin - 6 h
-          (berlin_minus_6) ab 2021-03; M1 fest UTC-5 laut HistData (NICHT
+Zeitzone: UTC; Rohzeit Ticks laut erweitertem Survey 2009-2025 (v7):
+          America/New_York (ny_local) bis 2018-11, ab 2018-12
+          berlin_minus_6_utc_midnight (Europe/Berlin - 6 h, Sommerzeit-
+          Wechsel erst Mo 00:00 UTC); M1 fest UTC-5 laut HistData (NICHT
           verifiziert). Regeln/Fahrplan: config/histdata_timezone.yaml. JE
           ROHMONAT im Code geprueft (s. u.)
 Recherche, Quellen, Offenes: docs/histdata_research.md
@@ -247,7 +247,9 @@ Store (SRC = histdata im Tickmodus, histdata_m1 im M1-Modus):
                                    geprueft: besteht -> Marker
                                    weg, sonst accepted false mit "note"; Tick in
                                    nicht eindeutiger Ortszeit oder Ruecksprung
-                                   >= 30 min sperrt per Default; liegen ALLE
+                                   >= 30 min (ausser dem erwarteten Herbst-
+                                   Ruecksprung der Tagesregel, roh So 19:xx,
+                                   nie freigebbar) sperrt per Default; liegen ALLE
                                    betroffenen Ticks (Ruecksprung: Rohzeit in
                                    [back_to_raw, at_raw]; verbotene Stunden) im
                                    geschlossenen Wochenendmarkt (WEEKEND_CLOSED_RAW,
@@ -281,14 +283,14 @@ float64; tick_count int64; bid_volume, ask_volume float64; source = SRC).
 Parquet-Metadaten: histdata_mode = histdata_tick|histdata_m1,
 spread_available = true|false, tz_right_padding = true|false, source_timezone
 = Regel(n) der Rohmonate mit Zone/Verschiebung und TZ_CHECK_VERSION, z.B.
-"berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v6)"
-(tick) bzw. "fixed_est (Etc/GMT+5 +0 h) -> ..." (m1); im undecided-Zeitraum
-"ny_local (America/New_York +0 h) [undecided: ny_local|berlin_minus_6, hier
-identisch] -> ...". v5 hatte alle Tick-Monate unter berlin_minus_6
-geschrieben: fuer heute ny_local/undecided-Monate gilt unten "verschiebt"
-(Maerz, Oktober, November -> metals/stale/, Neubau unter ny_local bzw.
-rule_undecided) oder "dieselben UTC-Zeiten" (uebrige Monate -> neu
-gekennzeichnet). Zu Beginn JEDES Laufs
+"berlin_minus_6_utc_midnight (Europe/Berlin -6 h, Sommerzeit ab 00:00 UTC) ->
+UTC, je Rohmonat geprueft (tz_check v7)" (tick) bzw. "fixed_est (Etc/GMT+5 +0
+h) -> ..." (m1). v5/v6-Dateien (berlin_minus_6, undecided) mit unter v7
+anderen UTC-Zeiten (Umstellungssonntage im Maerz/Oktober, ny_local-Fenster
+2019-2021) gelten unten als "verschiebt" (-> metals/stale/, Neubau), die
+uebrigen als "dieselben UTC-Zeiten" (neu gekennzeichnet); unter v6 als
+undecided zurueckgehaltene Monate werden jetzt geschrieben, alte Quarantaene-
+Marker (z.B. die Oktober-Rueckspruenge) neu geprueft. Zu Beginn JEDES Laufs
 werden alle Monatsdateien des Symbols/Modus geprueft (nicht nur
 --start/--end):
   andere/aeltere Kennzeichnung, im UTC-Monat aber dieselben UTC-Zeiten
@@ -327,76 +329,81 @@ keine Quarantaene-Marker.
         als Jahres-ZIP, laufendes Jahr monatlich.
 
 Zeitzone und Monatsgrenze:
-- Stempelungsregel (TzRule: Rohzeit = Ortszeit in zone + shift_h) je
+- Stempelungsregel (TzRule: Rohzeit - UTC = Offset(zone) + shift_h) je
   ROHmonat nach Fahrplan in config/histdata_timezone.yaml (andere Datei:
-  $HISTDATA_TZ_CONFIG). Eingebaut: berlin_minus_6 (Europe/Berlin, -6),
+  $HISTDATA_TZ_CONFIG). Art (kind): zone_shift (Default; Offset im Zeitpunkt
+  selbst, Rohzeit = Ortszeit in zone + shift_h) oder dst_daily_utc (Offset
+  der Zone um 00:00 UTC des UTC-Tages: eine Umstellung wirkt erst ab der
+  naechsten UTC-Mitternacht). Eingebaut: berlin_minus_6_utc_midnight
+  (Europe/Berlin, -6, dst_daily_utc), berlin_minus_6 (Europe/Berlin, -6),
   ny_local (America/New_York, 0), fixed_est (Etc/GMT+5, 0); weitere Regeln
-  in der Datei (Name eindeutig, Zone geprueft). schedule je Modus:
+  in der Datei (Name eindeutig, Zone und kind geprueft). schedule je Modus:
   [{from: "YYYY-MM", rule: name}] aufsteigend, Wechsel nur an
-  Rohmonatsgrenzen. Unbekannte Regel/Zone, unsortiert/doppelt, fehlender
+  Rohmonatsgrenzen. Unbekannte Regel/Zone/kind, unsortiert/doppelt, fehlender
   Modus oder schedule, Fahrplan beginnt nach dem fruehesten benoetigten
   Rohmonat (Historienbeginn minus 1 Monat = 2009-02), fehlende Datei (auch
   die Default-Datei im Repo) -> Abbruch beim Laden (nie still ein Default).
   Eintrag {from: "YYYY-MM", rule: undecided, candidates: [a, b, ...]}
-  (>= 2 bekannte Regeln) = Regel noch offen (UndecidedRule).
-- VORLAEUFIGER Tick-Fahrplan (v6) nach dem Survey des Owners (Homelab,
-  XAUUSD/XAGUSD; Belegtabelle im Kommentar der YAML):
+  (>= 2 bekannte Regeln) = Regel offen (UndecidedRule; nicht im Default).
+- Tick-Fahrplan (v7) nach dem erweiterten Survey des Owners (Homelab,
+  2009-2025, XAUUSD/XAGUSD; Belegtabelle im Kommentar der YAML):
     {from: "2000-01", rule: ny_local}
-    {from: "2018-12", rule: undecided, candidates: [ny_local, berlin_minus_6]}
-    {from: "2021-03", rule: berlin_minus_6}
-  m1 fixed_est ab 2000-01. Belege: 2010, 2012, 2015, 2018 (Maerz und
-  Okt/Nov, beide Metalle) eindeutig ny_local; 2021-03 und 2024-03 eindeutig
-  berlin_minus_6; 2021-10 und 2024-10 berlin_minus_6 bis auf EINEN 60-min-
-  Ruecksprung (roh Sa 21:00 -> 20:00, verirrte Ticks im geschlossenen Markt
-  der EU-Umstellungsnacht; freigebbar, s. Quarantaene). Nicht untersucht:
-  2009, 2011, 2013, 2014, 2016, 2017, 2019, 2020, 2022, 2023, 2025.
-- Warum der Wechsel an jeder Rohmonatsgrenze dazwischen liegen kann, die
-  NICHT in einem Umstellungsfenster liegt (also nicht zwischen Rohmonat 10
-  und 11 - das Okt/Nov-Fenster ueberspannt beide; das Maerz-Fenster liegt
-  ganz im Rohmaerz): beide
-  Regeln liefern ausserhalb zweier Fenster je Jahr dieselbe Abbildung roh ->
-  UTC (UTC-5 im Winter, UTC-4 im Sommer). Nur in den Fenstern rechnet
-  ny_local UTC-4, berlin_minus_6 UTC-5: Maerz vom US-Beginn (2. So 07:00 UTC)
-  bis zum EU-Beginn (letzter So 01:00 UTC), Okt/Nov vom EU-Ende (letzter So
-  Okt 01:00 UTC) bis zum US-Ende (1. So Nov 06:00 UTC); mit zoneinfo
-  nachgerechnet (Liste 2009-2025 in config/histdata_timezone.yaml), z.B.
-  2019: 03-10 07:00 .. 03-31 01:00 und 10-27 01:00 .. 11-03 06:00 UTC;
-  2020: 03-08 07:00 .. 03-29 01:00 und 10-25 01:00 .. 11-01 06:00 UTC.
-- tick berlin_minus_6 = UTC-5 im EU-Winter, UTC-4 in der EU-Sommerzeit
-  (Wechsel letzter So Maerz/Oktober 01:00 UTC); 2024-03 bleibt von der
-  US-Umstellung (10.03.) bis Monatsende bei -5 h (Tagespause roh 15:59:59 ->
-  17:00:00), 2024-10 ab 27.10. (EU) schon -5 h. ny_local = America/New_York
-  (Wechsel 2. So Maerz / 1. So November). Die Marktzeiten bleiben New York
-  (Anker 17:00/18:00 America/New_York). m1 fixed_est = fest UTC-5
-  (HistData-Angabe, fuer M1 NICHT verifiziert; pruefen mit --mode m1
-  --verify-month 2024-07).
-- undecided: raw_to_utc_ms rechnet alle Kandidaten; identisch -> Ergebnis,
-  sonst RuleUndecided. Ein UTC-Monat, in den ein verschieden umgerechneter
-  Tick (unter irgendeinem Kandidaten) fallen kann, wird NICHT geschrieben:
-  Laufreport months_rule_undecided (auch in summary) mit raw_month,
-  raw_ranges, differing_ticks; Eintrag kind rule_undecided in "quarantined",
-  Exit 4 (3 hat Vorrang), KEIN Marker, keine Extra-Requests, jeder Lauf
-  prueft neu aus dem Cache (bis der Fahrplan entschieden ist). UTC-Monate,
-  die vom Rohmonat nur identisch umgerechnete Ticks brauchen (z.B. UTC-April
-  mit den letzten Stunden des Rohmaerz), werden geschrieben. Pruefung unter
-  dem ersten Kandidaten; hat der Rohmonat verschieden umgerechnete Ticks,
-  unter jedem Kandidaten (bestanden, wenn einer passt).
+    {from: "2018-12", rule: berlin_minus_6_utc_midnight}
+  m1 fixed_est ab 2000-01. Belege: 2010, 2012, 2015, 2018 eindeutig
+  ny_local; 2019-03 ny_local faellt durch, nur berlin_minus_6 und fixed_est
+  bestehen, fixed_est durch die Juli-Kontrollmonate (-4 h) ausgeschlossen;
+  2019-10 und jeder Oktober seither: echter Ruecksprung (2k-28k Ticks je
+  Monat) am EU-Umstellungs-SONNTAG roh 19:59:59 -> 19:00:00 = 23:59:59 UTC ->
+  Mo 00:00:00 UTC, d.h. HistData wechselt den Offset erst Mo 00:00 UTC;
+  2021-03 und 2024-03 Berliner Familie. Die fruehere Deutung (verirrte
+  Wochenend-Ticks roh Sa 21:00 -> 20:00) war FALSCH.
+- Herbst: roh So 19:00-19:59:59.999 kommt zweimal vor (Markt offen).
+  raw_to_utc_ms loest nach DATEIREIHENFOLGE auf: der erste Ruecksprung >= 30
+  min in diese Stunde trennt -4 h (davor) von -5 h (ab ihm); ohne ihn ->
+  TimezoneError (Quarantaene), nie geraten, nie verworfen. check_timezone
+  erwartet ihn (expected_reversals; kein large_reversal, nie freigebbar).
+- Fruehjahr: roh So 18:59:59 -> 20:00:00 (23:59:59 UTC -> Mo 00:00 UTC), roh
+  So 19:00-19:59:59.999 existiert nicht (Tick dort -> TimezoneError). Noch an
+  den Daten zu bestaetigen: der Survey berichtet je Umstellungsnacht.
+- transition_nights (Pruefbericht je Rohmonat): je Umstellung der Regel
+  date, kind (spring/fall), expected, window_raw, last_before_raw,
+  first_after_raw, reversal_found, ticks_in_fold bzw. ticks_in_gap, status
+  ok | no_data | unexpected (Herbst: Daten auf beiden Seiten ohne Ruecksprung
+  oder unaufgeloeste Ticks; Fruehjahr: Ticks in der fehlenden Stunde) -
+  unexpected ist ein Fehlergrund. Regeln ohne EU-Wechsel (ny_local,
+  fixed_est): zusaetzlich Beobachtungen der EU-Sonntage (rule_transition
+  false, observed, nie ein Fehler).
+- Warum der Wechsel ab Rohmonat 2018-12 gesetzt werden kann: ny_local und
+  berlin_minus_6_utc_midnight unterscheiden sich nur in zwei Fenstern je
+  Jahr (ny_local UTC-4, die Tagesregel UTC-5): Maerz vom US-Beginn (2. So
+  07:00 UTC) bis Mo 00:00 UTC nach dem EU-Beginn, Okt/Nov von Mo 00:00 UTC
+  nach dem EU-Ende bis zum US-Ende (1. So Nov 06:00 UTC). Zwischen dem Ende
+  des Fensters 2018 (2018-11-04 06:00 UTC, ny_local belegt) und dem Beginn
+  des Fensters 2019 (2019-03-10 07:00 UTC, Berliner Familie belegt) liegt
+  keines: jede Rohmonatsgrenze 2018-12 .. 2019-03 ist gleichwertig (Liste
+  2009-2025 mit zoneinfo nachgerechnet in config/histdata_timezone.yaml).
+- Marktzeiten bleiben New York (Anker 17:00/18:00 America/New_York). m1
+  fixed_est = fest UTC-5 (HistData-Angabe, fuer M1 NICHT verifiziert;
+  pruefen mit --mode m1 --verify-month 2024-07).
+- undecided (falls wieder noetig): raw_to_utc_ms rechnet alle Kandidaten;
+  identisch -> Ergebnis, sonst RuleUndecided. Ein UTC-Monat, in den ein
+  verschieden umgerechneter Tick fallen kann, wird NICHT geschrieben
+  (months_rule_undecided, Exit 4, kein Marker, jeder Lauf prueft neu).
 - Regel fuer einen Zeitraum aendern: Eintrag in schedule (z.B.
   {from: "2012-01", rule: berlin_minus_6} nach {from: "2000-01", rule:
   fixed_est}); vorher Kandidaten offline gegen den Roh-Cache abgleichen
   (scripts/histdata_tz_survey.py, nutzt evaluate_raw_month: nur Cache, kein
   Download, keine Marker). Der naechste Lauf erkennt betroffene
   Monatsdateien an source_timezone (s. o.).
-- Umrechnung raw_to_utc_ms(raw, rule): Rohziffern - shift_h als Ortszeit der
-  Regel-Zone, exakt nach UTC. Ortszeit in der Sommerzeit-Luecke oder der
-  doppelten Stunde (berlin_minus_6: roh Samstag 20:00-20:59:59.999 in den
-  Umstellungsnaechten) wird NIE geraten: TimezoneError -> Quarantaene (Exit
-  4); der Markt ist dann geschlossen.
+- Umrechnung raw_to_utc_ms(raw, rule) (raw in Dateireihenfolge): exakt nach
+  UTC. Rohzeit in einer Umstellungsluecke oder doppelten Stunde wird NIE
+  geraten (Ausnahme: die Herbststunde von dst_daily_utc mit Ruecksprung, s.
+  o.): TimezoneError -> Quarantaene (Exit 4).
 - UTC-Monat M = letzte 4 h (EU-Sommer) bzw. 5 h (EU-Winter/M1) des
   Rohmonats M-1 + Rohmonat M ohne diese Stunden an seinem Ende (aus dem
   Fahrplan berechnet). Geschrieben wird M nur, wenn beide Rohmonate erledigt
   sind (Daten, bestaetigt leer oder vor Historienbeginn).
-- Pruefung je Rohmonat (check_timezone, Pruefversion 6): je Marktluecke ein
+- Pruefung je Rohmonat (check_timezone, Pruefversion 7): je Marktluecke ein
   Schluss- und ein Oeffnungsanker: Wochenende (>= 24 h, Schluss Do/Fr,
   Oeffnung So/Mo; Fr 17:00 -> So 18:00 New York;
   andere Luecken >= 24 h sind Ausfaelle: nur Bericht "outages"),
@@ -406,8 +413,8 @@ Zeitzone und Monatsgrenze:
   ersten/letzten 8 Tage der gecachten Nachbar-Rohmonate (Luecken ueber den
   Monatsrand). Erwartete Marktzeiten per zoneinfo America/New_York,
   erwarteter Offset je Anker aus der Regel des Rohmonats im Ereigniszeitpunkt
-  (berlin_minus_6 -5 h im EU-Winter, -4 h im EU-Sommer; fixed_est immer
-  -5 h); entschieden wird ueber Abweichung =
+  (berlin_minus_6_utc_midnight -5 h im EU-Winter, -4 h im EU-Sommer, Wechsel
+  Mo 00:00 UTC; ny_local nach New York; fixed_est immer -5 h); entschieden wird ueber Abweichung =
   implizit - erwartet, je Luecke aus beiden Seiten gemeinsam (Schluss nicht
   vor dem letzten Tick, Toleranz 15 min; Oeffnung nicht nach dem ersten,
   5 min) - auch bei duennen Daten richtig.
@@ -580,27 +587,36 @@ Annahmen (ohne Netz erstellt, nicht verifiziert):
 ## Zeitzonen-Survey (HistData-Ticks)
 
 Prueft, welche Stempelregel die HistData-Ticks wann hatten, und grenzt den
-Wechsel ein. Kandidaten: `ny_local` (America/New_York-Ortszeit),
-`berlin_minus_6` (Europe/Berlin minus 6 h), `fixed_est` und eigene Regeln aus
-config/histdata_timezone.yaml. Nur Tick-Modus, XAUUSD und XAGUSD.
+Wechsel ein. Kandidaten: alle Regeln aus fetch_histdata.TZ_RULES -
+`ny_local` (America/New_York-Ortszeit), `berlin_minus_6` (Europe/Berlin minus
+6 h, Wechsel am EU-Sonntag 01:00 UTC), `berlin_minus_6_utc_midnight` (Art
+dst_daily_utc: -5 h / -4 h, Wechsel erst Mo 00:00 UTC nach dem EU-Sonntag),
+`fixed_est` - und eigene Regeln aus config/histdata_timezone.yaml. Nur
+Tick-Modus, XAUUSD und XAGUSD.
 
-Stand (erster Survey, Exit 4, 124 Requests): 2010, 2012, 2015, 2018 (Maerz und
-Okt/Nov, beide Metalle) eindeutig ny_local; 2021-03 und 2024-03 eindeutig
-berlin_minus_6; 2021-10 und 2024-10 "keine Regel passt" nur wegen eines
-60-min-Ruecksprungs in der Dateireihenfolge (verirrte Ticks im geschlossenen
-Wochenendmarkt der EU-Umstellungsnacht: unter berlin_minus_6 springt die
-Rohuhr Sa 21:00 -> 20:00). Der Wechsel liegt also zwischen 2018-11 und 2021-03.
+Stand:
+- Erster Survey (Exit 4, 124 Requests): 2010, 2012, 2015, 2018 (Maerz und
+  Okt/Nov, beide Metalle) eindeutig ny_local; ab 2021 die berlin-Familie.
+- Erweiterter Scan 2009-2025 (Exit 4): 2019-03 fallen ny_local und
+  berlin_minus_6 durch, es bestehen nur berlin_minus_6_utc_midnight und
+  fixed_est; fixed_est ist durch die Juli-Kontrollmonate (-4 h) widerlegt.
+  Oktober ab 2019 jedes Jahr echte Ticks (2k-28k je Monat) mit Rueckfall am
+  EU-Sonntag roh 19:59:59 -> 19:00:00: HistData wechselt den Offset erst Mo
+  00:00 UTC. Fahrplan: ny_local bis 2018-11, berlin_minus_6_utc_midnight ab
+  2018-12 (Kontrolle: Survey erneut, s.u.).
 
-Erweiterter Scan (Homelab, alle Jahre ab Historienbeginn, Pflichtmonate 2019/2020):
+Kontroll-Scan (Homelab; Preset mit Kontrollmonaten 01/07 fuer den Ausschluss):
 
     runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/histdata_tz_survey.py --preset full --periods 2019-03 2019-10 2019-11 2020-03 2020-10 2020-11 --json /opt/marketdata/data/metals/reports/histdata-tz-survey-full.json --markdown /opt/marketdata/data/metals/reports/histdata-tz-survey-full.md
 
-Erwartete Requests: der Plan umfasst 2009-2025 x Maerz/Oktober/November x 2
-Metalle = 101 Rohdateien (XAGUSD 2009-03 liegt vor Historienbeginn; die
---periods-Monate sind im Preset schon enthalten). 36 davon liegen seit dem
-ersten Survey im Cache (2010/2012/2015/2018/2021/2024 x 3 Monate x 2), es
-fehlen also hoechstens 65 Rohmonate = 130 Requests (je Rohmonat Seiten-GET +
-POST), bei 5 s Pause mindestens ca. 11 min. Was sonst schon im Roh-Cache
+Erwartete Requests: der Plan umfasst 2009-2025 x Januar/Maerz/Juli/Oktober/
+November x 2 Metalle = 170 Rohdateien, davon 3 vor Historienbeginn (XAUUSD
+2009-01, XAGUSD 2009-01 und 2009-03; die --periods-Monate sind im Preset
+schon enthalten). Im Cache liegen 101 Rohdateien des erweiterten Scans (alle
+03/10/11) und 24 Kontrollmonate des ersten Surveys (01/07 der Jahre
+2010/2012/2015/2018/2021/2024). Es fehlen also hoechstens 42 Rohmonate (die
+Januar/Juli der uebrigen Jahre) = 84 Requests (je Rohmonat Seiten-GET +
+POST), bei 5 s Pause mindestens ca. 7 min. Was sonst schon im Roh-Cache
 liegt (z.B. vom normalen Fetcher), wird nicht geladen; die genaue Zahl steht
 vor dem ersten Download auf der Konsole ("Plan: ...", "Geplant: N Rohmonate
 laden = 2N Requests"). Leere, noch unbestaetigte Monate (Marker .empty,
@@ -615,7 +631,7 @@ Monate waehlen:
 - ohne Optionen: Jahre 2010 2012 2015 2018 2021 2024, Umstellungsmonate
   3 4 10 11, Kontrollmonate 1 7 (alter Default).
 - `--preset full`: alle Jahre vom fruehesten Historienbeginn (2009) bis 2025,
-  Monate 3 10 11, keine Kontrollmonate. --years/--months/--controls
+  Monate 3 10 11, Kontrollmonate 1 7. --years/--months/--controls
   ueberschreiben das Preset.
 - `--periods YYYY-MM ...`: einzelne Rohmonate zusaetzlich; ohne --preset und
   --years nur diese.
@@ -639,10 +655,23 @@ Ergebnis lesen:
   laut Fahrplan ("offen" = undecided). Darunter jeder grosse Ruecksprung in
   der Dateireihenfolge mit Rohzeit, Minuten, Tick-Zahl und ob er im
   geschlossenen Wochenendmarkt liegt.
-- Entscheidend ist ein Rohmonat, in dem GENAU EINE Regel besteht und alle
-  anderen durchfallen (Monate mit verworfenen Wochenend-Ticks zaehlen normal).
-  Ueber beide Metalle: wo beide entscheiden, muessen sie uebereinstimmen,
-  sonst KONFLIKT. Nicht entscheidende oder fehlende Monate widersprechen nicht.
+- Kontroll-Ausschluss: faellt eine Regel in einem Kontrollmonat (Januar,
+  Juli oder jeder Monat ohne Fenster zwischen den Sommerzeit-Regeln) eines
+  Jahres durch, zaehlt sie in den Umstellungsmonaten DESSELBEN Jahres nicht
+  mit. Tabelle: "fixed_est ausgeschlossen (2019-07: +1.0 h)" (Abweichung der
+  Regel im Kontrollmonat); Liste "Ausgeschlossen fuer die Umstellungsmonate".
+- Regelfamilien: berlin_minus_6 und berlin_minus_6_utc_midnight
+  unterscheiden sich nur an den EU-Sonntagen (je Jahr ca. 46 h).
+- Entscheidend ist ein Rohmonat, in dem alle bestehenden, nicht
+  ausgeschlossenen Regeln zu EINER Familie gehoeren und alle anderen
+  durchfallen (Monate mit verworfenen Wochenend-Ticks zaehlen normal).
+  Zwischen den Varianten entscheiden die Umstellungsnaechte: Rueckfall an der
+  Oktober-Faltung (roh So 19:59:59 -> 19:00:00) -> utc_midnight; Ticks in der
+  Maerz-Luecke (roh So 19:00-19:59) -> nicht utc_midnight. Ohne solche
+  Evidenz ist der Monat fuer die Familie entscheidend ("Familie
+  berlin_minus_6/berlin_minus_6_utc_midnight"). Ueber beide Metalle: Schnitt
+  der zugelassenen Regeln; leer = KONFLIKT. Nicht entscheidende oder
+  fehlende Monate widersprechen nicht.
 - Umstellungsfenster: ny_local und berlin_minus_6 rechnen nur im Maerz (US-
   Beginn 2. So Maerz bis EU-Beginn letzter So Maerz) und im Okt/Nov (EU-Ende
   letzter So Oktober bis US-Ende 1. So November) verschieden um. Der Survey
@@ -655,6 +684,9 @@ Ergebnis lesen:
   entscheidender Oktober belegt NICHT den November derselben Periode (z.B.
   hat Roh-2019-11 nur eine Fenster-Luecke, dort bestehen oft alle Regeln).
   Oktober alt / November neu ist ein gueltiger Wechsel an der Grenze 10/11.
+  Familie und Variante vertragen sich; die Block-Regel ist die
+  spezifischste belegte (eine nicht aufgeloeste Familie kaeme als undecided
+  mit ihren Mitgliedern in den Vorschlag).
   Verlangt ist hoechstens EIN Wechsel und kein Konflikt; sonst Exit 4 mit
   Erklaerung und ohne Vorschlag.
 - Evidenztabelle Periode x Metall ("Maerz" = Roh 03, "Okt/Nov" = Roh 10 + 11),
@@ -665,24 +697,37 @@ Ergebnis lesen:
 
       - {from: "2000-01", rule: ny_local}   # bis zum letzten entscheidenden ny-Rohmonat
       - {from: "<Monat danach>", rule: undecided, candidates: [ny_local, berlin_minus_6]}
-      - {from: "<erster entscheidender berlin-Rohmonat>", rule: berlin_minus_6}
+      - {from: "<s.u.>", rule: berlin_minus_6_utc_midnight}
 
   Der undecided-Eintrag kommt, sobald zwischen beiden Belegen ein Rohmonat
   mit Fenster liegt (nicht entscheidend, fehlend oder nicht untersucht); er
-  muss jeden solchen Monat abdecken, sonst kein Vorschlag (Exit 4).
+  muss jeden solchen Monat abdecken, sonst kein Vorschlag (Exit 4); die neue
+  Regel gilt dann ab ihrem ersten entscheidenden Rohmonat. Ohne Fenster-Monat
+  dazwischen gilt sie ab dem Monat nach dem letzten alten Beleg (Daten des
+  Eigentuemers: ny_local bis 2018-11, berlin_minus_6_utc_midnight ab 2018-12).
   Rohmonate ohne Fenster sind unter beiden Regeln identisch, ihre Zuordnung
   ist beliebig. Beispiel: letzter ny-Beleg 2019-10, 2019-11 nicht
   entscheidend, erster berlin-Beleg 2020-03 -> undecided ab 2019-11, berlin
   ab 2020-03. Ein Block (gleiche Regel) braucht mindestens 2 entscheidende
   Monate ODER beide Metalle im selben Monat, sonst "zu wenig Evidenz" und
   kein Vorschlag. Bei Exit 3 ist der Vorschlag als VORLAEUFIG markiert.
-- --markdown schreibt Evidenztabelle, Wechselanalyse, Vorschlag, Begruendung,
+- Umstellungsnaechte: Tabelle je Jahr x Metall x Maerz/Oktober fuer die
+  berlin-Varianten (EU-Sonntag, erwartetes Muster der Regel, letzter Tick vor
+  / erster nach der Umstellung roh, Rueckfall bzw. Ticks in Faltung/Luecke,
+  Status ok / no_data / unexpected) und je Jahr eine Zeile "Maerz-Sprung
+  bestaetigt / Oktober-Rueckfall bestaetigt / keine Daten / abweichend".
+  Damit prueft man an den Daten: Maerz 2019-2025 roh 18:59:59 -> 20:00:00
+  (Mo 00:00 UTC), Oktober roh 19:59:59 -> 19:00:00. Auch in JSON
+  (transition_nights, transition_nights_summary) und Markdown.
+- --markdown schreibt Evidenztabelle, Umstellungsnaechte, Ausschluesse,
+  Wechselanalyse, Vorschlag, Begruendung,
   verworfene Wochenend-Ticks und Ruecksprunge als Markdown (fuer die Doku und
   die Kommentare in config/histdata_timezone.yaml).
 - Exit-Codes, Vorrang von oben nach unten:
   4 = Befund: die konfigurierte Regel faellt in einem Monat durch, dessen
   Fahrplan-Regel nicht undecided ist ("KONFIGURIERTE REGEL FAELLT DURCH",
-  bei entscheidend anderer Regel auch "WIDERSPRUCH"), ODER mehr als ein
+  bei entscheidend anderer Regel auch "WIDERSPRUCH"; auch eine unerwartete
+  Umstellungsnacht unter der konfigurierten Regel), ODER mehr als ein
   Wechsel, ODER ein Konflikt - auch wenn noch Monate fehlen. Monate unter
   undecided stehen als "offen" da, nie als Fehler.
   3 = unvollstaendig (Download gescheitert, 429, --max-downloads erreicht,

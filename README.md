@@ -242,33 +242,43 @@ Two modes (`--mode`):
 
 Time zone:
 
-- **Tick timestamps follow a per-period stamping schedule (provisional,
-  check version 6)**, from the owner's survey on real XAUUSD/XAGUSD ticks:
-  `ny_local` (America/New_York) up to 2018-11 (2010, 2012, 2015 and 2018
-  clearly `ny_local` in March and Oct/Nov), `undecided` (candidates
-  `ny_local`, `berlin_minus_6`) for 2018-12..2021-02, and `berlin_minus_6`
-  (Europe/Berlin local time minus 6 h: UTC-5 in EU winter, UTC-4 in EU summer)
-  from 2021-03 (2021-03 and 2024-03 clearly `berlin_minus_6`; 2021-10 and
-  2024-10 fit except for one 60-minute reversal of stray ticks in the closed
-  weekend market). Years 2009, 2011, 2013, 2014, 2016, 2017, 2019, 2020, 2022,
-  2023 and 2025 are not surveyed yet.
-- **Why the switch can sit at any raw-month boundary in between that is
-  outside a transition window** (so not between raw October and raw November:
-  the Oct/Nov window spans both; the March window lies entirely in raw
-  March): the two
-  rules differ only in two windows a year, where `ny_local` gives UTC-4 and
-  `berlin_minus_6` UTC-5: March from the US start (2nd Sunday of March, 07:00
-  UTC) to the EU start (last Sunday of March, 01:00 UTC), and Oct/Nov from the
-  EU end (last Sunday of October, 01:00 UTC) to the US end (1st Sunday of
-  November, 06:00 UTC). Everywhere else both give UTC-5 in winter and UTC-4 in
-  summer. The list per year 2009-2025 (checked with zoneinfo) is in
+- **Tick timestamps follow a per-period stamping schedule (check version
+  7)**, from the owner's extended survey 2009–2025 on real XAUUSD/XAGUSD
+  ticks: `ny_local` (America/New_York) up to and including 2018-11 (2010,
+  2012, 2015 and 2018 clearly `ny_local`), then `berlin_minus_6_utc_midnight`
+  from 2018-12: Europe/Berlin local time minus 6 h (UTC-5 in EU winter, UTC-4
+  in EU summer), but the DST status is taken at **00:00 UTC of the UTC day**,
+  so the change takes effect at **Monday 00:00 UTC** after the last Sunday of
+  March/October, not at Sunday 01:00 UTC (rule kind `dst_daily_utc`). In
+  2019-03 only the Berlin family passes (fixed UTC-5 is excluded by the July
+  control months at -4 h). Every October since 2019 contains thousands of real
+  ticks in a raw reversal on the EU fall-back **Sunday**: raw 19:59:59 →
+  19:00:00, i.e. 23:59:59 UTC → Monday 00:00:00 UTC. (The earlier reading
+  "stray weekend ticks, raw Saturday 21:00 → 20:00" was wrong.)
+- **Fall: the raw hour Sunday 19:00–19:59:59.999 occurs twice** (market
+  open). `raw_to_utc_ms` resolves it by **file order**: the first reversal of
+  30 minutes or more into that hour separates the -4 h ticks (before it) from
+  the -5 h ticks (from it on). Without such a reversal the ticks cannot be
+  placed and raise `TimezoneError` (quarantine); they are never guessed or
+  dropped. The check expects this reversal (`expected_reversals`, not a
+  `large_reversals` entry, never releasable).
+- **Spring: raw Sunday 19:00–19:59:59.999 does not exist** (raw 18:59:59 →
+  20:00:00 = 23:59:59 UTC → Monday 00:00 UTC); a tick there raises
+  `TimezoneError`. This is still to be confirmed on the data; the survey
+  reports every transition night (`transition_nights`).
+- **Why the switch can be set at raw month 2018-12**: `ny_local` and the new
+  rule differ only in two windows a year (March from the US start, 2nd Sunday
+  07:00 UTC, to Monday 00:00 UTC after the EU start; Oct/Nov from Monday
+  00:00 UTC after the EU end to the US end, 1st Sunday of November 06:00 UTC).
+  Between the 2018 window (ends 2018-11-04 06:00 UTC, `ny_local` confirmed)
+  and the 2019 window (starts 2019-03-10 07:00 UTC, Berlin family confirmed)
+  there is none, so every raw-month boundary from 2018-12 to 2019-03 is
+  equivalent. The list per year 2009–2025 (checked with zoneinfo) is in
   `config/histdata_timezone.yaml`.
-- **`undecided`**: the conversion runs under every candidate. Where they
-  agree, the result is used (and the check runs under the first candidate).
-  A UTC month into which a tick converted differently by the candidates could
-  fall is **not written**: run report `months_rule_undecided` (with the raw
-  ranges, also in `summary`), a manual case (exit 4; 3 still wins), no
-  quarantine marker, no extra requests, re-evaluated from the cache every run.
+- **`undecided`** is still supported but no longer in the default schedule:
+  the conversion runs under every candidate; a UTC month into which a tick
+  converted differently could fall is not written (`months_rule_undecided`,
+  exit 4, no marker).
 - **The market stays New York-based**: the expected anchors are still the
   CME/New York session times (17:00/18:00 `America/New_York`); only the
   stamping rule changed.
@@ -277,7 +287,9 @@ Time zone:
   before relying on M1 summer months.
 - **Rules and schedule** live in `config/histdata_timezone.yaml`
   (`$HISTDATA_TZ_CONFIG` selects another file). A rule (`TzRule`) has a name, a
-  zoneinfo zone and a whole-hour shift (raw = local time in `zone` +
+  zoneinfo zone, a whole-hour shift and a `kind` (`zone_shift`, the default:
+  offset at the instant itself; `dst_daily_utc`: offset of the zone at 00:00
+  UTC of the instant's UTC day) (raw = local time in `zone` +
   `shift_h`). Built in: `berlin_minus_6` (Europe/Berlin, -6), `ny_local`
   (America/New_York, 0), `fixed_est` (Etc/GMT+5, 0); the file may define more.
   `schedule` lists per mode `{from: "YYYY-MM", rule: name}` keyed on **raw**
@@ -304,16 +316,23 @@ Time zone:
   `scripts/histdata_tz_survey.py` (uses `evaluate_raw_month`: cached raw files
   only, no download, no markers). After a change, the next run detects every
   monthly file whose `source_timezone` no longer matches (see below).
-- `raw_to_utc_ms(raw_ms, rule)` converts exactly (vectorized). A local time
-  that does not exist or is ambiguous in the rule's zone is never guessed:
-  for `berlin_minus_6` that is raw Saturday 20:00–20:59:59.999 in the two
-  transition nights. The market is closed then, so such a tick raises
-  `TimezoneError` and the raw month goes to quarantine (exit 4).
+- `raw_to_utc_ms(raw_ms, rule)` converts exactly (vectorized; `raw_ms` in file
+  order). A raw time that does not exist or is ambiguous under the rule is
+  never guessed (except the fall hour of `dst_daily_utc`, resolved by file
+  order as above): such a tick raises `TimezoneError` and the raw month goes
+  to quarantine (exit 4).
 - A UTC month M therefore needs raw months M-1 (its last 4 or 5 hours) and
   M; the raw months are computed from the schedule. M is written only when
   both are present, or when M-1 is before the symbol's history or confirmed
   empty.
-- The time zone is **checked in code for every raw month** (check version 6).
+- The time zone is **checked in code for every raw month** (check version 7).
+  The report lists each transition of the rule in the raw month under
+  `transition_nights` (date, kind spring/fall, expected, last_before_raw,
+  first_after_raw, reversal_found, ticks_in_fold/ticks_in_gap, status
+  ok/no_data/unexpected); `unexpected` (fall: data on both sides but no
+  reversal, or unresolved ticks; spring: ticks in the nonexistent hour) is a
+  failure. Rules without an EU change (e.g. `ny_local`) also get observation
+  entries for the EU Sundays (`rule_transition: false`, never a failure).
   Every market gap gives a close anchor and an open anchor:
   - weekend (gap of 24 h or more, closing on Thursday/Friday and opening on
     Sunday/Monday): close 17:00, open 18:00 New York. Other gaps of 24 h or
@@ -381,8 +400,11 @@ Time zone:
     marker is removed; if not, it is rewritten with `"accepted": false` and a
     note that the earlier release applied to the old conversion.
   - A tick at an ambiguous or nonexistent local time, or a reversal of 30
-    minutes or more in file order, quarantines the raw month (default: error,
-    never a guess). Each `large_reversals` entry reports `at_raw`,
+    minutes or more in file order (other than the expected fall reversal of
+    `dst_daily_utc`), quarantines the raw month (default: error, never a
+    guess). The weekend release below is for genuine strays in the closed
+    weekend market only; the expected Sunday fold is never released or
+    dropped. Each `large_reversals` entry reports `at_raw`,
     `back_to_raw`, `minutes`, `n_ticks`, `first_raw`, `last_raw` and
     `weekend_closed`; the affected ticks are all ticks with a raw time in
     [`back_to_raw`, `at_raw`]. If **all** affected reversal ticks and all
@@ -391,7 +413,7 @@ Time zone:
     before 16:00 - conservative across rules and offsets), the report and the
     marker carry `releasable_weekend` (`reversal_ticks`,
     `impossible_hour_ticks`, `raw_ranges`). After a manual check run
-    `fetch_histdata.py --symbol XAUUSD --accept-weekend-ticks 2024-10` (raw
+    `fetch_histdata.py --symbol XAUUSD --accept-weekend-ticks YYYY-MM` (raw
     month; prints the ticks to drop, no download; exit 2 with the reason if
     the marker is not releasable). Those ticks are then **dropped** (never
     converted), the rest is re-checked and written if it passes; the monthly
@@ -403,11 +425,13 @@ Time zone:
     `"accepted": true`) is kept, logged as ERROR and keeps blocking.
 - Monthly files carry the parquet metadata `source_timezone`, derived from
   the stamping rule(s) of their raw months and the check version, e.g.
-  `berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v6)`.
-  v5 wrote every tick month under `berlin_minus_6`; under the v6 schedule its
-  March, October and November files before 2021-03 count as shifted (moved
-  to `metals/stale/`, rebuilt under `ny_local` or held as `rule_undecided`),
-  the other months are only relabelled.
+  `berlin_minus_6_utc_midnight (Europe/Berlin -6 h, Sommerzeit ab 00:00 UTC) -> UTC, je Rohmonat geprueft (tz_check v7)`.
+  Files of v5/v6 (`berlin_minus_6`, `undecided`) whose UTC times differ under
+  the v7 schedule (the transition Sundays in March/October, and the
+  `ny_local` windows of 2019–2021 written as undecided) are moved to
+  `metals/stale/` and rebuilt; the rest is relabelled. Months held as
+  undecided under v6 are written now; old quarantine markers (e.g. the
+  October reversals) are re-checked.
   At the start of **every** run, all monthly files of the symbol and mode
   are checked, not only those in `--start`/`--end`:
   - an older or different label whose conversion gives the **same UTC times

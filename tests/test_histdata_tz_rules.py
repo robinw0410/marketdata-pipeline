@@ -44,8 +44,17 @@ REF_RULES = {"berlin_minus_6": (BER, -6), "ny_local": (NYZ, 0), "fixed_est": (ES
 
 
 @pytest.fixture(autouse=True)
-def _no_env_config(monkeypatch):
-    monkeypatch.delenv(ENV, raising=False)
+def _berlin_minus_6_config(monkeypatch, tmp_path_factory):
+    """Diese Datei prueft die Regel berlin_minus_6 (Umstellung So 01:00 UTC) als
+    solche. Der ausgelieferte Zeitplan (v7: ny_local bis 2018-11, danach
+    berlin_minus_6_utc_midnight) wird in test_default_config und in
+    tests/test_histdata_tz_v7.py geprueft; hier gilt ausdruecklich
+    berlin_minus_6 fuer alle Rohmonate (Tests mit eigener Config setzen ENV neu)."""
+    d = tmp_path_factory.mktemp("tzcfg")
+    cfg = d / "berlin_minus_6.yaml"
+    cfg.write_text('schedule:\n  tick:\n    - {from: "2000-01", rule: berlin_minus_6}\n'
+                   '  m1:\n    - {from: "2000-01", rule: fixed_est}\n')
+    monkeypatch.setenv(ENV, str(cfg))
 
 
 # ------------------------------------------------------- referenz (zoneinfo) ---
@@ -528,20 +537,18 @@ def test_tz_rule_dataclass_and_builtin_rules():
         assert rr.name == name
 
 
-def test_default_config():
-    """Zeitplan nach Survey (LXC): ny_local bis 2018 belegt, berlin_minus_6 ab 2021-03
-    belegt, dazwischen undecided (v6). M1 unveraendert fixed_est."""
+def test_default_config(monkeypatch):
+    """Ausgelieferter Zeitplan nach erweitertem Survey (LXC, 2009-2025): ny_local bis
+    Rohmonat 2018-11, berlin_minus_6_utc_midnight ab 2018-12. M1 unveraendert fixed_est."""
+    monkeypatch.delenv(ENV, raising=False)
     cfg = fh.load_tz_config()
     for ym in ((2000, 1), (2009, 3), (2015, 12), (2016, 1), (2018, 11)):
         assert fh.rule_for("tick", ym, cfg) == rule("ny_local"), ym
-    for ym in ((2018, 12), (2019, 3), (2020, 11), (2021, 2)):
-        r = fh.rule_for("tick", ym, cfg)
-        assert r.name == "undecided" and {c.name for c in r.candidates} == {"ny_local", "berlin_minus_6"}, ym
-    for ym in ((2021, 3), (2024, 3), (2024, 10), (2026, 11)):
-        assert fh.rule_for("tick", ym, cfg) == rule("berlin_minus_6"), ym
+    for ym in ((2018, 12), (2019, 3), (2020, 11), (2021, 3), (2024, 3), (2024, 10), (2026, 11)):
+        assert fh.rule_for("tick", ym, cfg) == fh.TZ_RULES["berlin_minus_6_utc_midnight"], ym
     for ym in ((2000, 1), (2009, 3), (2019, 3), (2024, 3), (2026, 11)):
         assert fh.rule_for("m1", ym, cfg) == rule("fixed_est"), ym
-    assert fh.rule_for("tick", (2024, 3)) == rule("berlin_minus_6")      # cfg=None
+    assert fh.rule_for("tick", (2024, 3)).name == "berlin_minus_6_utc_midnight"      # cfg=None
 
 
 def _write_cfg(path: Path, tick, m1=(("2000-01", "fixed_est"),), rules=None) -> Path:
@@ -618,7 +625,7 @@ def test_env_override(tmp_path, monkeypatch):
     assert fh.rule_for("tick", (2024, 3), fh.load_tz_config()).name == "ny_local"
     assert fh.rule_for("tick", (2024, 3)).name == "ny_local"                  # cfg=None
     monkeypatch.delenv(ENV)
-    assert fh.rule_for("tick", (2024, 3), fh.load_tz_config()).name == "berlin_minus_6"
+    assert fh.rule_for("tick", (2024, 3), fh.load_tz_config()).name == "berlin_minus_6_utc_midnight"
 
 
 def test_rule_switch_applies_at_raw_month_boundary_end_to_end(tmp_path, monkeypatch):

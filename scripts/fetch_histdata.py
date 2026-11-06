@@ -33,42 +33,50 @@ Periodenseite -> ZIP (CSV + Status-.txt mit Lueckenliste). Leerer Body =
 keine Daten. Je Datei 2 Requests, immer nur einer gleichzeitig. 429 auf den
 POST -> nach der Pause wieder ab dem Seiten-GET (frisches Token).
 
-Zeitzone = Stempelungsregel (TzRule: Rohzeit = Ortszeit in `zone` + shift_h)
-je ROHmonat nach Fahrplan in config/histdata_timezone.yaml (load_tz_config,
-rule_for; andere Datei per $HISTDATA_TZ_CONFIG; Datei muss existieren und ab
-spaetestens 2009-02 gelten; Fehler -> Abbruch beim Laden, nie still ein
-Default). Wechsel nur an Rohmonatsgrenzen.
-- tick (VORLAEUFIGER Fahrplan nach Survey, s. Kommentar in der YAML und
-  docs/histdata_research.md): ny_local (America/New_York) bis 2018-11 -
-  Survey 2010/2012/2015/2018 eindeutig; "undecided" (Kandidaten ny_local,
-  berlin_minus_6) 2018-12 .. 2021-02 - Wechsel liegt zwischen 2018-11 und
-  2021-03; berlin_minus_6 (Europe/Berlin - 6 h: UTC-5 im EU-Winter, UTC-4 in
-  der EU-Sommerzeit) ab 2021-03 - 2021-03/2024-03 eindeutig, 2021-10/2024-10
-  bis auf einen Ruecksprung im geschlossenen Wochenendmarkt. Beide Regeln
-  rechnen nur in den EU/US-Lueckenwochen verschieden (Maerz: US-Beginn 2. So
-  07:00 UTC bis EU-Beginn letzter So 01:00 UTC; Okt/Nov: EU-Ende letzter So
-  Okt 01:00 UTC bis US-Ende 1. So Nov 06:00 UTC). Die Marktzeiten (Anker)
+Zeitzone = Stempelungsregel (TzRule: Rohzeit - UTC = Offset(zone) + shift_h;
+kind zone_shift: Offset im Zeitpunkt selbst, kind dst_daily_utc: Offset um
+00:00 UTC des UTC-Tages) je ROHmonat nach Fahrplan in
+config/histdata_timezone.yaml (load_tz_config, rule_for; andere Datei per
+$HISTDATA_TZ_CONFIG; Datei muss existieren und ab spaetestens 2009-02 gelten;
+Fehler -> Abbruch beim Laden, nie still ein Default). Wechsel nur an
+Rohmonatsgrenzen.
+- tick (Fahrplan nach dem erweiterten Survey 2009-2025, s. Kommentar in der
+  YAML und docs/histdata_research.md): ny_local (America/New_York) bis
+  2018-11 (2010/2012/2015/2018 eindeutig), ab 2018-12
+  berlin_minus_6_utc_midnight = Europe/Berlin - 6 h mit Sommerzeit-Wechsel
+  erst Mo 00:00 UTC nach dem letzten So im Maerz/Oktober (2019-03 nur
+  Berliner Familie; jeder Oktober seit 2019 mit echten Ticks im Ruecksprung
+  roh So 19:59:59 -> 19:00:00). Zwischen 2018-11-04 und 2019-03-10 rechnen
+  beide Regeln gleich (kein Umstellungsfenster), der Wechsel ab 2018-12 ist
+  also gleichwertig zu jeder Grenze bis 2019-03. Die Marktzeiten (Anker)
   bleiben New York/CME: 17:00/18:00 America/New_York.
-  "undecided" (UndecidedRule, rule_for): raw_to_utc_ms rechnet alle
-  Kandidaten; identisch -> Ergebnis, sonst RuleUndecided. Ein UTC-Monat, in
-  den ein verschieden umgerechneter Tick (unter irgendeinem Kandidaten) fallen
-  kann, wird NICHT geschrieben: Laufreport months_rule_undecided (Rohbereiche),
-  manueller Fall (Exit 4, 3 hat Vorrang), kein Marker, keine Requests, jeder
-  Lauf prueft neu aus dem Cache. Pruefung sonst unter dem ersten Kandidaten
-  (mit abweichenden Ticks: bestanden, wenn ein Kandidat passt).
+  Herbst: roh So 19:00-19:59:59.999 kommt ZWEIMAL vor (Markt offen, 23:00-
+  01:00 UTC); raw_to_utc_ms loest nach DATEIREIHENFOLGE auf: der erste
+  Ruecksprung >= 30 min in diese Stunde trennt -4 h (davor) von -5 h (ab
+  ihm); fehlt er -> TimezoneError (nie raten, nie verwerfen). check_timezone
+  erwartet diesen Ruecksprung (expected_reversals, kein large_reversal, nie
+  verwerfbar) und berichtet je Umstellung transition_nights (status ok |
+  no_data | unexpected; unexpected = Fehler). Fruehjahr: roh So 18:59:59 ->
+  20:00:00, roh So 19:00-19:59:59.999 existiert nicht (Tick dort ->
+  TimezoneError); an den Daten noch zu bestaetigen (Survey).
+  "undecided" (UndecidedRule; nicht mehr im Default-Fahrplan): raw_to_utc_ms
+  rechnet alle Kandidaten; identisch -> Ergebnis, sonst RuleUndecided. Ein
+  UTC-Monat, in den ein verschieden umgerechneter Tick (unter irgendeinem
+  Kandidaten) fallen kann, wird NICHT geschrieben: Laufreport
+  months_rule_undecided (Rohbereiche), manueller Fall (Exit 4, 3 hat
+  Vorrang), kein Marker, keine Requests, jeder Lauf prueft neu aus dem Cache.
 - m1: fixed_est = Etc/GMT+5 (fest UTC-5) laut HistData-Angabe, fuer M1 NICHT
   verifiziert: mit --mode m1 --verify-month 2024-07 (Sommermonat) pruefen.
 Andere Regeln offline gegen den Roh-Cache abgleichen: evaluate_raw_month
 (scripts/histdata_tz_survey.py).
 Umrechnung raw_to_utc_ms(raw, rule) (vektorisiert, exakt auf die
-Millisekunde). Ortszeiten in der Sommerzeit-Luecke oder der doppelten Stunde
-der Regel-Zone (berlin_minus_6: roh Samstag 20:00-20:59:59.999 in den
-Umstellungsnaechten) werden NIE geraten: TimezoneError -> Quarantaene (Exit
-4); der Markt ist dann ohnehin zu. Folge: UTC-Monat M braucht die Rohmonate
+Millisekunde). Rohzeiten in der Luecke oder der doppelten Stunde einer
+Umstellung werden NIE geraten (Ausnahme: dst_daily_utc-Herbststunde mit
+Ruecksprung, s. o.): TimezoneError -> Quarantaene (Exit 4). Folge: UTC-Monat M braucht die Rohmonate
 M-1 (dessen letzte 4 bzw. 5 h, aus dem Fahrplan berechnet) und M; er gilt nur
 als vollstaendig, wenn beide da sind (oder M-1 vor Historienbeginn bzw.
 bestaetigt leer ist).
-Die Zeitzone wird JE ROHMONAT aus den Daten geprueft (check_timezone, v6):
+Die Zeitzone wird JE ROHMONAT aus den Daten geprueft (check_timezone, v7):
 je Marktluecke ein Schluss- und ein Oeffnungsanker - Wochenende (>= 24 h,
 Schluss Do/Fr, Oeffnung So/Mo: Fr 17:00 -> So 18:00 New York; andere Luecken >= 24 h sind Ausfaelle, nur Bericht), bei Metallen
 die Tagespause Mo-Do (17:00-18:00 New York; nur wenn alle pausenartigen
@@ -97,11 +105,14 @@ ein bestaetigter Wechsel im Folge-Rohmonat in Monat M zurueck, wird M nicht
 geschrieben (check_following). Zu wenige Anker -> gemeinsam mit dem
 Nachbar-Rohmonat pruefen.
 Parquet-Metadatum source_timezone = store_tz_label(mode, ym): Regel(n) der
-Rohmonate mit Zone/Verschiebung und TZ_CHECK_VERSION (6), z.B.
-"berlin_minus_6 (Europe/Berlin -6 h) -> UTC, je Rohmonat geprueft (tz_check v6)".
-v5-Dateien mit berlin_minus_6 fuer Monate, die jetzt ny_local/undecided sind:
-in den Lueckenwochen verschoben -> metals/stale/ und neu gebaut (bzw. als
-rule_undecided zurueckgehalten), sonst nur neu gekennzeichnet.
+Rohmonate mit Zone/Verschiebung und TZ_CHECK_VERSION (7), z.B.
+"berlin_minus_6_utc_midnight (Europe/Berlin -6 h, Sommerzeit ab 00:00 UTC) ->
+UTC, je Rohmonat geprueft (tz_check v7)". v5/v6-Dateien (berlin_minus_6,
+undecided) mit anderen UTC-Zeiten unter dem v7-Fahrplan (Umstellungssonntage
+im Maerz/Oktober, ny_local-Fenster 2019-2021) -> metals/stale/ und neu gebaut,
+sonst nur neu gekennzeichnet; unter v6 als undecided zurueckgehaltene Monate
+werden jetzt geschrieben; alte Quarantaene-Marker (z.B. die Oktober-
+Rueckspruenge) werden neu geprueft.
 Zu Beginn JEDES Laufs werden alle Monatsdateien
 des Symbols/Modus geprueft (classify_store_file):
 - andere oder aeltere Kennzeichnung, im UTC-Monat aber dieselben UTC-Zeiten
@@ -271,8 +282,14 @@ HOUR_MS, MIN_MS, DAY_MS = 3_600_000, 60_000, 86_400_000
 # Ticks, verwerfbare Wochenend-Ticks (releasable_weekend). v5-Dateien mit
 # berlin_minus_6 fuer heute ny_local/undecided-Monate: verschoben -> metals/stale/
 # und neu gebaut, gleich -> nur neu gekennzeichnet.
+# v7 = Fahrplan entschieden (erweiterter Survey 2009-2025): ny_local bis 2018-11,
+# ab 2018-12 berlin_minus_6_utc_midnight (Art dst_daily_utc: Sommerzeit-Wechsel
+# erst Mo 00:00 UTC); doppelte Rohstunde im Herbst (roh So 19:00-19:59) nach
+# Dateireihenfolge aufgeloest, ihr Ruecksprung erwartet (expected_reversals),
+# Bericht transition_nights. v6-Dateien (berlin_minus_6/undecided) mit anderen
+# UTC-Zeiten -> metals/stale/ + Neubau, sonst neu gekennzeichnet.
 # Nicht freigegebene Marker und Store-Dateien aelterer Version werden neu geprueft.
-TZ_CHECK_VERSION = 6
+TZ_CHECK_VERSION = 7
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TZ_CONFIG = REPO_ROOT / "config" / "histdata_timezone.yaml"
 TZ_CONFIG_ENV = "HISTDATA_TZ_CONFIG"
@@ -495,16 +512,27 @@ def _table_for(tzname: str, ms: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ------------------------------------------------ stempelungsregeln (v5) ---
+RULE_KINDS = ("zone_shift", "dst_daily_utc")
+
+
 @dataclass(frozen=True)
 class TzRule:
-    """Stempelungsregel: Rohzeit (Wanduhr-Ziffern der Datei) = Ortszeit in `zone`
-    + shift_h Stunden. berlin_minus_6: Europe/Berlin - 6 h = UTC-5 im EU-Winter,
-    UTC-4 in der EU-Sommerzeit (Umstellung letzter So Maerz/Oktober 01:00 UTC)."""
+    """Stempelungsregel: Rohzeit - UTC = Offset(zone) + shift_h Stunden.
+    kind "zone_shift": Offset der Zone im UTC-Zeitpunkt selbst (Rohzeit =
+      Ortszeit in `zone` + shift_h). berlin_minus_6: UTC-5 im EU-Winter, UTC-4 in
+      der EU-Sommerzeit, Umstellung letzter So Maerz/Oktober 01:00 UTC.
+    kind "dst_daily_utc": Offset der Zone um 00:00 UTC des UTC-Kalendertags des
+      Zeitpunkts - eine Umstellung wirkt erst ab der naechsten UTC-Mitternacht.
+      berlin_minus_6_utc_midnight: -5 h / -4 h, Wechsel Mo 00:00 UTC nach dem
+      letzten So im Maerz/Oktober (so stempelt HistData seit 2018-12, Survey)."""
     name: str
     zone: str
     shift_h: int
+    kind: str = "zone_shift"
 
     def describe(self) -> str:
+        if self.kind == "dst_daily_utc":
+            return f"{self.name} ({self.zone} {self.shift_h:+d} h, Sommerzeit ab 00:00 UTC)"
         return f"{self.name} ({self.zone} {self.shift_h:+d} h)"
 
 
@@ -549,18 +577,24 @@ def rule_candidates(rule) -> tuple:
 
 
 def rule_identity(rule) -> tuple[str, int]:
-    """(Zone, Verschiebung) bzw. fuer "undecided" ein eigener Schluessel (Marker)."""
+    """(Zone, Verschiebung) bzw. fuer "undecided" ein eigener Schluessel (Marker);
+    andere Art als zone_shift: "Zone|art" (z.B. Europe/Berlin|dst_daily_utc)."""
     if isinstance(rule, UndecidedRule):
         return "undecided:" + "|".join(c.name for c in rule.candidates), 0
+    if rule.kind != "zone_shift":
+        return f"{rule.zone}|{rule.kind}", rule.shift_h
     return rule.zone, rule.shift_h
 
 
 TZ_RULES = {"berlin_minus_6": TzRule("berlin_minus_6", "Europe/Berlin", -6),
             "ny_local": TzRule("ny_local", "America/New_York", 0),
-            "fixed_est": TzRule("fixed_est", "Etc/GMT+5", 0)}
+            "fixed_est": TzRule("fixed_est", "Etc/GMT+5", 0),
+            "berlin_minus_6_utc_midnight": TzRule("berlin_minus_6_utc_midnight", "Europe/Berlin", -6,
+                                                  kind="dst_daily_utc")}
 # Default-Fahrplan, falls die Konfiguration keinen liefert (identisch mit der
 # ausgelieferten config/histdata_timezone.yaml). M1 ist NICHT verifiziert.
-DEFAULT_TZ_SCHEDULE = {"tick": [((2000, 1), "berlin_minus_6")], "m1": [((2000, 1), "fixed_est")]}
+DEFAULT_TZ_SCHEDULE = {"tick": [((2000, 1), "ny_local"), ((2018, 12), "berlin_minus_6_utc_midnight")],
+                       "m1": [((2000, 1), "fixed_est")]}
 # (nur fuer build_tz_config(None) ohne Datei; load_tz_config verlangt immer eine Datei)
 
 
@@ -596,8 +630,12 @@ def build_tz_config(data: dict | None, path: str | None = None) -> TzConfig:
     rules = dict(TZ_RULES)
     for i, r in enumerate(data.get("rules") or []):
         where = f"{path}: rules[{i}]"
-        if not isinstance(r, dict) or set(r) != {"name", "zone", "shift_h"}:
-            raise ValueError(f"{where}: genau name, zone, shift_h erwartet, nicht {r!r}")
+        if not isinstance(r, dict) or not {"name", "zone", "shift_h"} <= set(r) <= \
+                {"name", "zone", "shift_h", "kind"}:
+            raise ValueError(f"{where}: name, zone, shift_h (optional kind) erwartet, nicht {r!r}")
+        kind = str(r.get("kind", "zone_shift"))
+        if kind not in RULE_KINDS:
+            raise ValueError(f"{where}: kind {kind!r} unbekannt; erlaubt: {list(RULE_KINDS)}")
         name = str(r["name"])
         if not re.fullmatch(r"[a-z0-9_]+", name):
             raise ValueError(f"{where}: Name {name!r} nur a-z, 0-9, _")
@@ -606,7 +644,7 @@ def build_tz_config(data: dict | None, path: str | None = None) -> TzConfig:
         _check_zone(r["zone"], where)
         if not isinstance(r["shift_h"], int) or isinstance(r["shift_h"], bool) or abs(r["shift_h"]) > 14:
             raise ValueError(f"{where}: shift_h muss ganze Stunden (-14..14) sein, nicht {r['shift_h']!r}")
-        rules[name] = TzRule(name, str(r["zone"]), int(r["shift_h"]))
+        rules[name] = TzRule(name, str(r["zone"]), int(r["shift_h"]), kind=kind)
     sched_in = data.get("schedule")
     if sched_in is None:
         if path is not None:
@@ -747,14 +785,27 @@ def _zone_offset_ms(zone: str, utc_ms: np.ndarray) -> np.ndarray:
     return O[np.searchsorted(T, utc_ms, side="right") - 1]
 
 
+def _rule_table(rule, ms: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(T, O) der Regel: ab UTC-ms T[i] gilt Rohzeit - UTC = O[i] (inkl. shift_h).
+    dst_daily_utc: jeder Wechsel der Zone wirkt erst ab der naechsten UTC-
+    Mitternacht (liegt er genau auf 00:00 UTC, ab dort)."""
+    rule = concrete_rule(rule)
+    T, O = _table_for(rule.zone, np.asarray(ms, dtype=np.int64))
+    if rule.kind == "dst_daily_utc" and len(T) > 1:
+        t = T[1:]
+        T = np.concatenate([T[:1], np.where(t % DAY_MS == 0, t, (t // DAY_MS + 1) * DAY_MS)])
+    return T, O + rule.shift_h * HOUR_MS
+
+
 def utc_to_raw_ms(utc_ms: np.ndarray, rule: TzRule) -> np.ndarray:
-    """UTC-ms -> Rohzeit-ms nach `rule` (Ortszeit in rule.zone + shift_h); immer eindeutig.
+    """UTC-ms -> Rohzeit-ms nach `rule`; immer eindeutig.
     "undecided": nach dem ersten Kandidaten (nur fuer Monatsgrenzen/Planung)."""
     rule = concrete_rule(rule)
     utc_ms = np.asarray(utc_ms, dtype=np.int64)
     if not len(utc_ms):
         return utc_ms.copy()
-    return utc_ms + _zone_offset_ms(rule.zone, utc_ms) + rule.shift_h * HOUR_MS
+    T, O = _rule_table(rule, utc_ms)
+    return utc_ms + O[np.searchsorted(T, utc_ms, side="right") - 1]
 
 
 def _ranges_of(raw_ms: np.ndarray, gap_ms: int = HOUR_MS) -> list[tuple[str, str]]:
@@ -845,37 +896,71 @@ def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
     = mehrdeutig (Sommerzeitende) -> TimezoneError mit Beispielen (Rohzeit);
     nie raten. berlin_minus_6: roh Samstag 20:00-20:59:59.999 in den
     Umstellungsnaechten (Markt zu); ny_local: 02:00-02:59 bzw. 01:00-01:59.
+    dst_daily_utc (Wechsel zur UTC-Mitternacht): Fruehjahrsluecke roh So
+    19:00-19:59:59.999 (berlin_minus_6_utc_midnight) -> TimezoneError; doppelte
+    Herbststunde nach DATEIREIHENFOLGE aufgeloest (_resolve_fold), ohne
+    Ruecksprung -> TimezoneError. raw_ms muss daher in Dateireihenfolge sein.
     """
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
     if not len(raw_ms):
         return raw_ms.copy()
     if isinstance(rule, UndecidedRule):
         return _raw_to_utc_undecided(raw_ms, rule)
-    local = raw_ms - rule.shift_h * HOUR_MS
-    T, O = _table_for(rule.zone, local)
+    T, O = _rule_table(rule, raw_ms)
     cands = np.unique(O)
     if len(cands) == 1:                         # feste Zone (Etc/GMT+5)
-        return local - cands[0]
+        return raw_ms - cands[0]
     out = np.zeros(len(raw_ms), dtype=np.int64)
+    late = np.zeros(len(raw_ms), dtype=np.int64)    # groesster gueltiger Kandidat (nach der Umstellung)
     n_ok = np.zeros(len(raw_ms), dtype=np.int8)
-    for off in cands:
-        u = local - off
+    for off in cands[::-1]:                     # groesster Offset zuerst = frueheste UTC
+        u = raw_ms - off
         ok = O[np.searchsorted(T, u, side="right") - 1] == off
-        out[ok] = u[ok]
+        out[ok & (n_ok == 0)] = u[ok & (n_ok == 0)]
+        late[ok] = u[ok]
         n_ok += ok
-    if (n_ok != 1).any():
-        bad = n_ok != 1
+    unresolved = n_ok > 1
+    if rule.kind == "dst_daily_utc" and unresolved.any():
+        unresolved = _resolve_fold(raw_ms, unresolved, out, late)
+    if (n_ok == 0).any() or unresolved.any():
+        bad = (n_ok == 0) | unresolved
         msg = []
+        amb_what = ("mehrdeutiger Rohzeit (doppelte Stunde) OHNE Ruecksprung in Dateireihenfolge"
+                    if rule.kind == "dst_daily_utc" else "mehrdeutiger Ortszeit (Sommerzeitende)")
         for mask, what in ((n_ok == 0, "nicht existierender Ortszeit (Sommerzeitbeginn)"),
-                           (n_ok > 1, "mehrdeutiger Ortszeit (Sommerzeitende)")):
+                           (unresolved, amb_what)):
             idx = np.nonzero(mask)[0]
             if len(idx):
                 ex = ", ".join(_raw_iso(int(raw_ms[i]), ms_digits=True) for i in idx[:5])
                 msg.append(f"{len(idx)} Zeitstempel (roh) in {what} nach {rule.describe()}, z.B. {ex}")
-        err = TimezoneError("; ".join(msg) + " - Markt ist dann geschlossen, nicht umgerechnet")
+        err = TimezoneError("; ".join(msg) + " - nie geraten, nicht umgerechnet")
         err.bad_mask = bad
         raise err
     return out
+
+
+def _resolve_fold(raw_ms: np.ndarray, amb: np.ndarray, early: np.ndarray, late: np.ndarray) -> np.ndarray:
+    """dst_daily_utc, doppelte Rohstunde (Herbst, roh So 19:00-19:59:59.999 bei
+    berlin_minus_6_utc_midnight): nach DATEIREIHENFOLGE aufloesen. Je Rohtag der
+    erste Index i mit raw[i] < raw[i-1] - 30 min und raw[i] in der doppelten
+    Stunde: mehrdeutige Ticks davor bekommen den Offset VOR der Umstellung
+    (fruehere UTC, in `early`), ab i den danach (`late`, wird nach early
+    kopiert). Ohne solchen Ruecksprung bleiben sie unaufgeloest (Rueckgabe-
+    Maske) -> TimezoneError; nie verworfen, nie geraten."""
+    idx = np.nonzero(amb)[0]
+    days = raw_ms[idx] // DAY_MS
+    jumps = np.nonzero((raw_ms[1:] < raw_ms[:-1] - REGRESSION_MAX_MS) & amb[1:])[0] + 1
+    unresolved = amb.copy()
+    for d in np.unique(days):
+        mine = idx[days == d]
+        j = jumps[raw_ms[jumps] // DAY_MS == d]
+        if not len(j):
+            continue
+        i = int(j[0])
+        after = mine[mine >= i]
+        early[after] = late[after]
+        unresolved[mine] = False
+    return unresolved
 
 
 # Geschlossener Wochenendmarkt nach ROHuhr, konservativ ueber alle Regeln und
@@ -890,16 +975,75 @@ WEEKEND_CLOSED_RAW = ((4, 18), (6, 16))
 
 def weekend_closed_raw(raw_ms: np.ndarray) -> np.ndarray:
     """Rohzeit im geschlossenen Wochenendmarkt (WEEKEND_CLOSED_RAW: Fr >= 18:00,
-    Sa, So < 16:00) - dort liegen die verbotenen Stunden der Regeln
-    (berlin_minus_6: Sa 20:00-20:59, ny_local: So 01:00-02:59) und verirrte
-    Ticks der Umstellungsnaechte."""
+    Sa, So < 16:00) - dort liegen die verbotenen Stunden der zone_shift-Regeln
+    (berlin_minus_6: Sa 20:00-20:59, ny_local: So 01:00-02:59). Die Stunde der
+    Tagesregel (roh So 19:00-19:59) liegt NICHT darin: nie verwerfbar."""
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
     (wa, ha), (wb, hb) = WEEKEND_CLOSED_RAW
     pos = (raw_ms + 3 * DAY_MS) % (7 * DAY_MS)          # ms seit Montag 00:00 (roh)
     return (pos >= wa * DAY_MS + ha * HOUR_MS) & (pos < wb * DAY_MS + hb * HOUR_MS)
 
 
-def _reversal_mask(raw_ms: np.ndarray) -> tuple[np.ndarray, list[dict]]:
+def _rules_in(raw_ms: np.ndarray, mode: str, rule=None) -> list:
+    """Konkrete Regeln der Rohmonate in raw_ms (oder nur `rule`)."""
+    if rule is not None:
+        return [concrete_rule(rule)]
+    if not len(raw_ms):
+        return []
+    ks = np.unique(_raw_month_index(np.asarray(raw_ms, dtype=np.int64)))
+    return list(dict.fromkeys(concrete_rule(rule_for(mode, (int(k) // 12, int(k) % 12 + 1))) for k in ks))
+
+
+def rule_windows(rule, raw_lo: int, raw_hi: int) -> list[dict]:
+    """Offset-Wechsel der Regel, deren Rohzeit-Fenster [raw_lo, raw_hi) schneidet:
+    je Wechsel kind "fall" (Offset faellt: doppelte Rohzeit [lo, hi)) oder "spring"
+    (Offset steigt: Rohzeit [lo, hi) existiert nicht), t_utc = UTC-ms des Wechsels,
+    date = Datum der Zonen-Umstellung (dst_daily_utc: der Tag VOR der UTC-Mitternacht)."""
+    rule = concrete_rule(rule)
+    T, O = _rule_table(rule, np.array([raw_lo - 2 * DAY_MS, raw_hi + 2 * DAY_MS], dtype=np.int64))
+    out = []
+    for i in range(1, len(T)):
+        t, pre, post = int(T[i]), int(O[i - 1]), int(O[i])
+        if pre == post:
+            continue
+        lo, hi = (t + post, t + pre) if post < pre else (t + pre, t + post)
+        if hi <= raw_lo or lo >= raw_hi:
+            continue
+        day = (t - 1 if rule.kind == "dst_daily_utc" else t) // DAY_MS
+        out.append({"kind": "fall" if post < pre else "spring", "t_utc": t, "lo": lo, "hi": hi,
+                    "pre_h": pre / HOUR_MS, "post_h": post / HOUR_MS,
+                    "date": str(np.datetime64(int(day), "D"))})
+    return out
+
+
+def expected_fold_jumps(raw_ms: np.ndarray, mode: str = "tick", rule=None) -> dict[int, dict]:
+    """dst_daily_utc: der ERWARTETE Ruecksprung je Herbst-Umstellung (erster Index j
+    mit raw[j] < raw[j-1] - 30 min, raw[j] in der doppelten Rohstunde und raw[j-1]
+    vor ihrem Ende) -> {j-1 (Index in np.diff): Fenster}. Derselbe, den
+    raw_to_utc_ms zur Aufloesung nach Dateireihenfolge nimmt."""
+    raw_ms = np.asarray(raw_ms, dtype=np.int64)
+    out: dict[int, dict] = {}
+    if len(raw_ms) < 2:
+        return out
+    jumps = np.nonzero(raw_ms[1:] < raw_ms[:-1] - REGRESSION_MAX_MS)[0] + 1
+    if not len(jumps):
+        return out
+    lo_all, hi_all = int(raw_ms.min()), int(raw_ms.max()) + 1
+    for r in _rules_in(raw_ms, mode, rule):
+        if r.kind != "dst_daily_utc":
+            continue
+        for w in rule_windows(r, lo_all, hi_all):
+            if w["kind"] != "fall":
+                continue
+            ok = jumps[(raw_ms[jumps] >= w["lo"]) & (raw_ms[jumps] < w["hi"])]
+            if len(ok):
+                j = int(ok[0])
+                if w["lo"] - HOUR_MS <= raw_ms[j - 1] < w["hi"]:
+                    out[j - 1] = w
+    return out
+
+
+def _reversal_mask(raw_ms: np.ndarray, skip=()) -> tuple[np.ndarray, list[dict]]:
     """Ruecksprung >= REGRESSION_MAX_MS in Dateireihenfolge: betroffen sind alle
     Ticks mit Rohzeit in [zurueck_auf, bei] -> (Maske, Details je Ruecksprung).
     n_ticks zaehlt das EIGENE Intervall jedes Ruecksprungs; ueberlappen sich
@@ -910,6 +1054,8 @@ def _reversal_mask(raw_ms: np.ndarray) -> tuple[np.ndarray, list[dict]]:
     out = []
     d0 = np.diff(raw_ms)
     for i in np.nonzero(d0 <= -REGRESSION_MAX_MS)[0]:
+        if int(i) in skip:                       # erwarteter Ruecksprung (doppelte Rohstunde)
+            continue
         at, back = int(raw_ms[i]), int(raw_ms[i + 1])
         m = (raw_ms >= back) & (raw_ms <= at)
         mask |= m
@@ -952,7 +1098,9 @@ def weekend_release(raw_ms: np.ndarray, mode: str = "tick", rule=None) -> tuple[
     liegen (WEEKEND_CLOSED_RAW); sonst None (nie freigebbar).
     """
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
-    rev, _ = _reversal_mask(raw_ms)
+    # der erwartete Ruecksprung der doppelten Rohstunde (dst_daily_utc) ist nie
+    # verwerfbar: er wird nach Dateireihenfolge aufgeloest
+    rev, _ = _reversal_mask(raw_ms, expected_fold_jumps(raw_ms, mode, rule))
     imp = _impossible_mask(raw_ms, mode, rule)
     drop = rev | imp
     if not drop.any() or not bool(weekend_closed_raw(raw_ms[drop]).all()):
@@ -1010,8 +1158,8 @@ def utc_to_raw_ms_mode(utc_ms: np.ndarray, mode: str, cfg: TzConfig | None = Non
 def tz_offset_h(utc_ms: int, rule: TzRule) -> float:
     """Offset (Rohzeit - UTC) nach `rule` im UTC-Zeitpunkt utc_ms, in Stunden
     ("undecided": erster Kandidat)."""
-    rule = concrete_rule(rule)
-    return (_utcoff_ms(ZoneInfo(rule.zone), utc_ms // 1000) + rule.shift_h * HOUR_MS) / HOUR_MS
+    T, O = _rule_table(rule, np.array([utc_ms], dtype=np.int64))
+    return float(O[np.searchsorted(T, utc_ms, side="right") - 1]) / HOUR_MS
 
 
 def raw_month_end_utc(ym: tuple[int, int], mode: str = "tick") -> datetime:
@@ -1140,14 +1288,20 @@ def label_rules(label: str | None) -> list[tuple[str, int]] | None:
         return [LEGACY_TZ_META[label]]
     if "->" not in label:
         return None
-    found = re.findall(r"\S+ \((\S+) ([+-]\d+) h\)", label.split("->")[0])
-    out = [(z, int(h)) for z, h in found] if found else [(label.split()[0], 0)]
-    for z, _ in out:
+    found = re.findall(r"\S+ \((\S+) ([+-]\d+) h(, Sommerzeit ab 00:00 UTC)?\)", label.split("->")[0])
+    out = ([(z, int(h)) + (("dst_daily_utc",) if daily else ()) for z, h, daily in found]
+           if found else [(label.split()[0], 0)])
+    for z, *_ in out:
         try:
             ZoneInfo(z)
         except Exception:
             return None
     return out
+
+
+def _rule_key(r: TzRule) -> tuple:
+    """(Zone, Verschiebung[, Art]) wie label_rules (Art nur, wenn nicht zone_shift)."""
+    return (r.zone, r.shift_h) + (() if r.kind == "zone_shift" else (r.kind,))
 
 
 def _zones_differ_in(old: list[tuple[str, int]] | None, mode: str, ym: tuple[int, int]) -> bool:
@@ -1159,7 +1313,7 @@ def _zones_differ_in(old: list[tuple[str, int]] | None, mode: str, ym: tuple[int
     # "undecided": alle Kandidaten muessen hier dieselbe Rohzeit liefern wie die alte Regel
     rules = [rule_for(mode, m) for m in _raw_months_for(ym, mode)]
     cands = [c for r in rules for c in rule_candidates(r)]
-    new_rules = [(r.zone, r.shift_h) for r in dict.fromkeys(cands)]
+    new_rules = [_rule_key(r) for r in dict.fromkeys(cands)]
     if old == new_rules:
         return False
     if len(set(old)) != 1:
@@ -1168,8 +1322,7 @@ def _zones_differ_in(old: list[tuple[str, int]] | None, mode: str, ym: tuple[int
     lo = int(datetime(*ym, 1, tzinfo=UTC).timestamp() * 1000)
     hi = int(datetime(*_ym_add(ym, 1), 1, tzinfo=UTC).timestamp() * 1000)
     grid = np.arange(lo, hi, HOUR_MS // 4, dtype=np.int64)
-    zone, shift = old[0]
-    ref = utc_to_raw_ms(grid, TzRule("alt", zone, shift))
+    ref = utc_to_raw_ms(grid, TzRule("alt", *old[0]))
     npick = max(len(rule_candidates(r)) for r in rules)
     return any(bool((utc_to_raw_ms_mode(grid, mode, pick=k) != ref).any()) for k in range(npick))
 
@@ -1555,8 +1708,9 @@ def _gap_fit(a: int, b: int, hours: tuple[int, int], rule_at) -> dict:
 
 
 def _transitions_ms(rule: TzRule, lo_ms: int, hi_ms: int) -> np.ndarray:
-    """UTC-ms der Uhrumstellungen der Regel-Zone in [lo_ms, hi_ms] (leer bei fester Zone)."""
-    T, _ = _table_for(concrete_rule(rule).zone, np.array([lo_ms, hi_ms], dtype=np.int64))
+    """UTC-ms der Offset-Wechsel der Regel in [lo_ms, hi_ms] (leer bei fester Zone;
+    dst_daily_utc: die folgende UTC-Mitternacht)."""
+    T, _ = _rule_table(rule, np.array([lo_ms, hi_ms], dtype=np.int64))
     T = T[1:]
     return T[(T >= lo_ms) & (T <= hi_ms)]
 
@@ -1661,11 +1815,19 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
     d0 = np.diff(raw_ms)
     rep["reversals"] = int((d0 < 0).sum())
     rep["max_reversal_s"] = float(max(0, -int(d0.min())) / 1000) if len(d0) else 0.0
-    large = np.nonzero(d0 <= -REGRESSION_MAX_MS)[0]
+    # erwarteter Ruecksprung der doppelten Rohstunde (dst_daily_utc, Herbst): kein Fehler
+    exp_jumps = expected_fold_jumps(raw_ms, mode, fixed)
+    rep["expected_reversals"] = [
+        {"at_raw": _raw_iso(int(raw_ms[i])), "back_to_raw": _raw_iso(int(raw_ms[i + 1])),
+         "minutes": round(-int(d0[i]) / MIN_MS, 1), "date": w["date"],
+         "fold_raw": [_raw_iso(w["lo"]), _raw_iso(w["hi"])]} for i, w in sorted(exp_jumps.items())]
+    large = np.array([i for i in np.nonzero(d0 <= -REGRESSION_MAX_MS)[0] if int(i) not in exp_jumps],
+                     dtype=np.int64)
     # betroffene Ticks je Ruecksprung: Rohzeit in [zurueck_auf, bei]
-    rev_mask, rev_rows = _reversal_mask(raw_ms)
+    rev_mask, rev_rows = _reversal_mask(raw_ms, exp_jumps)
     rep["large_reversals"] = rev_rows[:N_EXAMPLES]
     rep["reversal_ticks_total"] = int(rev_mask.sum())
+    rep["transition_nights"] = transition_nights(raw_ms, mode, fixed, bounds, exp_jumps)
     _, rel = weekend_release(raw_ms, mode, fixed)
     if rel is not None:
         # alle Ruecksprung- und Verbotene-Stunden-Ticks im geschlossenen Wochenendmarkt:
@@ -1843,6 +2005,12 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
                warnings=warnings[:N_EXAMPLES],
                deviating_examples=[arow(a) for a in anchors if a[3] != a[4]][:N_EXAMPLES])
     reasons = []
+    for tn in rep["transition_nights"]:
+        # Fenster im geschlossenen Wochenendmarkt (zone_shift: berlin_minus_6 Sa 20:00,
+        # ny_local So 01:00-03:00): Ticks dort scheitern schon an der Umrechnung
+        # (TimezoneError, ggf. als Wochenend-Ticks freigebbar) - hier nur Bericht
+        if tn["status"] == "unexpected" and tn.get("rule_transition", True) and not tn["weekend_closed"]:
+            reasons.append(f"Umstellungsnacht {tn['date']} ({tn['kind']}, {tn['rule']}): {tn['detail']}")
     if len(large):
         reasons.append(f"{len(large)} Ruecksprung/Rueckspruenge >= {REGRESSION_MAX_MS // MIN_MS} min "
                        f"in Dateireihenfolge (max {rep['max_reversal_s'] / 60:.0f} min, Uhrumstellung?; "
@@ -1867,6 +2035,109 @@ def check_timezone(raw_ms: np.ndarray, symbol: str,
     rep["ok"] = rep["status"] == "ok"
     rep["reason"] = "; ".join(reasons) or None
     return rep
+
+
+def transition_nights(raw_ms: np.ndarray, mode: str = "tick", rule=None, bounds=None,
+                      exp_jumps: dict | None = None) -> list[dict]:
+    """
+    Bericht je Umstellung im Rohmonat (bounds; sonst Spanne der Ticks): fuer die
+    Regel(n) des Monats je Offset-Wechsel ein Eintrag (date, kind spring/fall,
+    expected, window_raw, last_before_raw, first_after_raw, reversal_found,
+    ticks_in_fold bzw. ticks_in_gap, status ok|no_data|unexpected, detail).
+      fall:   dst_daily_utc: der Ruecksprung in die doppelte Rohstunde muss da
+              sein (ok); Ticks dort ohne ihn oder Daten auf beiden Seiten ohne
+              Ticks in der doppelten Stunde -> unexpected. zone_shift: jeder Tick
+              in der doppelten Stunde ist unexpected (nicht aufloesbar).
+      spring: Ticks in der nicht existierenden Rohstunde -> unexpected; Daten
+              auf beiden Seiten -> ok; sonst no_data.
+    Regeln ohne Wechsel an einem EU-Umstellungssonntag des Monats (ny_local,
+    fixed_est): zusaetzlich ein Eintrag rule_transition=False je EU-Sonntag mit
+    der Beobachtung im Fenster von berlin_minus_6_utc_midnight (observed:
+    fold_reversal|gap|continuous|ambiguous|no_data; nie ein Fehler).
+    """
+    raw_ms = np.asarray(raw_ms, dtype=np.int64)
+    if not len(raw_ms) and bounds is None:
+        return []
+    blo, bhi = bounds if bounds is not None else (int(raw_ms.min()), int(raw_ms.max()) + 1)
+    if exp_jumps is None:
+        exp_jumps = expected_fold_jumps(raw_ms, mode, rule)
+    exp_post = {i + 1 for i in exp_jumps}
+    srt = np.sort(raw_ms)
+
+    def count(a, b):
+        return int(np.searchsorted(srt, b) - np.searchsorted(srt, a))
+
+    def last_before(x, span=6 * HOUR_MS):
+        k = int(np.searchsorted(srt, x)) - 1
+        return _raw_iso(int(srt[k])) if k >= 0 and srt[k] >= x - span else None
+
+    def first_from(x, span=6 * HOUR_MS):
+        k = int(np.searchsorted(srt, x))
+        return _raw_iso(int(srt[k])) if k < len(srt) and srt[k] < x + span else None
+
+    def night(r, w, own: bool) -> dict:
+        lo, hi = w["lo"], w["hi"]
+        both = count(lo - HOUR_MS, lo) > 0 and count(hi, hi + HOUR_MS) > 0
+        n_in = count(lo, hi)
+        e = {"date": w["date"], "kind": w["kind"], "rule": r.name, "rule_transition": own,
+             "window_raw": [_raw_iso(lo), _raw_iso(hi)], "reversal_found": False,
+             "weekend_closed": bool(weekend_closed_raw(np.array([lo, hi - 1])).all())}
+        if w["kind"] == "fall":
+            post = [j for j in exp_post if lo <= raw_ms[j] < hi] if own else []
+            if not post:
+                jumps = np.nonzero(raw_ms[1:] < raw_ms[:-1] - REGRESSION_MAX_MS)[0] + 1
+                post = [int(j) for j in jumps if lo <= raw_ms[j] < hi][:1]
+            e["expected"] = (f"roh {_raw_iso(hi - 1000)} -> {_raw_iso(lo)} (Rohstunde doppelt, "
+                             f"Offset {w['pre_h']:+g} -> {w['post_h']:+g} h um "
+                             f"{_raw_iso(w['t_utc'])} UTC; Aufloesung nach Dateireihenfolge)" if own else
+                             f"keine Umstellung nach {r.name} (beobachtet im Fenster von "
+                             "berlin_minus_6_utc_midnight)")
+            e["ticks_in_fold"] = n_in
+            if post:
+                j = min(post)
+                e.update(reversal_found=True, last_before_raw=_raw_iso(int(raw_ms[j - 1])),
+                         first_after_raw=_raw_iso(int(raw_ms[j])))
+            else:
+                e.update(last_before_raw=last_before(hi), first_after_raw=first_from(hi))
+            if not own:
+                e["observed"] = ("fold_reversal" if post else "ambiguous" if n_in and not both
+                                 else "continuous" if n_in or both else "no_data")
+                e["status"] = "ok" if (n_in or both) else "no_data"
+            elif r.kind == "dst_daily_utc":
+                e["status"] = ("ok" if post else "unexpected" if (n_in or both) else "no_data")
+                e["detail"] = ("doppelte Rohstunde ohne Ruecksprung in Dateireihenfolge "
+                               f"({n_in} Tick(s) nicht aufloesbar)" if n_in and not post else
+                               "Daten vor und nach der doppelten Rohstunde, aber keine darin "
+                               "und kein Ruecksprung" if not post else "")
+            else:
+                e["status"] = "unexpected" if n_in else "no_data"
+                e["detail"] = f"{n_in} Tick(s) in der doppelten Rohstunde (nicht eindeutig)" if n_in else ""
+        else:
+            e["expected"] = (f"roh {_raw_iso(lo - 1000)} -> {_raw_iso(hi)} (Rohstunde existiert nicht, "
+                             f"Offset {w['pre_h']:+g} -> {w['post_h']:+g} h um {_raw_iso(w['t_utc'])} UTC)"
+                             if own else f"keine Umstellung nach {r.name} (beobachtet im Fenster von "
+                             "berlin_minus_6_utc_midnight)")
+            e["ticks_in_gap"] = n_in
+            e.update(last_before_raw=last_before(lo), first_after_raw=first_from(hi))
+            if not own:
+                e["observed"] = "continuous" if n_in else "gap" if both else "no_data"
+                e["status"] = "ok" if (n_in or both) else "no_data"
+            else:
+                e["status"] = "unexpected" if n_in else ("ok" if both else "no_data")
+                e["detail"] = f"{n_in} Tick(s) in der nicht existierenden Rohstunde" if n_in else ""
+        return e
+
+    out = []
+    for r in _rules_in(raw_ms, mode, rule) if len(raw_ms) else [concrete_rule(rule)] if rule else []:
+        wins = rule_windows(r, blo, bhi)
+        out += [night(r, w, True) for w in wins]
+        own_dates = {w["date"] for w in wins}
+        if r.kind == "dst_daily_utc" or r.zone == "Europe/Berlin":
+            continue
+        # Regel ohne EU-Wechsel: EU-Sonntage des Monats beobachten (Fenster der Tagesregel)
+        ref = TZ_RULES["berlin_minus_6_utc_midnight"]
+        out += [night(r, w, False) for w in rule_windows(ref, blo, bhi) if w["date"] not in own_dates]
+    return sorted(out, key=lambda e: e["window_raw"][0])
 
 
 def _fmt_counter(c: Counter) -> str:

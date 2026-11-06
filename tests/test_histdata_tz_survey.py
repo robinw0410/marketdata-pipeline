@@ -5,7 +5,6 @@ import json
 import re
 import zipfile
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -36,18 +35,16 @@ def cfg(tmp_path, monkeypatch):
 
 
 def offsets(rule, ym):
-    """Stuendliche Offsets (h) einer Regel ueber den Rohmonat."""
-    lo = datetime(*ym, 1)
-    hi = datetime(*sv.ym_add(ym, 1), 1)
-    z = ZoneInfo(rule.zone)
-    t, out = lo, []
-    while t < hi:
-        out.append(z.utcoffset(t).total_seconds() / 3600 + rule.shift_h)
-        t += timedelta(hours=1)
-    return np.array(out)
+    """Stuendliche Offsets (h) einer Regel ueber den Rohmonat (UTC-Raster, ueber
+    fh.utc_to_raw_ms - gilt fuer jede Regelart, auch dst_daily_utc)."""
+    lo = int(datetime(*ym, 1, tzinfo=UTC).timestamp() * 1000)
+    hi = int(datetime(*sv.ym_add(ym, 1), 1, tzinfo=UTC).timestamp() * 1000)
+    u = np.arange(lo, hi, 3_600_000, dtype=np.int64)
+    return (fh.utc_to_raw_ms(u, rule) - u) / 3_600_000
 
 
-def fake_evaluator(truth, calls=None, not_checkable=(), dropped=None, drop_flags=None):
+def fake_evaluator(truth, calls=None, not_checkable=(), dropped=None, drop_flags=None,
+                   nights=None):
     """evaluate_raw_month-Ersatz: Regel besteht, wenn sie im ganzen Rohmonat
     dieselben Offsets wie die "wahre" Stempelung truth(ym) hat. dropped:
     {(symbol, ym, regel): n} verworfene Wochenend-Ticks; drop_flags sammelt
@@ -67,7 +64,8 @@ def fake_evaluator(truth, calls=None, not_checkable=(), dropped=None, drop_flags
         return {"status": "ok" if not dev.any() else "failed", "reason": None, "cached": True,
                 "anchors": 40, "median_deviation_h": float(np.median(dev)),
                 "dropped_weekend_ticks": n, "releasable_weekend": {"ticks": n} if n else None,
-                "large_reversals": []}
+                "large_reversals": [],
+                "transition_nights": (nights(symbol, tuple(ym), rule.name) if nights else None) or []}
     return ev
 
 
@@ -278,7 +276,8 @@ def test_classify_needs_exactly_one_pass_and_no_unclear():
 
 
 def test_dst_rules_share_offsets_in_january_and_july():
-    assert sorted(sv.dst_rules(fh.TZ_RULES, 2015)) == ["berlin_minus_6", "ny_local"]
+    assert sorted(sv.dst_rules(fh.TZ_RULES, 2015)) == ["berlin_minus_6",
+                                                      "berlin_minus_6_utc_midnight", "ny_local"]
     for ym in [(2015, 1), (2015, 7)]:
         assert (offsets(fh.TZ_RULES["berlin_minus_6"], ym) == offsets(fh.TZ_RULES["ny_local"], ym)).all()
 
@@ -341,24 +340,28 @@ def test_exit_0_when_schedule_matches(tmp_path, cfg, monkeypatch):
     assert res["verdicts"]["2015"]["verdict"] == "ny_local passt"
 
 
-def test_fixed_est_period_is_decisive_in_july_and_change_inside_year(tmp_path, cfg, monkeypatch):
+def test_fixed_est_failing_july_is_excluded_in_same_year(tmp_path, cfg, monkeypatch):
+    """Kontroll-Ausschluss: faellt fixed_est im Juli 2012 durch, zaehlt es in den
+    Umstellungsmonaten 2012 nicht mit - ein Wechsel fixed_est -> berlin mitten im
+    Jahr ist so nicht belegbar (2012-03: keine nicht ausgeschlossene Regel passt)."""
     truth = lambda ym: "fixed_est" if ym < (2012, 6) else "berlin_minus_6"
     monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(truth))
     root = tmp_path / "data"
     for m in (1, 3, 7, 10):
         touch_cache(root, "XAUUSD", (2012, m))
     res, out = run(tmp_path, years=[2012], offline=True, **NO_MONTHS)
-    v = res["verdicts"]["2012"]["verdict"]
-    assert v.startswith("Wechsel im Jahr: fixed_est (2012-03..2012-03) -> berlin_minus_6"), v
-    # je Block nur EIN entscheidender Monat eines Symbols: zu wenig Evidenz fuer einen
-    # Vorschlag (Review v5) - Belege werden gedruckt, aber nicht vorgeschlagen
-    assert res["schedule"] == []
-    assert [(b["rule"], b["months"]) for b in res["weak_evidence"]] == \
-        [("fixed_est", ["2012-03"]), ("berlin_minus_6", ["2012-10"])]
-    assert "zu wenig Evidenz" in out
-    jan = next(m for m in res["months"] if m["month"] == "2012-01")
-    assert jan["text"] == "Kontrolle ok: berlin_minus_6, ny_local, fixed_est"
-    assert res["exit_code"] == 4
+    by = {m["month"]: m for m in res["months"]}
+    assert not by["2012-03"]["decisive"]
+    assert by["2012-03"]["text"] == "keine Regel passt | fixed_est ausgeschlossen (2012-07: +1.0 h)"
+    assert by["2012-10"]["winner"] == "berlin_minus_6"
+    assert res["exclusions"] == {"2012": {"fixed_est": "2012-07: +1.0 h"}}
+    assert "fixed_est (2012-07: +1.0 h)" in out
+    assert by["2012-01"]["text"] == \
+        "Kontrolle ok: berlin_minus_6, ny_local, fixed_est, berlin_minus_6_utc_midnight"
+    # ein entscheidender Monat eines Symbols: zu wenig Evidenz, kein Vorschlag
+    assert res["schedule"] == [] and [(b["rule"], b["months"]) for b in res["weak_evidence"]] == \
+        [("berlin_minus_6", ["2012-10"])]
+    assert res["exit_code"] == 4                             # berlin faellt 2012-03 durch
 
 
 def test_no_rule_passes_and_control_failure(tmp_path, cfg, monkeypatch):
@@ -389,7 +392,8 @@ def test_symbols_disagree_month_left_out_of_schedule(tmp_path, cfg, monkeypatch)
         touch_cache(tmp_path / "data", s, (2018, 3))
     res, out = run(tmp_path, symbols=["XAUUSD", "XAGUSD"], years=[2018], months=[3],
                    controls=[], offline=True)
-    assert res["symbol_conflicts"] == ["2018-03: berlin_minus_6, ny_local"]
+    assert res["symbol_conflicts"] == [
+        "2018-03: KONFLIKT (Symbole: XAUUSD berlin_minus_6, XAGUSD ny_local)"]
     assert res["schedule"] == []
     assert res["exit_code"] == 4                             # XAGUSD widerspricht dem Fahrplan
 
@@ -530,8 +534,9 @@ def test_integration_weekend_reversal_dropped_and_schedule(tmp_path, cfg):
     assert oct24["results"]["berlin_minus_6"]["dropped_weekend_ticks"] == 4
     assert "ok +0.0 (4 Wochenend-Ticks verworfen)" in out
     rev = res["reversals"]["XAUUSD"]
-    assert rev == ["2024-10: 2024-10-26 20:59:02 -> 2024-10-26 20:00:05 (59.0 min, 4 Ticks, "
-                   "Wochenende (Markt zu), verworfen)"], rev
+    assert len(rev) == 1 and rev[0].startswith(
+        "2024-10: 2024-10-26 20:59:02 -> 2024-10-26 20:00:05 (59.0 min, 4 Ticks, "
+        "Wochenende (Markt zu), verworfen"), rev
     # letzter ny-Beleg 2018-10 (2018-11 nicht untersucht, hat Fenster) -> undecided ab 2018-11
     assert [(e["from"], e["rule"]) for e in res["schedule"]] == [
         ("2000-01", "ny_local"), ("2018-11", "undecided"), ("2021-03", "berlin_minus_6")], out
@@ -548,7 +553,8 @@ def test_configured_rule_failing_where_two_others_pass_is_exit_4(tmp_path, cfg, 
     touch_cache(tmp_path / "data", "XAUUSD", (2018, 7))       # Juli: berlin = ny, fixed_est faellt
     res, out = run(tmp_path, years=[2018], months=[], controls=[7], offline=True)
     m = res["months"][0]
-    assert not m["decisive"] and set(m["passing"]) == {"berlin_minus_6", "ny_local"}
+    assert not m["decisive"] and set(m["passing"]) == {"berlin_minus_6", "ny_local",
+                                                          "berlin_minus_6_utc_midnight"}
     assert res["contradictions"] == [] and res["exit_code"] == 4
     assert [(c["month"], c["configured"]) for c in res["configured_failed"]] == [("2018-07", "fixed_est")]
 
@@ -701,13 +707,14 @@ def test_one_switch_without_gap_two_entries():
     # 2020-11 ny, 2021-03 berlin: dazwischen nur Monate ohne Fenster -> kein undecided
     _, an, sched, just = analyse(ny_years(2019, 2020) + berlin_years(2021))
     assert an["undecided_months"] == [] and (an["last_old"], an["first_new"]) == ("2020-11", "2021-03")
-    assert entries(sched) == [("2000-01", "ny_local"), ("2021-03", "berlin_minus_6")]
+    # ohne Fenster dazwischen: neue Regel ab dem Monat nach dem letzten alten Beleg
+    assert entries(sched) == [("2000-01", "ny_local"), ("2020-12", "berlin_minus_6")]
     assert just["plain_months"] == ["2020-12", "2021-01", "2021-02"] and just["undecided"] is None
     # Maerz ny, Okt/Nov berlin im selben Jahr
     rows = ny_years(2020) + both((2021, 3), "ny_local") + both((2021, 10), "berlin_minus_6") + \
         both((2021, 11), "berlin_minus_6") + berlin_years(2022)
     _, an, sched, just = analyse(rows)
-    assert entries(sched) == [("2000-01", "ny_local"), ("2021-10", "berlin_minus_6")]
+    assert entries(sched) == [("2000-01", "ny_local"), ("2021-04", "berlin_minus_6")]
     assert just["plain_months"] == [f"2021-{m:02d}" for m in range(4, 10)]
 
 
@@ -836,18 +843,18 @@ def test_undecided_months_are_open_not_failures(tmp_path, cfg, monkeypatch):
     assert "Offen laut Fahrplan (undecided, kein Fehler): 2 Rohmonate (2019-03, 2019-10)" in out
     row = next(x for x in out.splitlines() if x.startswith("2019-10"))
     assert " offen " in row and "WIDERSPRUCH" not in row
-    # Vorschlag: ny bis 2019 Maerz, berlin ab 2019 Okt/Nov (benachbart: kein undecided)
+    # Vorschlag: ny bis 2019-03, berlin ab 2019-04 (dazwischen kein Fenster: kein undecided)
     assert [(e["from"], e["rule"]) for e in res["schedule"]] == [
-        ("2000-01", "ny_local"), ("2019-10", "berlin_minus_6")]
+        ("2000-01", "ny_local"), ("2019-04", "berlin_minus_6")]
     assert res["exit_code"] == 3                     # 2018-03, 2021-10 fehlen (nicht im Cache)
 
 
 # ------------------------------------------------------- v6: Planung ---
 def test_preset_full_and_periods_resolve():
     years, months, controls = sv.resolve_plan("full", None, None, None, True)
-    assert years == list(range(2009, 2026)) and months == [3, 10, 11] and controls == []
+    assert years == list(range(2009, 2026)) and months == [3, 10, 11] and controls == [1, 7]
     # explizite Angaben schlagen das Preset
-    assert sv.resolve_plan("full", [2019], None, None, False) == ([2019], [3, 10, 11], [])
+    assert sv.resolve_plan("full", [2019], None, [], False) == ([2019], [3, 10, 11], [])
     # nur --periods: keine Default-Jahre
     assert sv.resolve_plan(None, None, None, None, True)[0] == []
     assert sv.resolve_plan(None, None, None, None, False) == (
@@ -862,13 +869,18 @@ def test_preset_full_and_periods_resolve():
 
 
 def test_preset_full_request_count_and_remaining(tmp_path, cfg, monkeypatch):
+    """--preset full mit Kontrollmonaten 01/07: Lage nach dem erweiterten Scan (alle
+    03/10/11 im Cache) und dem ersten Survey (01/07 der Jahre 2010/12/15/18/21/24)."""
     monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(lambda ym: "berlin_minus_6"))
     root = tmp_path / "data"
-    for y in (2010, 2012, 2015, 2018, 2021, 2024):           # erster Survey: schon im Cache
-        for m in (3, 10, 11):
+    first = (2010, 2012, 2015, 2018, 2021, 2024)
+    for y in range(2009, 2026):
+        for m in (3, 10, 11) + ((1, 7) if y in first else ()):
             for s in sv.SYMBOLS:
-                touch_cache(root, s, (y, m))
+                if not fh.before_history(s, (y, m)):
+                    touch_cache(root, s, (y, m))
     years, months, controls = sv.resolve_plan("full", None, None, None, True)
+    assert controls == [1, 7]
     site = Site()
     clock = Clock()
     out = io.StringIO()
@@ -877,15 +889,16 @@ def test_preset_full_request_count_and_remaining(tmp_path, cfg, monkeypatch):
                     now=lambda: datetime(2026, 11, 6, tzinfo=UTC), pause=0.0, out=out,
                     max_downloads=3, session=site, sleep=clock.sleep, clock=clock, wall=clock)
     txt = out.getvalue()
-    # 2009-2025 x 3 Monate x 2 Symbole = 102, XAGUSD 2009-03 vor Historienbeginn; 36 im Cache
-    assert "Plan: 51 Rohmonate x 2 Symbole = 102 Rohdateien (34 Umstellungsperioden), " \
-        "36 im Cache, 65 fehlen" in txt
+    # 17 Jahre x 5 Monate x 2 Symbole = 170; vor Historienbeginn: XAUUSD 2009-01, XAGUSD
+    # 2009-01/03; im Cache 101 (03/10/11) + 24 (01/07 erster Survey); fehlen 42 = 84 Requests
+    assert "Plan: 85 Rohmonate x 2 Symbole = 170 Rohdateien (34 Umstellungsperioden), " \
+        "125 im Cache, 42 fehlen" in txt
     assert "Geplant: 3 Rohmonate laden = 6 Requests" in txt
-    assert "62 weitere ueber --max-downloads 3 (naechster Aufruf, 124 Requests)" in txt
+    assert "39 weitere ueber --max-downloads 3 (naechster Aufruf, 78 Requests)" in txt
     assert site.requests == 6 and res["requests"] == 6
-    assert res["exit_code"] == 3 and res["remaining_raw_months"] == 62   # nichts widerspricht
-    assert "noch fehlend: 62 Rohmonate" in txt
-    assert "UNVOLLSTAENDIG: noch 62 Rohmonate offen (= 124 Requests" in txt
+    assert res["exit_code"] == 3 and res["remaining_raw_months"] == 39   # nichts widerspricht
+    assert "noch fehlend: 39 Rohmonate" in txt
+    assert {m["month"][-2:] for m in res["months"] if m["kind"] == "control"} == {"01", "07"}
 
 
 def test_cli_markdown_and_json(tmp_path, cfg, monkeypatch):
@@ -898,8 +911,8 @@ def test_cli_markdown_and_json(tmp_path, cfg, monkeypatch):
             for s in sv.SYMBOLS:
                 touch_cache(tmp_path / "data", s, (y, m))
     md, js = tmp_path / "rep" / "s.md", tmp_path / "rep" / "s.json"
-    code = sv.main(["--preset", "full", "--years", "2018", "2021", "--periods", "2019-03",
-                    "--offline", "--json", str(js), "--markdown", str(md)])
+    code = sv.main(["--preset", "full", "--years", "2018", "2021", "--controls", "--periods",
+                    "2019-03", "--offline", "--json", str(js), "--markdown", str(md)])
     res = json.loads(js.read_text())
     assert code == res["exit_code"] == 3                      # 2019-03 nicht im Cache
     text = md.read_text()
@@ -917,3 +930,181 @@ def test_cli_markdown_and_json(tmp_path, cfg, monkeypatch):
                                   "candidates": ["ny_local", "berlin_minus_6"]}
     assert res["switch_analysis"]["between"][0]["month"] == "2018-12"
     assert res["switch_analysis"]["undecided_months"][0] == "2019-03"
+
+
+# ------------------------- v7: Kontroll-Ausschluss, Regelfamilien, Naechte ---
+UM = "berlin_minus_6_utc_midnight"
+
+
+def night(kind, status, date, **kw):
+    """Eigene Umstellungsnacht einer Regel wie im Fetcher-Bericht (transition_nights)."""
+    base = {"date": date, "kind": kind, "rule_transition": True, "status": status,
+            "expected": "roh 19:59:59 -> 19:00:00" if kind == "fall" else "roh 18:59:59 -> 20:00:00",
+            "last_before_raw": None, "first_after_raw": None, "reversal_found": False}
+    base.update(kw)
+    return base
+
+
+def res_(status, nights_=()):
+    return {"status": status, "transition_nights": list(nights_)}
+
+
+def test_families_and_windows_of_the_new_rule():
+    fam = sv.rule_families(fh.TZ_RULES)
+    assert fam["berlin_minus_6"] == fam[UM] == frozenset({"berlin_minus_6", UM})
+    assert fam["ny_local"] == frozenset({"ny_local"}) and fam["fixed_est"] == frozenset({"fixed_est"})
+    b, u = fh.TZ_RULES["berlin_minus_6"], fh.TZ_RULES[UM]
+    # Varianten unterscheiden sich nur an den EU-Sonntagen (bis Mo 00:00 UTC)
+    assert sv._win_text(sv.month_windows(b, u, (2019, 10))) == "26.10. 20:00-27.10. 20:00 roh"
+    assert sv.month_windows(b, u, (2019, 11)) == () and sv.month_windows(b, u, (2019, 7)) == ()
+
+
+def test_2019_03_decided_via_july_control_exclusion(tmp_path, cfg, monkeypatch):
+    """Eigentuemer-Lauf: 2019-03 fallen ny_local und berlin_minus_6 durch, es bestehen
+    utc_midnight und fixed_est; fixed_est faellt im Juli 2019 durch (-4 h statt -5 h)
+    -> ausgeschlossen -> 2019-03 entscheidend fuer berlin_minus_6_utc_midnight."""
+    monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(lambda ym: UM))
+    for ym in [(2019, 3), (2019, 7)]:
+        touch_cache(tmp_path / "data", "XAUUSD", ym)
+    res, out = run(tmp_path, years=[2019], months=[3], controls=[7], offline=True)
+    mar = next(m for m in res["months"] if m["month"] == "2019-03")
+    assert {n for n, r in mar["results"].items() if r["status"] == "ok"} == {UM, "fixed_est"}
+    assert mar["decisive"] and mar["winner"] == UM and mar["allowed"] == [UM]
+    assert mar["text"] == f"entscheidend: {UM} | fixed_est ausgeschlossen (2019-07: +1.0 h)"
+    assert "fixed_est ausgeschlossen (2019-07: +1.0 h)" in out
+    # ohne Kontrollmonat: nicht entscheidend
+    res, _ = run(tmp_path, years=[2019], months=[3], controls=[], offline=True)
+    assert not res["months"][0]["decisive"]
+    assert res["months"][0]["text"].startswith("mehrere passen")
+
+
+def test_october_fold_makes_utc_midnight_decisive():
+    fam = sv.rule_families(fh.TZ_RULES)
+    results = {"ny_local": res_("failed"), "fixed_est": res_("failed"),
+               "berlin_minus_6": res_("ok", [night("fall", "no_data", "2019-10-27")]),
+               UM: res_("ok", [night("fall", "ok", "2019-10-27", reversal_found=True,
+                                     ticks_in_fold=4200)])}
+    c = sv.classify(results, "transition", [], None, fam)
+    assert c["decisive"] and c["allowed"] == [UM] and c["winner"] == UM
+    assert f"{UM}: Nacht bestaetigt" in c["text"]
+    # ohne Nachtbericht: nur die Familie ist belegt
+    results[UM] = res_("ok")
+    c = sv.classify(results, "transition", [], None, fam)
+    assert c["decisive"] and c["allowed"] == ["berlin_minus_6", UM]
+    assert c["winner"] == f"Familie berlin_minus_6/{UM}"
+    # nicht-eigene Beobachtungen (rule_transition False) sind keine Evidenz
+    results[UM] = res_("ok", [night("fall", "ok", "2019-10-27", rule_transition=False)])
+    assert sv.classify(results, "transition", [], None, fam)["allowed"] == ["berlin_minus_6", UM]
+
+
+def test_march_gap_ticks_exclude_the_variant():
+    fam = sv.rule_families(fh.TZ_RULES)
+    results = {"ny_local": res_("failed"), "fixed_est": res_("failed"),
+               "berlin_minus_6": res_("ok"),
+               UM: res_("ok", [night("spring", "unexpected", "2019-03-31", ticks_in_gap=950)])}
+    c = sv.classify(results, "transition", [], None, fam)
+    assert c["decisive"] and c["allowed"] == ["berlin_minus_6"]
+    assert f"{UM}: Nacht widerspricht" in c["text"]
+
+
+def test_family_month_and_variant_month_form_one_block():
+    """Familie (2019-11) und Variante (2019-03, 2019-10) vertragen sich: ein Block mit
+    der spezifischsten Regel; Variante gegen klassische Regel = Wechsel."""
+    def fam_row(sym, ym):
+        r = mrow(sym, ym, UM)
+        r.update(allowed=["berlin_minus_6", UM], winner=f"Familie berlin_minus_6/{UM}")
+        return r
+    rows = ny_years(2017, 2018) + both((2019, 3), UM) + both((2019, 10), UM) + \
+        [fam_row(s, (2019, 11)) for s in sv.SYMBOLS]
+    _, an, sched, just = analyse(rows)
+    assert an["switches"] == 1 and an["blocks"][1]["rule"] == UM
+    assert entries(sched) == [("2000-01", "ny_local"), ("2018-12", UM)]
+    rows += both((2020, 3), "berlin_minus_6") + both((2020, 10), "berlin_minus_6")
+    _, an, sched, _ = analyse(rows)
+    assert an["switches"] == 2 and sched == []
+
+
+def owner_truth(ym):
+    return "ny_local" if ym <= (2018, 11) else UM
+
+
+def owner_nights(symbol, ym, rule):
+    """utc_midnight-Bericht ab 2019: Maerz-Sprung und Oktober-Rueckfall bestaetigt."""
+    if rule != UM or ym < (2019, 1) or ym[1] not in (3, 10):
+        return None
+    if ym[1] == 3:
+        return [night("spring", "ok", f"{ym[0]}-03-31", ticks_in_gap=0,
+                      last_before_raw=f"{ym[0]}-03-31 18:59:59", first_after_raw=f"{ym[0]}-03-31 20:00:00")]
+    return [night("fall", "ok", f"{ym[0]}-10-27", reversal_found=True, ticks_in_fold=4200,
+                  last_before_raw=f"{ym[0]}-10-27 19:59:59", first_after_raw=f"{ym[0]}-10-27 19:00:00")]
+
+
+def test_owner_data_proposes_ny_until_2018_11_then_utc_midnight(tmp_path, cfg, monkeypatch):
+    cfg((("2000-01", "ny_local"), ("2018-12", UM)))
+    monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(owner_truth, nights=owner_nights))
+    for y in (2017, 2018, 2019, 2020):
+        for m in (1, 3, 7, 10, 11):
+            for s in sv.SYMBOLS:
+                touch_cache(tmp_path / "data", s, (y, m))
+    md = tmp_path / "s.md"
+    res, out = run(tmp_path, symbols=list(sv.SYMBOLS), years=[2017, 2018, 2019, 2020],
+                   months=[3, 10, 11], controls=[1, 7], offline=True)
+    assert [(e["from"], e["rule"]) for e in res["schedule"]] == [("2000-01", "ny_local"), ("2018-12", UM)]
+    an = res["switch_analysis"]
+    assert (an["last_old"], an["first_new"], an["undecided_months"]) == ("2018-11", "2019-03", [])
+    assert "# Vorschlag = konfigurierter Fahrplan (tick)." in out
+    assert res["exit_code"] == 0, out
+    # Umstellungsnaechte: Tabelle + Zusammenfassung in Konsole, JSON und Markdown
+    assert "Umstellungsnaechte (EU-Sonntage" in out
+    line = f"2019 {UM}: Maerz-Sprung bestaetigt (XAUUSD, XAGUSD); Oktober-Rueckfall bestaetigt (XAUUSD, XAGUSD)"
+    assert line in out and line in res["transition_nights_summary"]
+    assert any(x["status"] == "ok" and x["first_after_raw"] == "2019-10-27 19:00:00"
+               for x in res["transition_nights"])
+    md.write_text(sv.render_markdown(res))
+    text = md.read_text()
+    assert "## Umstellungsnaechte" in text and f"- {line}" in text
+    assert "| 2019 | XAUUSD | Oktober | berlin_minus_6_utc_midnight | 2019-10-27 |" in text
+
+
+def test_unexpected_night_under_configured_rule_is_exit_4(tmp_path, cfg, monkeypatch):
+    cfg((("2000-01", UM),))
+    bad = lambda sym, ym, rule: [night("spring", "unexpected", "2019-03-31", ticks_in_gap=12,
+                                       last_before_raw="2019-03-31 19:00:01",
+                                       first_after_raw="2019-03-31 20:00:00")] \
+        if rule == UM and ym == (2019, 3) else None
+    monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(lambda ym: UM, nights=bad))
+    for ym in [(2019, 3), (2019, 10)]:
+        touch_cache(tmp_path / "data", "XAUUSD", ym)
+    res, out = run(tmp_path, years=[2019], months=[3, 10], controls=[], offline=True)
+    assert res["exit_code"] == 4
+    assert [(c["month"], c["configured"]) for c in res["configured_failed"]] == [("2019-03", UM)]
+    assert "unerwartete Umstellungsnacht: 2019-03-31 spring: 2019-03-31 19:00:01 -> " \
+        "2019-03-31 20:00:00" in res["configured_failed"][0]["reason"]
+    assert f"2019 {UM}: Maerz abweichend (XAUUSD)" in out
+
+
+def test_integration_utc_midnight_real_zips(tmp_path, cfg):
+    """Echte Pruefung (fh.evaluate_raw_month) mit Ticks nach berlin_minus_6_utc_midnight:
+    2019-03 entscheidend erst durch den Juli-Ausschluss von fixed_est und den
+    Maerz-Sprung (Nacht), 2019-10 durch den Oktober-Rueckfall; Vorschlag ny_local bis
+    2018-11, berlin_minus_6_utc_midnight ab 2018-12."""
+    cfg((("2000-01", "ny_local"), ("2018-12", UM)))
+    root = tmp_path / "data"
+    for ym in [(2018, 10), (2018, 11)]:
+        write_raw_month(root, "XAUUSD", ym, "ny_local")
+    for ym in [(2019, 3), (2019, 7), (2019, 10)]:
+        write_raw_month(root, "XAUUSD", ym, UM)
+    res, out = run(tmp_path, years=[2018, 2019], months=[3, 10, 11], controls=[7], offline=True,
+                   max_downloads=0)
+    by = {m["month"]: m for m in res["months"]}
+    assert by["2019-03"]["allowed"] == [UM], out
+    assert "fixed_est ausgeschlossen (2019-07: +1.0 h)" in by["2019-03"]["text"]
+    assert by["2019-10"]["allowed"] == [UM]
+    assert [(e["from"], e["rule"]) for e in res["schedule"]] == [("2000-01", "ny_local"), ("2018-12", UM)]
+    assert f"2019 {UM}: Maerz-Sprung bestaetigt (XAUUSD); Oktober-Rueckfall bestaetigt (XAUUSD)" \
+        in res["transition_nights_summary"]
+    fall = next(x for x in res["transition_nights"]
+                if x["rule"] == UM and x["kind"] == "fall" and x["year"] == 2019)
+    assert (fall["last_before_raw"], fall["first_after_raw"], fall["reversal_found"]) == \
+        ("2019-10-27 19:59:00", "2019-10-27 19:00:00", True)
+    assert res["configured_failed"] == [] and res["exit_code"] == 3   # 2018-03, 2019-11 fehlen
