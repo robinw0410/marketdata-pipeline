@@ -152,26 +152,41 @@ def market_utc(lo, hi) -> pd.DatetimeIndex:
 
 # Echte Umstellungsnaechte. Quelle: Kontroll-Survey des Owners im Homelab (Lauf zur
 # Bestaetigung des Fahrplans, Exit 0; alle Naechte 2019-2025 ok fuer XAUUSD und XAGUSD),
-# Zahlen wie berichtet. fold_ticks = Ticks roh So 19:00:00-19:59:59.999 der
-# Herbstnacht, beide Durchgaenge zusammen; im Maerz 0 Ticks in der Luecke.
-# Felder mit None kommen mit dem vollstaendigen Bericht; solange None, entfaellt NUR
-# der jeweilige Einzel-Assert (nie ganze Tests):
-#   fold_split                (Ticks 1. Durchgang, Ticks 2. Durchgang)
-#   fall_last_before_raw_exact / fall_first_after_raw_exact   "HH:MM:SS.mmm"
-#   spring_last_before_raw / spring_first_after_raw           "HH:MM:SS[.mmm]"
+# Zahlen wie berichtet (Report histdata-tz-survey-full.md):
+#   fold_ticks = Ticks roh So 19:00:00-19:59:59.999 der Herbstnacht, beide Durchgaenge
+#     zusammen; Herbst-Raender roh 19:59:59 -> 19:00:00 (Sekundengenauigkeit).
+#   spring_*   = letzter Tick vor / erster Tick nach der Maerz-Luecke (roh, Sekunden);
+#     0 Ticks in der Luecke.
+# NICHT ERHOBEN (der Report liefert sie nicht; bewusst nicht weiter verfolgt):
+#   Millisekunden der Raender und die Aufteilung der Faltenticks auf die beiden
+#   Durchgaenge. Die Tests pruefen dafuer nichts gegen echte Werte; der Generator
+#   nimmt die Aufteilung DEFAULT_FIRST_PASS_SHARE an (s.u.) - eine Testannahme,
+#   kein Messwert.
+NICHT_ERHOBEN = "nicht erhoben"
 _REAL_FOLD_TICKS = {
     2019: (5472, 1886), 2020: (8146, 4030), 2021: (9516, 2310), 2022: (7342, 3554),
     2023: (8272, 2798), 2024: (14158, 5320), 2025: (28010, 17032)}
+# (letzter vor, erster nach) der Maerz-Luecke, roh, je (Jahr, Symbol)
+_REAL_SPRING_EDGES = {
+    (2019, "XAUUSD"): ("18:59:53", "20:00:00"), (2019, "XAGUSD"): ("18:58:00", "20:00:00"),
+    (2020, "XAUUSD"): ("18:59:59", "20:00:00"), (2020, "XAGUSD"): ("18:59:47", "20:00:00"),
+    (2021, "XAUUSD"): ("18:59:58", "20:00:00"), (2021, "XAGUSD"): ("18:59:59", "20:00:00"),
+    (2022, "XAUUSD"): ("18:59:59", "20:00:00"), (2022, "XAGUSD"): ("18:59:56", "20:00:00"),
+    (2023, "XAUUSD"): ("18:59:59", "20:00:00"), (2023, "XAGUSD"): ("18:59:50", "20:00:00"),
+    (2024, "XAUUSD"): ("18:59:58", "20:00:00"), (2024, "XAGUSD"): ("18:59:58", "20:00:00"),
+    (2025, "XAUUSD"): ("18:59:59", "20:00:00"), (2025, "XAGUSD"): ("18:59:58", "20:00:00")}
 REAL_NIGHTS = {
     (y, sym): {"fold_ticks": _REAL_FOLD_TICKS[y][i],
                "fall_last_before_raw": "19:59:59", "fall_first_after_raw": "19:00:00",
                "spring_ticks_in_gap": 0,
-               # optional, folgt mit dem vollstaendigen Bericht:
-               "fold_split": None,
-               "fall_last_before_raw_exact": None, "fall_first_after_raw_exact": None,
-               "spring_last_before_raw": None, "spring_first_after_raw": None}
+               "spring_last_before_raw": _REAL_SPRING_EDGES[(y, sym)][0],
+               "spring_first_after_raw": _REAL_SPRING_EDGES[(y, sym)][1],
+               "fold_split": NICHT_ERHOBEN,
+               "fall_last_before_raw_exact": NICHT_ERHOBEN,
+               "fall_first_after_raw_exact": NICHT_ERHOBEN}
     for y in _REAL_FOLD_TICKS for i, sym in enumerate(("XAUUSD", "XAGUSD"))}
-# solange die echte Aufteilung fehlt: fester Anteil des 1. Durchgangs (dokumentiert)
+# Testannahme (kein Messwert): Anteil der Faltenticks im 1. Durchgang (So 23-24 UTC),
+# Rest im 2. Durchgang (Mo 00-01 UTC). Die echte Aufteilung ist nicht erhoben.
 DEFAULT_FIRST_PASS_SHARE = 0.55
 SPRING_PATTERN = ("18:59:59", "20:00:00")
 
@@ -188,27 +203,22 @@ def _day_ms(d: date) -> int:
 
 
 def fold_split(y, sym) -> tuple[int, int]:
-    rn = REAL_NIGHTS[(y, sym)]
-    if rn["fold_split"] is not None:
-        a, b = rn["fold_split"]
-        assert a + b == rn["fold_ticks"]
-        return int(a), int(b)
-    a = int(round(rn["fold_ticks"] * DEFAULT_FIRST_PASS_SHARE))
-    return a, rn["fold_ticks"] - a
+    """Generator-Aufteilung der echten Faltenticks (Annahme DEFAULT_FIRST_PASS_SHARE)."""
+    n = REAL_NIGHTS[(y, sym)]["fold_ticks"]
+    a = int(round(n * DEFAULT_FIRST_PASS_SHARE))
+    return a, n - a
 
 
 def fall_edges_raw(y, sym) -> tuple[int, int]:
-    """Rohzeit-ms (letzter Tick 1. Durchgang, erster Tick nach dem Ruecksprung)."""
+    """Rohzeit-ms (letzter Tick 1. Durchgang, erster Tick nach dem Ruecksprung), echt (s)."""
     rn, d = REAL_NIGHTS[(y, sym)], FALL[y]
-    a = rn["fall_last_before_raw_exact"] or rn["fall_last_before_raw"]
-    b = rn["fall_first_after_raw_exact"] or rn["fall_first_after_raw"]
-    return _day_ms(d) + _hms_ms(a), _day_ms(d) + _hms_ms(b)
+    return _day_ms(d) + _hms_ms(rn["fall_last_before_raw"]), _day_ms(d) + _hms_ms(rn["fall_first_after_raw"])
 
 
 def spring_edges_raw(y, sym) -> tuple[int, int]:
-    rn, d = REAL_NIGHTS.get((y, sym), {}), last_sunday(y, 3)
-    a = rn.get("spring_last_before_raw") or SPRING_PATTERN[0]
-    b = rn.get("spring_first_after_raw") or SPRING_PATTERN[1]
+    """Rohzeit-ms der Maerz-Raender: echt fuer 2019-2025, sonst das erwartete Muster."""
+    rn, d = REAL_NIGHTS.get((y, sym)), last_sunday(y, 3)
+    a, b = (rn["spring_last_before_raw"], rn["spring_first_after_raw"]) if rn else SPRING_PATTERN
     return _day_ms(d) + _hms_ms(a), _day_ms(d) + _hms_ms(b)
 
 
@@ -644,16 +654,19 @@ def _generator_selftest(sym, y):
 def test_real_nights_table_complete():
     assert set(REAL_NIGHTS) == {(y, sym) for y in YEARS for sym in SYMS}
     keys = {"fold_ticks", "fall_last_before_raw", "fall_first_after_raw", "spring_ticks_in_gap",
-            "fold_split", "fall_last_before_raw_exact", "fall_first_after_raw_exact",
-            "spring_last_before_raw", "spring_first_after_raw"}
+            "spring_last_before_raw", "spring_first_after_raw",
+            "fold_split", "fall_last_before_raw_exact", "fall_first_after_raw_exact"}
     for k, rn in REAL_NIGHTS.items():
         assert set(rn) == keys, k
         assert rn["fold_ticks"] > 1000 and rn["spring_ticks_in_gap"] == 0
         assert (rn["fall_last_before_raw"], rn["fall_first_after_raw"]) == ("19:59:59", "19:00:00")
-        for f in ("fall_last_before_raw_exact", "fall_first_after_raw_exact"):
-            assert rn[f] is None or re.fullmatch(r"19:\d\d:\d\d\.\d{3}", rn[f]), (k, f)
-        if rn["fold_split"] is not None:
-            assert sum(rn["fold_split"]) == rn["fold_ticks"]
+        assert re.fullmatch(r"18:5\d:\d\d", rn["spring_last_before_raw"]), k
+        assert rn["spring_first_after_raw"] == "20:00:00", k
+        # bewusst nicht erhoben - kein stiller None/Skip
+        for f in ("fold_split", "fall_last_before_raw_exact", "fall_first_after_raw_exact"):
+            assert rn[f] == NICHT_ERHOBEN, (k, f)
+    assert REAL_NIGHTS[(2019, "XAGUSD")]["spring_last_before_raw"] == "18:58:00"
+    assert REAL_NIGHTS[(2020, "XAGUSD")]["spring_last_before_raw"] == "18:59:47"
     assert REAL_NIGHTS[(2025, "XAUUSD")]["fold_ticks"] == 28010
     assert REAL_NIGHTS[(2019, "XAGUSD")]["fold_ticks"] == 1886
 
@@ -738,9 +751,7 @@ def test_run_october_fold_written_every_tick_accounted(tmp_path, sym, y):
     # jeder Faltentick umgerechnet, keiner verworfen: UTC So 23-24 + Mo 00-01 = echte Zahl
     first_pass, second_pass = hour_ticks(tmp_path, sym, sun23, mon0), hour_ticks(tmp_path, sym, mon0, mon1)
     assert first_pass + second_pass == rn["fold_ticks"] == int(fold.sum())
-    assert (first_pass, second_pass) == (n1, n2)
-    if rn["fold_split"] is not None:
-        assert (first_pass, second_pass) == tuple(rn["fold_split"])
+    assert (first_pass, second_pass) == (n1, n2)      # Generator-Annahme, Aufteilung nicht erhoben
     # Umrechnung des ganzen Rohmonats: exakt die Generator-UTC, streng monoton
     src = raw_month(sym, y, 10, NEW)
     conv = fh.raw_to_utc_ms(raw_ms_of(src), rule(NEW))
@@ -755,10 +766,6 @@ def test_run_october_fold_written_every_tick_accounted(tmp_path, sym, y):
     assert n["ticks_in_fold"] == rn["fold_ticks"]
     assert str(n["last_before_raw"]).startswith(f"{d:%Y-%m-%d} {rn['fall_last_before_raw']}")
     assert str(n["first_after_raw"]).startswith(f"{d:%Y-%m-%d} {rn['fall_first_after_raw']}")
-    if rn["fall_last_before_raw_exact"] is not None:
-        assert str(n["last_before_raw"]) == f"{d:%Y-%m-%d} {rn['fall_last_before_raw_exact']}"
-    if rn["fall_first_after_raw_exact"] is not None:
-        assert str(n["first_after_raw"]) == f"{d:%Y-%m-%d} {rn['fall_first_after_raw_exact']}"
     assert "expected" in n
     exp = [x for v in find_key(mrep, "expected_reversals") for x in (v or [])]
     assert exp and any(f"{d:%Y-%m-%d} 19:59:59" in json.dumps(x) for x in exp)
@@ -799,7 +806,8 @@ def test_run_march_gap_written_every_tick_accounted(tmp_path, sym, y):
     raw = raw_ms_of(df)
     gap = (raw >= rms(y, 3, spr.day, 19)) & (raw < rms(y, 3, spr.day, 20))
     assert gap.sum() == 0
-    assert rms(y, 3, spr.day, 18, 59, 59) in set(raw) and rms(y, 3, spr.day, 20) in set(raw)
+    lb, fa = spring_edges_raw(y, sym)                 # echte Raender (Report)
+    assert lb in set(raw) and fa in set(raw)
     months = [(y, m) for m in (1, 2, 3, 4, 5)]
     seed_raw(tmp_path, months, sym=sym)
     site = Site()
@@ -816,7 +824,11 @@ def test_run_march_gap_written_every_tick_accounted(tmp_path, sym, y):
                    (datetime(mon.year, mon.month, mon.day, tzinfo=UTC),
                     datetime(mon.year, mon.month, mon.day, 1, tzinfo=UTC))):
         want = gen_ticks(sym, raws, lo, hi)
-        assert want >= 1200, (lo, want)
+        # dicht (alle 3 s); die Stunde vor der Umstellung endet am echten letzten Tick
+        # (z.B. XAG 2019 roh 18:58:00 = 23:58 UTC), daher dort die Untergrenze ab dem Rand
+        lb_utc = spring_edges_raw(y, sym)[0] + 5 * 3_600_000
+        floor = (lb_utc - utc_dt(y, 3, spr.day, 23)) // 3000 if lo.hour == 23 else 1200
+        assert want >= floor, (lo, want, floor)
         assert hour_ticks(tmp_path, sym, lo, hi) == want, (lo, hi)
     mrep = json.loads(month_report_file(tmp_path, sym, y, 3).read_text())
     ns = nights(mrep, spr)
@@ -825,12 +837,9 @@ def test_run_march_gap_written_every_tick_accounted(tmp_path, sym, y):
     rn = REAL_NIGHTS[(y, sym)]
     assert n["kind"] == "spring" and n["status"] == "ok"
     assert n["ticks_in_gap"] == rn["spring_ticks_in_gap"] == 0
-    assert str(n["last_before_raw"]).startswith(f"{spr:%Y-%m-%d} {SPRING_PATTERN[0]}")
-    assert str(n["first_after_raw"]).startswith(f"{spr:%Y-%m-%d} {SPRING_PATTERN[1]}")
-    if rn["spring_last_before_raw"] is not None:
-        assert str(n["last_before_raw"]).startswith(f"{spr:%Y-%m-%d} {rn['spring_last_before_raw']}")
-    if rn["spring_first_after_raw"] is not None:
-        assert str(n["first_after_raw"]).startswith(f"{spr:%Y-%m-%d} {rn['spring_first_after_raw']}")
+    # echte Raender aus dem Report (roh, Sekunden)
+    assert str(n["last_before_raw"]).startswith(f"{spr:%Y-%m-%d} {rn['spring_last_before_raw']}")
+    assert str(n["first_after_raw"]).startswith(f"{spr:%Y-%m-%d} {rn['spring_first_after_raw']}")
     src = raw_month(sym, y, 3, NEW)
     conv = fh.raw_to_utc_ms(raw_ms_of(src), rule(NEW))
     assert np.array_equal(conv, utc_ms_of(src)) and (np.diff(conv) > 0).all()
@@ -874,8 +883,12 @@ def test_transition_on_utc_month_boundary(tmp_path, sym, before, after, kind):
     check_months_written(tmp_path, sym, [before, after], {ym: NEW for ym in months})
     b0 = bars_of(store_file(tmp_path, sym, *before))
     b1 = bars_of(store_file(tmp_path, sym, *after))
-    # letzte Minute vorher = So 23:59 UTC, erste danach = Mo 00:00 UTC
-    assert b0["ts"].max() == pd.Timestamp(datetime(y, m, sun.day, 23, 59, tzinfo=UTC))
+    # letzte Minute vorher = Minute des echten letzten Ticks vor der Umstellung (Herbst
+    # roh 19:59:59 -> So 23:59 UTC; Fruehjahr echter Rand, z.B. XAG 2019 roh 18:58:00 ->
+    # So 23:58 UTC), erste danach = Mo 00:00 UTC
+    lb_raw = fall_edges_raw(y, sym)[0] if kind == "fall" else spring_edges_raw(y, sym)[0]
+    lb_utc = lb_raw + (4 if kind == "fall" else 5) * 3_600_000
+    assert b0["ts"].max() == pd.Timestamp(lb_utc - lb_utc % 60_000, unit="ms", tz="UTC")
     assert b1["ts"].min() == pd.Timestamp(datetime(*after, 1, tzinfo=UTC))
     # die Ticks Mo 00:00-01:00 UTC stammen aus dem ROHmonat davor (roh So 19:xx bzw. 20:xx)
     src = raw_month(sym, y, m, NEW)
