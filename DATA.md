@@ -263,6 +263,11 @@ Store (SRC = histdata im Tickmodus, histdata_m1 im M1-Modus):
                                    Erfolg geschrieben; Monatsreport dropped_ticks,
                                    dropped_raw, warning. Ausserhalb des
                                    geschlossenen Wochenendmarkts nie freigebbar;
+                                   ein einfaches "accepted": true ohne
+                                   releasable_weekend wird bei Ruecksprung oder
+                                   nicht eindeutiger Ortszeit IGNORIERT (ERROR,
+                                   Quarantaene bleibt); "undecided": verbotene
+                                   Stunden = Vereinigung ueber alle Kandidaten;
                                    unlesbarer Marker (JSON-Fehler): ERROR, bleibt,
                                    sperrt weiter
         <zip>.failed               dauerhafter Inhaltsfehler (JSON: error, count,
@@ -345,7 +350,10 @@ Zeitzone und Monatsgrenze:
   Ruecksprung (roh Sa 21:00 -> 20:00, verirrte Ticks im geschlossenen Markt
   der EU-Umstellungsnacht; freigebbar, s. Quarantaene). Nicht untersucht:
   2009, 2011, 2013, 2014, 2016, 2017, 2019, 2020, 2022, 2023, 2025.
-- Warum der Wechsel an jeder Rohmonatsgrenze dazwischen liegen kann: beide
+- Warum der Wechsel an jeder Rohmonatsgrenze dazwischen liegen kann, die
+  NICHT in einem Umstellungsfenster liegt (also nicht zwischen Rohmonat 10
+  und 11 - das Okt/Nov-Fenster ueberspannt beide; das Maerz-Fenster liegt
+  ganz im Rohmaerz): beide
   Regeln liefern ausserhalb zweier Fenster je Jahr dieselbe Abbildung roh ->
   UTC (UTC-5 im Winter, UTC-4 im Sommer). Nur in den Fenstern rechnet
   ny_local UTC-4, berlin_minus_6 UTC-5: Maerz vom US-Beginn (2. So 07:00 UTC)
@@ -595,7 +603,10 @@ fehlen also hoechstens 65 Rohmonate = 130 Requests (je Rohmonat Seiten-GET +
 POST), bei 5 s Pause mindestens ca. 11 min. Was sonst schon im Roh-Cache
 liegt (z.B. vom normalen Fetcher), wird nicht geladen; die genaue Zahl steht
 vor dem ersten Download auf der Konsole ("Plan: ...", "Geplant: N Rohmonate
-laden = 2N Requests"). Mit dem Default --max-downloads 80 reicht ein Aufruf.
+laden = 2N Requests"). Leere, noch unbestaetigte Monate (Marker .empty,
+letzte Pruefung < 24 h) stehen als "warten auf Bestaetigung" da und zaehlen
+nicht als Request (der Fetcher fragt dann nicht an), wohl aber als
+unvollstaendig. Mit dem Default --max-downloads 80 reicht ein Aufruf.
 Bricht er ab (429, Sperre aktiv, Download gescheitert), endet er mit Exit 3
 und nennt die noch fehlenden Rohmonate ("noch fehlend: N"); derselbe Befehl
 spaeter setzt fort, der Cache bleibt.
@@ -630,45 +641,55 @@ Ergebnis lesen:
   geschlossenen Wochenendmarkt liegt.
 - Entscheidend ist ein Rohmonat, in dem GENAU EINE Regel besteht und alle
   anderen durchfallen (Monate mit verworfenen Wochenend-Ticks zaehlen normal).
-- Umstellungsperioden: je Jahr "Maerz" (Rohmonat 03) und "Okt/Nov" (10 + 11).
-  Nur dort unterscheiden sich ny_local und berlin_minus_6: Maerz vom US-Beginn
-  (2. So Maerz) bis zum EU-Beginn (letzter So Maerz), Okt/Nov vom EU-Ende
-  (letzter So Oktober) bis zum US-Ende (1. So November). Urteil je Symbol =
-  die eine Regel, die in den Monaten der Periode entscheidend besteht; nicht
-  entscheidende oder fehlende Monate widersprechen nicht, zwei Monate mit
-  verschiedenen Gewinnern sind ein KONFLIKT. Gesamturteil: wo beide Metalle
-  entscheiden, muessen sie uebereinstimmen, sonst KONFLIKT. Bestaetigt =
-  fuer mindestens ein Metall entscheidend und ohne Widerspruch.
-- Wechselanalyse: Zahl der Wechsel und Konflikte, letzte bestaetigte Periode
-  der alten Regel, erste der neuen, offene Perioden dazwischen (auch nicht
-  untersuchte). Verlangt ist hoechstens EIN Wechsel und kein Konflikt; sonst
-  Exit 4 mit Erklaerung und ohne Vorschlag.
-- Fahrplan-Vorschlag (YAML zum Kopieren, mit Evidenztabelle Periode x Symbol
-  und Begruendung als Kommentar; die Config wird nie geschrieben):
+  Ueber beide Metalle: wo beide entscheiden, muessen sie uebereinstimmen,
+  sonst KONFLIKT. Nicht entscheidende oder fehlende Monate widersprechen nicht.
+- Umstellungsfenster: ny_local und berlin_minus_6 rechnen nur im Maerz (US-
+  Beginn 2. So Maerz bis EU-Beginn letzter So Maerz) und im Okt/Nov (EU-Ende
+  letzter So Oktober bis US-Ende 1. So November) verschieden um. Der Survey
+  rechnet je ROHmonat nach, ob es dort Fensterstunden gibt (Rohzeit -> UTC
+  unter beiden Regeln); in der Praxis haben alle Rohmonate 03, 10 und 11
+  Fenster, alle anderen keine.
+- Wechselanalyse ueber die entscheidenden ROHmonate (chronologisch): Zahl der
+  Wechsel und Konflikte, letzter entscheidender Rohmonat der alten Regel,
+  erster der neuen, jeder Rohmonat dazwischen mit Fenstern. Ein
+  entscheidender Oktober belegt NICHT den November derselben Periode (z.B.
+  hat Roh-2019-11 nur eine Fenster-Luecke, dort bestehen oft alle Regeln).
+  Oktober alt / November neu ist ein gueltiger Wechsel an der Grenze 10/11.
+  Verlangt ist hoechstens EIN Wechsel und kein Konflikt; sonst Exit 4 mit
+  Erklaerung und ohne Vorschlag.
+- Evidenztabelle Periode x Metall ("Maerz" = Roh 03, "Okt/Nov" = Roh 10 + 11),
+  nur zur Anzeige: Regel mit entscheidenden Monaten, "10: ny_local -> 11:
+  berlin_minus_6" bei einem Wechsel in der Periode, offen mit Grund je Monat.
+- Fahrplan-Vorschlag (YAML zum Kopieren, mit Evidenztabelle und Begruendung
+  als Kommentar; die Config wird nie geschrieben):
 
-      - {from: "2000-01", rule: ny_local}       # bis zur letzten ny_local-Periode
+      - {from: "2000-01", rule: ny_local}   # bis zum letzten entscheidenden ny-Rohmonat
       - {from: "<Monat danach>", rule: undecided, candidates: [ny_local, berlin_minus_6]}
-      - {from: "<YYYY-03 oder YYYY-10>", rule: berlin_minus_6}   # erste berlin-Periode
+      - {from: "<erster entscheidender berlin-Rohmonat>", rule: berlin_minus_6}
 
-  Der undecided-Eintrag kommt nur, wenn zwischen den beiden Perioden
-  Umstellungsperioden offen sind (fehlend oder nicht entscheidend). Begruendung:
-  Rohmonate ohne Umstellungsfenster (Dezember bis Februar, April bis
-  September) sind unter beiden Regeln identisch - der Survey rechnet das
-  stuendlich nach und nennt die Fenster -, daher ist jede Grenze zwischen der
-  letzten ny_local- und der ersten berlin_minus_6-Periode fuer diese Monate
-  gleichwertig. Ein Block (gleiche Regel) braucht mindestens 2 entscheidende
-  Monate ODER beide Metalle im selben Monat, sonst "zu wenig Evidenz" und kein
-  Vorschlag. Bei Exit 3 ist der Vorschlag als VORLAEUFIG markiert.
+  Der undecided-Eintrag kommt, sobald zwischen beiden Belegen ein Rohmonat
+  mit Fenster liegt (nicht entscheidend, fehlend oder nicht untersucht); er
+  muss jeden solchen Monat abdecken, sonst kein Vorschlag (Exit 4).
+  Rohmonate ohne Fenster sind unter beiden Regeln identisch, ihre Zuordnung
+  ist beliebig. Beispiel: letzter ny-Beleg 2019-10, 2019-11 nicht
+  entscheidend, erster berlin-Beleg 2020-03 -> undecided ab 2019-11, berlin
+  ab 2020-03. Ein Block (gleiche Regel) braucht mindestens 2 entscheidende
+  Monate ODER beide Metalle im selben Monat, sonst "zu wenig Evidenz" und
+  kein Vorschlag. Bei Exit 3 ist der Vorschlag als VORLAEUFIG markiert.
 - --markdown schreibt Evidenztabelle, Wechselanalyse, Vorschlag, Begruendung,
   verworfene Wochenend-Ticks und Ruecksprunge als Markdown (fuer die Doku und
   die Kommentare in config/histdata_timezone.yaml).
-- Exit 4: die konfigurierte Regel faellt in einem Monat durch, dessen
-  Fahrplan-Regel nicht undecided ist (Listen "KONFIGURIERTE REGEL FAELLT
-  DURCH" und, wenn entscheidend anders, "WIDERSPRUCH"), ODER mehr als ein
-  Wechsel, ODER ein Konflikt. Monate unter undecided stehen als "offen" da,
-  nie als Fehler. Exit 3: unvollstaendig (Download gescheitert, 429,
-  --max-downloads erreicht, Symbol-Lock belegt, bei --offline nicht im
-  Cache). 4 geht vor 3. Exit 0: sonst.
+- Exit-Codes, Vorrang von oben nach unten:
+  4 = Befund: die konfigurierte Regel faellt in einem Monat durch, dessen
+  Fahrplan-Regel nicht undecided ist ("KONFIGURIERTE REGEL FAELLT DURCH",
+  bei entscheidend anderer Regel auch "WIDERSPRUCH"), ODER mehr als ein
+  Wechsel, ODER ein Konflikt - auch wenn noch Monate fehlen. Monate unter
+  undecided stehen als "offen" da, nie als Fehler.
+  3 = unvollstaendig (Download gescheitert, 429, --max-downloads erreicht,
+  Symbol-Lock belegt, bei --offline nicht im Cache, wartet auf Bestaetigung).
+  4 = "Wechsel nicht belegt": alles ausgewertet, aber kein Vorschlag (zu
+  wenig Evidenz oder Grenze nicht gleichwertig; JSON unproven).
+  0 = sonst.
 
 Fahrplan aendern: erst wenn der Scan vollstaendig ist (kein Exit 3) und
 genau einen Wechsel ohne Konflikt zeigt, den Vorschlag in

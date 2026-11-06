@@ -1673,7 +1673,7 @@ def test_v6_reversal_detail_fields():
     rep = hd.check_timezone(_raw_ms(oct_), "XAUUSD")
     assert not rep["ok"] and rep["large_reversals"] == [{
         "at_raw": "2024-10-26 21:00:00", "back_to_raw": "2024-10-26 20:00:00", "minutes": 60.0,
-        "n_ticks": 5, "first_raw": "2024-10-26 20:20:00.000", "last_raw": "2024-10-26 20:25:00.000",
+        "n_ticks": 5, "first_raw": "2024-10-26 20:00:00.000", "last_raw": "2024-10-26 21:00:00.000",
         "weekend_closed": True}]
     assert rep["reversal_ticks_total"] == 5
     assert rep["releasable_weekend"] == {
@@ -1787,3 +1787,161 @@ def test_v6_migrates_v5_berlin_labelled_files(tmp_path, clock):
         label = hd.stored_timezone(out)
         assert "ny_local" in label and "v6" in label and "berlin" not in label
         pd.testing.assert_frame_equal(pd.read_parquet(out), df, check_dtype=False)
+
+
+
+# =============================================== Review v6: Regressionen ---
+def _with_ticks(df, stamps):
+    """Zusaetzliche Ticks (roh, Dateireihenfolge wie angegeben) vor dem ersten Tick
+    am/nach dem ersten Stempel einfuegen."""
+    i = int(np.searchsorted(df["raw"].to_numpy(), np.datetime64(stamps[0])))
+    extra = pd.DataFrame({"raw": pd.to_datetime(stamps), "utc": pd.NaT,
+                          "bid": df["bid"].iloc[i - 1], "ask": df["ask"].iloc[i - 1]})
+    return pd.concat([df.iloc[:i], extra, df.iloc[i:]], ignore_index=True)
+
+
+def _switch_2019_10_site(clock, stray):
+    """Wahrheit: ny_local bis Rohmonat 2019-09, berlin_minus_6 ab 2019-10 (Fahrplan:
+    undecided). Rohmonat November ohne Ticks 1.-3.11. (Ausfall); optional ein
+    verirrter Tick roh Sa 2019-10-26 20:30 (doppelte Stunde von berlin_minus_6)."""
+    oct_ = raw_month_ticks("XAUUSD", 2019, 10, stamping="berlin")
+    if stray:
+        oct_ = _with_ticks(oct_, ["2019-10-26 20:30:00"])
+    nov = raw_month_ticks("XAUUSD", 2019, 11, stamping="berlin")
+    nov = nov[nov["raw"] >= pd.Timestamp("2019-11-03 17:00")]
+    files = {("T", "201908"): tick_zip("XAUUSD", 2019, 8, stamping="ny"),
+             ("T", "201909"): tick_zip("XAUUSD", 2019, 9, stamping="ny"),
+             ("T", "201910"): _zip_from(oct_, "XAUUSD", 2019, 10),
+             ("T", "201911"): _zip_from(nov, "XAUUSD", 2019, 11),
+             ("T", "201912"): tick_zip("XAUUSD", 2019, 12, stamping="berlin")}
+    return Site(clock, files), oct_
+
+
+@pytest.mark.parametrize("stray", [True, False], ids=["stray", "no_stray"])
+def test_review_v6_undecided_erroring_candidate_still_compared(tmp_path, clock, stray):
+    """HIGH 2: wirft ein Kandidat (berlin_minus_6) wegen EINES verirrten Ticks
+    TimezoneError, muessen seine uebrigen Umrechnungen trotzdem verglichen werden.
+    Vorher: nur der verirrte Tick zaehlte als abweichend, UTC-November wurde aus den
+    Ticks vom 31.10. abends nach ny_local geschrieben (54 Minuten verschoben)."""
+    site, oct_ = _switch_2019_10_site(clock, stray)
+    und = hd.rule_for("tick", (2019, 10))
+    with pytest.raises(hd.RuleUndecided) as e:
+        hd.raw_to_utc_ms(_raw_ms(oct_), und)
+    assert len(e.value.differing_raw) > 1000                    # ganze Lueckenwoche, nicht 1
+    rep = run(tmp_path, clock, site, start=(2019, 9), end=(2019, 11))
+    assert rep["exit_code"] == 4, rep
+    assert not hd.store_path(tmp_path, "XAUUSD", 2019, 11).exists()
+    assert not hd.store_path(tmp_path, "XAUUSD", 2019, 10).exists()
+    held = rep["months_rule_undecided"]
+    assert {"2019-10", "2019-11"} <= set(held), rep["quarantined"]
+    assert held["2019-11"]["raw_month"] == "2019-10"
+    assert held["2019-10"]["differing_ticks"] > 1000
+    assert rep["summary"]["months_written"] == ["2019-09"]
+
+
+def test_review_v6_plain_accept_never_converts_reversal_or_impossible_ticks(tmp_path, clock, caplog):
+    """MEDIUM 3: ein einfaches "accepted": true (ohne releasable_weekend) hebt eine
+    Quarantaene wegen Ruecksprung oder nicht eindeutiger Ortszeit NICHT auf."""
+    now = datetime(2025, 1, 15, tzinfo=UTC)
+    # a) Ruecksprung unter der Woche (nicht freigebbar)
+    oct_ = raw_month_ticks("XAUUSD", 2024, 10)
+    r = oct_["raw"]
+    j = int(np.nonzero((r >= "2024-10-16 09:00").to_numpy())[0][0])
+    k = int(np.nonzero((r >= "2024-10-16 10:00").to_numpy())[0][0])
+    oct_ = pd.concat([oct_.iloc[:j], oct_.iloc[j + 1:k + 1], oct_.iloc[[j]], oct_.iloc[k + 1:]],
+                     ignore_index=True)
+    files = {("T", "202409"): tick_zip("XAUUSD", 2024, 9), ("T", "202410"): _zip_from(oct_, "XAUUSD", 2024, 10),
+             ("T", "202411"): tick_zip("XAUUSD", 2024, 11)}
+    site = Site(clock, files)
+    rep = run(tmp_path, clock, site, start=(2024, 10), end=(2024, 11), now=now)
+    assert rep["exit_code"] == 4
+    assert "--accept-weekend-ticks" in rep["hint"] and "NICHT bei Rueckspruengen" in rep["hint"]
+    q = hd.Unit("XAUUSD", "tick", 2024, 10).qmarker(tmp_path, (2024, 10))
+    q.write_text(json.dumps({**json.loads(q.read_text()), "accepted": True}))
+    with caplog.at_level("ERROR", logger="histdata"):
+        rep = run(tmp_path, clock, site, start=(2024, 10), end=(2024, 11), now=now)
+    assert rep["exit_code"] == 4 and not hd.store_path(tmp_path, "XAUUSD", 2024, 10).exists()
+    reason = rep["quarantine"][0]["reason"]
+    assert "IGNORIERT" in reason and "nicht freigebbar" in reason
+    assert rep["quarantine"][0]["check"]["accepted_ignored"] is True
+    assert any("IGNORIERT" in x.getMessage() for x in caplog.records if x.levelname == "ERROR")
+    # b) Tick in der doppelten Stunde (Wochenende), Marker ohne releasable_weekend
+    root = tmp_path / "b"
+    site = Site(clock, _oct_with_saturday_tick())
+    run(root, clock, site, start=(2024, 10), now=now)
+    q = hd.Unit("XAUUSD", "tick", 2024, 10).qmarker(root, (2024, 10))
+    info = json.loads(q.read_text())
+    info.pop("releasable_weekend")
+    q.write_text(json.dumps({**info, "accepted": True}))
+    rep = run(root, clock, site, start=(2024, 10), now=now)
+    assert rep["exit_code"] == 4 and not hd.store_path(root, "XAUUSD", 2024, 10).exists()
+    assert "IGNORIERT" in rep["quarantine"][0]["reason"]
+    assert "--accept-weekend-ticks 2024-10" in rep["quarantine"][0]["reason"]
+    # c) andere manuelle Gruende bleiben freigebbar (Zeitzone passt nicht, kein Ruecksprung)
+    root = tmp_path / "c"
+    for m in (5, 6, 7, 8, 9):
+        p = hd.Unit("XAUUSD", "tick", 2024, m).path(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(tick_zip("XAUUSD", 2024, m, stamping="est"))
+    empty = Site(clock)
+    for _ in range(5):                         # Rohmonate werden nacheinander geprueft
+        rep = run(root, clock, empty, start=(2024, 7))
+        if rep["exit_code"] != 4:
+            break
+        for qm in (root / "metals").rglob("*.quarantine"):
+            info = json.loads(qm.read_text())
+            assert "IGNORIERT" not in (info.get("reason") or "")
+            qm.write_text(json.dumps({**info, "accepted": True}))
+    assert rep["exit_code"] == 0 and rep["summary"]["months_written"] == ["2024-07"], rep
+
+
+def test_review_v6_reversal_first_last_raw_are_min_max():
+    """LOW 4: first_raw/last_raw = frueheste/spaeteste Rohzeit des Intervalls (nicht
+    Dateireihenfolge); n_ticks je eigenem Intervall, Ueberlappung zaehlt doppelt."""
+    base = raw_month_ticks("XAUUSD", 2024, 10)
+    df = _with_ticks(base, ["2024-10-19 20:30", "2024-10-19 21:00", "2024-10-19 20:00", "2024-10-19 20:40"])
+    rep = hd.check_timezone(_raw_ms(df), "XAUUSD")
+    assert rep["large_reversals"] == [{
+        "at_raw": "2024-10-19 21:00:00", "back_to_raw": "2024-10-19 20:00:00", "minutes": 60.0,
+        "n_ticks": 4, "first_raw": "2024-10-19 20:00:00.000", "last_raw": "2024-10-19 21:00:00.000",
+        "weekend_closed": True}]
+    assert rep["reversal_ticks_total"] == 4
+    df = _with_ticks(base, ["2024-10-19 20:30", "2024-10-19 21:00", "2024-10-19 20:00",
+                            "2024-10-19 20:50", "2024-10-19 20:10"])
+    rep = hd.check_timezone(_raw_ms(df), "XAUUSD")
+    assert [r["n_ticks"] for r in rep["large_reversals"]] == [5, 3]
+    assert rep["reversal_ticks_total"] == 5
+    assert rep["large_reversals"][1]["first_raw"] == "2024-10-19 20:10:00.000"
+    assert rep["large_reversals"][1]["last_raw"] == "2024-10-19 20:50:00.000"
+
+
+def test_review_v6_undecided_impossible_hours_are_union_of_candidates(tmp_path, clock, monkeypatch):
+    """LOW 6: unter "undecided" sind die verbotenen Stunden die Vereinigung ueber alle
+    Kandidaten: ein berlin_minus_6-Streutick (roh Sa 20:02, ausserhalb des Ruecksprungs)
+    wird mit freigegeben und verworfen; vorher zaehlte nur ny_local (erster Kandidat)."""
+    und = hd.rule_for("tick", (2019, 10))
+    stray = np.array([_ms("2019-10-26 20:02"), _ms("2019-10-26 20:30")])
+    assert hd._impossible_mask(stray, rule=hd.TZ_RULES["ny_local"]).tolist() == [False, False]
+    assert hd._impossible_mask(stray, rule=und).tolist() == [True, True]
+    oct_ = _with_ticks(raw_month_ticks("XAUUSD", 2019, 10, stamping="berlin"),
+                       ["2019-10-26 20:02", "2019-10-26 20:20", "2019-10-26 20:50", "2019-10-26 21:00",
+                        "2019-10-26 20:05", "2019-10-26 20:30"])
+    rep = hd.check_timezone(_raw_ms(oct_), "XAUUSD")
+    assert rep["releasable_weekend"]["reversal_ticks"] == 5
+    assert rep["releasable_weekend"]["impossible_hour_ticks"] == 5
+    assert rep["releasable_weekend"]["raw_ranges"] == [["2019-10-26 20:02:00.000", "2019-10-26 21:00:00.000"]]
+    files = {("T", "201909"): tick_zip("XAUUSD", 2019, 9, stamping="ny"),
+             ("T", "201910"): _zip_from(oct_, "XAUUSD", 2019, 10),
+             ("T", "201911"): tick_zip("XAUUSD", 2019, 11, stamping="berlin")}
+    site = Site(clock, files)
+    rep = run(tmp_path, clock, site, start=(2019, 10), end=(2019, 11))
+    assert rep["exit_code"] == 4 and rep["quarantine"][0]["raw_month"] == "2019-10"
+    q = hd.Unit("XAUUSD", "tick", 2019, 10).qmarker(tmp_path, (2019, 10))
+    assert json.loads(q.read_text())["releasable_weekend"]["impossible_hour_ticks"] == 5
+    monkeypatch.setenv("MARKETDATA_DATA_ROOT", str(tmp_path))
+    assert hd.main(["--symbol", "XAUUSD", "--accept-weekend-ticks", "2019-10"]) == 0
+    rep = run(tmp_path, clock, site, start=(2019, 10), end=(2019, 11))
+    # Streuticks verworfen; Oktober bleibt nur wegen der Lueckenwoche offen (undecided)
+    assert rep["quarantine"] == [] and "2019-10" in rep["months_rule_undecided"], rep["quarantined"]
+    ranges = rep["months_rule_undecided"]["2019-10"]["raw_ranges"]
+    assert not any(a.startswith("2019-10-26 20:") for a, _ in ranges), ranges

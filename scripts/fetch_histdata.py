@@ -125,6 +125,9 @@ tz_check_version. Nicht freigegebene Marker aelterer Version/anderer Regel
 fuer dieselbe Regel (Zone + Verschiebung); eine Freigabe unter anderer
 Regel wird neu geprueft - besteht: Marker weg, sonst neuer Marker accepted
 false mit Hinweis. Unlesbarer Marker: ERROR, bleibt, sperrt weiter.
+Ein einfaches "accepted": true gilt NIE fuer Rueckspruenge >= 30 min oder
+Ticks in nicht eindeutiger Ortszeit (wird ignoriert, ERROR, Quarantaene
+bleibt); dort hilft nur releasable_weekend (s. u.).
 Ruecksprung >= 30 min (large_reversals mit at_raw, back_to_raw, minutes,
 n_ticks, first_raw, last_raw, weekend_closed; betroffen = alle Ticks mit
 Rohzeit in [back_to_raw, at_raw]) und nicht eindeutige Ortszeit sperren per
@@ -136,7 +139,11 @@ raw_ranges). Freigabe mit --accept-weekend-ticks YYYY-MM (ROHmonat, mit
 --symbol/--mode; gibt die Ticks aus, kein Download; sonst Exit 2): genau
 diese Ticks werden VERWORFEN (nie umgerechnet), der Rest neu geprueft und
 bei Erfolg geschrieben; Monatsreport dropped_ticks, dropped_raw, warning.
-Ausserhalb des geschlossenen Wochenendmarkts nie freigebbar.
+Ausserhalb des geschlossenen Wochenendmarkts nie freigebbar. "undecided":
+verbotene Stunden = Vereinigung ueber alle Kandidaten; ein Tick, den ein
+Kandidat nicht umrechnen kann, zaehlt als verschieden umgerechnet.
+first_raw/last_raw = frueheste/spaeteste Rohzeit des Intervalls; n_ticks
+je Ruecksprung (ueberlappende zaehlen doppelt, reversal_ticks_total nicht).
 EURUSD-Storeverzeichnisse aus Pruefversion 4 verschiebt jeder Lauf nach
 metals/stale/ (retired_removed_symbols).
 
@@ -150,7 +157,8 @@ histdata (tick) bzw. histdata_m1 (m1):
                           Historie nach manueller Pruefung akzeptiert)
         <zip>[.YYYY-MM].quarantine  Zeitzone/Format; loeschen = erneut pruefen
                           (ohne Download); "accepted": true = nach manueller
-                          Pruefung freigeben; ein neuer Download (ZIP loeschen)
+                          Pruefung freigeben (nicht bei Ruecksprung/nicht
+                          eindeutiger Ortszeit: --accept-weekend-ticks); ein neuer Download (ZIP loeschen)
                           entfernt den Marker und prueft neu; Marker aelterer
                           tz_check_version werden automatisch neu geprueft
         <zip>.failed      dauerhafter Inhaltsfehler (kein Formular, HTML statt
@@ -761,30 +769,69 @@ def _ranges_of(raw_ms: np.ndarray, gap_ms: int = HOUR_MS) -> list[tuple[str, str
             for a, b in zip(starts, ends)]
 
 
-def _raw_to_utc_undecided(raw_ms: np.ndarray, rule: "UndecidedRule") -> np.ndarray:
-    """Alle Kandidaten rechnen; nur bei identischem Ergebnis zurueck, sonst RuleUndecided."""
-    outs, errs = [], []
+@dataclass
+class UndecidedConversion:
+    """Umrechnung unter allen Kandidaten einer "undecided"-Regel.
+    utcs[k]/valid[k]: UTC je Tick unter Kandidat k und ob er ihn umrechnen kann
+    (verbotene Stunde -> False); diff: Ticks, die NICHT alle Kandidaten gleich
+    umrechnen (auch: ein Kandidat kann sie nicht umrechnen); ref: UTC des ersten
+    Kandidaten, der den Tick umrechnen kann (fuer nicht abweichende Ticks = alle)."""
+    utcs: list
+    valid: list
+    diff: np.ndarray
+    ref: np.ndarray
+    errors: list
+
+
+def undecided_conversion(raw_ms: np.ndarray, rule: "UndecidedRule") -> UndecidedConversion:
+    """Jeden Kandidaten auf ALLEN Ticks rechnen: wirft ein Kandidat TimezoneError,
+    werden seine uebrigen Ticks (ohne bad_mask) trotzdem umgerechnet und mit den
+    anderen Kandidaten verglichen - sonst blieben seine abweichenden Zeiten unbemerkt."""
+    raw_ms = np.asarray(raw_ms, dtype=np.int64)
+    n = len(raw_ms)
+    utcs, valid, errs = [], [], []
     for c in rule.candidates:
         try:
-            outs.append(raw_to_utc_ms(raw_ms, c))
+            u = raw_to_utc_ms(raw_ms, c)
+            v = np.ones(n, dtype=bool)
             errs.append(None)
         except TimezoneError as e:
-            outs.append(None)
+            bad = getattr(e, "bad_mask", None)
+            v = np.zeros(n, dtype=bool) if bad is None else ~np.asarray(bad, dtype=bool)
+            u = np.zeros(n, dtype=np.int64)
+            if v.any():
+                u[v] = raw_to_utc_ms(raw_ms[v], c)
             errs.append(e)
-    if all(e is not None for e in errs):
-        raise errs[0]                            # ueberall nicht eindeutig: normale Behandlung
-    diff = np.zeros(len(raw_ms), dtype=bool)
-    ref = next(o for o in outs if o is not None)
-    for o, e in zip(outs, errs):
-        diff |= getattr(e, "bad_mask", np.ones(len(raw_ms), bool)) if o is None else (o != ref)
-    if diff.any():
-        ranges = _ranges_of(raw_ms[diff])
+        utcs.append(u)
+        valid.append(v)
+    ref = np.zeros(n, dtype=np.int64)
+    have = np.zeros(n, dtype=bool)
+    for u, v in zip(reversed(utcs), reversed(valid)):     # erster gueltiger Kandidat gewinnt
+        ref = np.where(v, u, ref)
+        have |= v
+    diff = ~have
+    for u, v in zip(utcs, valid):
+        diff |= ~v | (u != ref)
+    return UndecidedConversion(utcs, valid, diff, ref, errs)
+
+
+def _raw_to_utc_undecided(raw_ms: np.ndarray, rule: "UndecidedRule") -> np.ndarray:
+    """Alle Kandidaten rechnen; nur bei identischem Ergebnis zurueck, sonst RuleUndecided.
+    Kann KEIN Kandidat umrechnen (jeder wirft TimezoneError): TimezoneError mit der
+    Vereinigung der bad_mask (normale Quarantaene)."""
+    conv = undecided_conversion(raw_ms, rule)
+    if all(e is not None for e in conv.errors):
+        err = TimezoneError("; ".join(str(e) for e in conv.errors))
+        err.bad_mask = np.logical_or.reduce([~v for v in conv.valid])
+        raise err
+    if conv.diff.any():
+        ranges = _ranges_of(raw_ms[conv.diff])
         raise RuleUndecided(
-            f"{int(diff.sum())} Tick(s), die die Kandidaten "
-            f"{', '.join(c.name for c in rule.candidates)} verschieden umrechnen (Zeitraum "
-            f"'undecided'), roh z.B. {', '.join(f'{a}..{b}' for a, b in ranges[:5])} - nicht "
-            "geschrieben, bis der Fahrplan entschieden ist", raw_ms[diff], ranges)
-    return ref
+            f"{int(conv.diff.sum())} Tick(s), die die Kandidaten "
+            f"{', '.join(c.name for c in rule.candidates)} verschieden (oder nicht alle) umrechnen "
+            f"(Zeitraum 'undecided'), roh z.B. {', '.join(f'{a}..{b}' for a, b in ranges[:5])} - nicht "
+            "geschrieben, bis der Fahrplan entschieden ist", raw_ms[conv.diff], ranges)
+    return conv.ref
 
 
 def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
@@ -832,9 +879,11 @@ def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
 
 
 # Geschlossener Wochenendmarkt nach ROHuhr, konservativ ueber alle Regeln und
-# Offsets (Schluss Fr 17:00 New York = roh 16:00-18:00, Oeffnung So 18:00 New
-# York = roh 17:00-19:00 je nach Regel/Woche): Freitag ab 18:00, ganzer Samstag,
-# Sonntag vor 16:00. (Wochentag Mo = 0, Stunde) von inklusive bis exklusive.
+# Offsets: unter ny_local und berlin_minus_6 ist roh = New York oder New York
+# - 1 h (Lueckenwochen), also Schluss Fr 17:00 New York = roh 16:00 oder 17:00,
+# Oeffnung So 18:00 New York = roh 17:00 oder 18:00; mit einer Stunde Abstand:
+# Freitag ab 18:00, ganzer Samstag, Sonntag vor 16:00. (Wochentag Mo = 0,
+# Stunde) von inklusive bis exklusive.
 # Nur Ticks hier duerfen nach menschlicher Freigabe verworfen werden.
 WEEKEND_CLOSED_RAW = ((4, 18), (6, 16))
 
@@ -852,7 +901,10 @@ def weekend_closed_raw(raw_ms: np.ndarray) -> np.ndarray:
 
 def _reversal_mask(raw_ms: np.ndarray) -> tuple[np.ndarray, list[dict]]:
     """Ruecksprung >= REGRESSION_MAX_MS in Dateireihenfolge: betroffen sind alle
-    Ticks mit Rohzeit in [zurueck_auf, bei] -> (Maske, Details je Ruecksprung)."""
+    Ticks mit Rohzeit in [zurueck_auf, bei] -> (Maske, Details je Ruecksprung).
+    n_ticks zaehlt das EIGENE Intervall jedes Ruecksprungs; ueberlappen sich
+    Rueckspruenge, kann die Summe der n_ticks groesser sein als die Vereinigung
+    (reversal_ticks_total). first_raw/last_raw = frueheste/spaeteste Rohzeit."""
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
     mask = np.zeros(len(raw_ms), dtype=bool)
     out = []
@@ -861,18 +913,18 @@ def _reversal_mask(raw_ms: np.ndarray) -> tuple[np.ndarray, list[dict]]:
         at, back = int(raw_ms[i]), int(raw_ms[i + 1])
         m = (raw_ms >= back) & (raw_ms <= at)
         mask |= m
-        idx = np.nonzero(m)[0]
+        sub = raw_ms[m]
         out.append({"at_raw": _raw_iso(at), "back_to_raw": _raw_iso(back),
-                    "minutes": round((at - back) / MIN_MS, 1), "n_ticks": int(len(idx)),
-                    "first_raw": _raw_iso(int(raw_ms[idx[0]]), ms_digits=True),
-                    "last_raw": _raw_iso(int(raw_ms[idx[-1]]), ms_digits=True),
+                    "minutes": round((at - back) / MIN_MS, 1), "n_ticks": int(len(sub)),
+                    "first_raw": _raw_iso(int(sub.min()), ms_digits=True),
+                    "last_raw": _raw_iso(int(sub.max()), ms_digits=True),
                     "weekend_closed": bool(weekend_closed_raw(raw_ms[m]).all())})
     return mask, out
 
 
 def _impossible_mask(raw_ms: np.ndarray, mode: str = "tick", rule=None) -> np.ndarray:
     """Ticks in nicht eindeutiger Ortszeit (verbotene Stunden) unter `rule` bzw.
-    der Regel ihres Rohmonats ("undecided": erster Kandidat)."""
+    der Regel ihres Rohmonats ("undecided": Vereinigung ueber ALLE Kandidaten)."""
     raw_ms = np.asarray(raw_ms, dtype=np.int64)
     bad = np.zeros(len(raw_ms), dtype=bool)
     if not len(raw_ms):
@@ -881,12 +933,13 @@ def _impossible_mask(raw_ms: np.ndarray, mode: str = "tick", rule=None) -> np.nd
     for k in np.unique(idx):
         sel = idx == k
         r = rule if rule is not None else rule_for(mode, (int(k) // 12, int(k) % 12 + 1))
-        try:
-            raw_to_utc_ms(raw_ms[sel], concrete_rule(r))
-        except TimezoneError as e:
-            m = getattr(e, "bad_mask", None)
-            sub = np.zeros(int(sel.sum()), dtype=bool) if m is None else m
-            bad[np.nonzero(sel)[0][sub]] = True
+        for c in rule_candidates(r):
+            try:
+                raw_to_utc_ms(raw_ms[sel], c)
+            except TimezoneError as e:
+                m = getattr(e, "bad_mask", None)
+                sub = np.ones(int(sel.sum()), dtype=bool) if m is None else np.asarray(m, dtype=bool)
+                bad[np.nonzero(sel)[0][sub]] = True
     return bad
 
 
@@ -2187,30 +2240,25 @@ class Ctx:
 
     def _convert(self, raw: np.ndarray, rule, u: Unit, ym: tuple[int, int]) -> np.ndarray:
         """Rohzeit -> UTC nach der Regel des Rohmonats (TimezoneError wie raw_to_utc_ms).
-        "undecided": erster rechnender Kandidat; Ticks, die die Kandidaten verschieden
-        umrechnen, werden mit allen Kandidaten-UTC gemerkt (ctx.undecided) -
-        build_month schreibt einen UTC-Monat nicht, in den einer davon fallen kann."""
+        "undecided": UTC des ersten Kandidaten, der umrechnen kann; Ticks, die die
+        Kandidaten verschieden (oder nicht alle) umrechnen, werden mit den echten
+        UTC-Zeiten JEDES Kandidaten gemerkt (ctx.undecided) - build_month schreibt
+        keinen UTC-Monat, in den einer davon fallen kann. Kann kein Kandidat
+        umrechnen (alle werfen): TimezoneError (Vereinigung der bad_mask)."""
         if not isinstance(rule, UndecidedRule):
             return raw_to_utc_ms(raw, rule)
-        outs, errs = [], []
-        for c in rule.candidates:
-            try:
-                outs.append(raw_to_utc_ms(raw, c))
-                errs.append(None)
-            except TimezoneError as e:
-                outs.append(None)
-                errs.append(e)
-        if all(e is not None for e in errs):
-            raise errs[0]                        # ueberall nicht eindeutig: normale Behandlung
-        ref = next(o for o in outs if o is not None)
-        diff = np.zeros(len(raw), dtype=bool)
-        for o, e in zip(outs, errs):
-            diff |= getattr(e, "bad_mask", np.ones(len(raw), dtype=bool)) if o is None else (o != ref)
-        if diff.any():
-            self.undecided[(u, ym)] = (raw[diff], [(o if o is not None else ref)[diff] for o in outs])
+        conv = undecided_conversion(raw, rule)
+        if all(e is not None for e in conv.errors):
+            err = TimezoneError("; ".join(str(e) for e in conv.errors))
+            err.bad_mask = np.logical_or.reduce([~v for v in conv.valid])
+            raise err
+        d = conv.diff
+        if d.any():
+            self.undecided[(u, ym)] = (raw[d], [x[d] for x in conv.utcs], [v[d] for v in conv.valid],
+                                       conv.ref[d])
         else:
             self.undecided.pop((u, ym), None)
-        return ref
+        return conv.ref
 
     def _check(self, raw: np.ndarray, ym, bounds, nb, rule=None) -> dict:
         """check_timezone fuer Rohmonat ym (rule None = Regel je Rohmonat), bei zu
@@ -2280,6 +2328,23 @@ class Ctx:
                         dropped["dropped_ticks"], ", ".join(dropped["dropped_raw"][:3]))
             sel = sel[~drop].reset_index(drop=True)
             raw_all = raw_all[~drop]
+        elif accepted:
+            # ein einfaches "accepted": true gilt NICHT fuer Rueckspruenge >= 30 min oder
+            # Ticks in nicht eindeutiger Ortszeit (Regel des Owners: sonst Quarantaene);
+            # verwerfen nur ueber releasable_weekend (--accept-weekend-ticks)
+            drop, rel = weekend_release(raw_all, self.mode, rule)
+            if drop.any():
+                rng = ", ".join(f"{a}..{b}" for a, b in _ranges_of(raw_all[drop])[:3])
+                reason = (f"\"accepted\": true im Marker {q.name} wird IGNORIERT: {int(drop.sum())} Tick(s) "
+                          f"mit Ruecksprung >= {REGRESSION_MAX_MS // MIN_MS} min oder nicht eindeutiger "
+                          f"Ortszeit (roh {rng}) werden nie umgerechnet - " + (
+                              "alle im geschlossenen Wochenendmarkt: Marker loeschen (= neu pruefen), "
+                              f"dann --accept-weekend-ticks {_ymstr(ym)} (verwirft genau diese Ticks)"
+                              if rel is not None else
+                              "nicht freigebbar (Ticks ausserhalb des geschlossenen Wochenendmarkts)"))
+                log.error("%s Rohmonat %s: %s", u.key, _ymstr(ym), reason)
+                raise Quarantined(u, ym, reason, {"accepted_ignored": True, "releasable_weekend": rel,
+                                                  "status": "failed", "ok": False, "reason": reason})
         try:
             sel = sel.assign(utc_ms=self._convert(raw_all, rule, u, ym))
         except TimezoneError as e:
@@ -2315,6 +2380,12 @@ class Ctx:
             chk = next((c for c in results if c["ok"]), results[0])
             if cands != [None]:
                 chk = {**chk, "candidates_checked": {c.name: r["status"] for c, r in zip(cands, results)}}
+                # verwerfbare Ticks nach der Fahrplan-Regel (Vereinigung ueber alle
+                # Kandidaten), nicht nur nach dem geprueften Kandidaten
+                chk.pop("releasable_weekend", None)
+                _, rel_all = weekend_release(sel["raw_ms"].to_numpy(), self.mode, rule)
+                if rel_all is not None:
+                    chk["releasable_weekend"] = rel_all
             chk["padding"] = pad
             if not pad["provisional"]:
                 self.tz[key] = chk
@@ -2358,10 +2429,14 @@ class Ctx:
             return
         lo_ms = int(datetime(*ym, 1, tzinfo=UTC).timestamp() * 1000)
         hi_ms = int(datetime(*_ym_add(ym, 1), 1, tzinfo=UTC).timestamp() * 1000)
-        d_raw, d_utcs = und
+        d_raw, d_utcs, d_valid, d_ref = und
         hit = np.zeros(len(d_raw), dtype=bool)
-        for x in d_utcs:
-            hit |= (x >= lo_ms) & (x < hi_ms)
+        for x, v in zip(d_utcs, d_valid):
+            hit |= v & (x >= lo_ms) & (x < hi_ms)
+        # kann ein Kandidat den Tick nicht umrechnen (verbotene Stunde), liegt er
+        # unter ihm "irgendwo um" die anderen Zeiten: konservativ +-2 h
+        unk = ~np.logical_and.reduce(d_valid)
+        hit |= unk & (d_ref >= lo_ms - 2 * HOUR_MS) & (d_ref < hi_ms + 2 * HOUR_MS)
         if not hit.any():
             return
         ranges = _ranges_of(d_raw[hit])
@@ -2845,7 +2920,10 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
                      "--verify-month fuer den Monat. <zip>.quarantine loeschen = erneut pruefen "
                      "(ohne Download); ZIP loeschen = neu laden und neu pruefen (Marker wird "
                      "dabei entfernt); nach manueller Pruefung \"accepted\": true im Marker "
-                     "(.quarantine bzw. .empty) = freigeben.")
+                     "(.quarantine bzw. .empty) = freigeben - NICHT bei Rueckspruengen/nicht "
+                     "eindeutiger Ortszeit: dort nur Wochenend-Ticks verwerfen mit "
+                     "--accept-weekend-ticks YYYY-MM (Marker mit releasable_weekend), sonst "
+                     "bleibt die Quarantaene.")
     if client.abort:
         hints.append(f"Lauf abgebrochen: {client.abort}")
     if content:

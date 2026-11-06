@@ -576,9 +576,10 @@ def test_check_timezone_reports_weekend_reversal(ym):
     day = f"{sat:%Y-%m-%d}"
     assert r["at_raw"].startswith(f"{day} 20:59")
     assert r["back_to_raw"].startswith(f"{day} 20:05")
-    assert 50 <= r["minutes"] <= 60
+    assert r["minutes"] == 54.0                          # 20:59 -> 20:05
     assert r["n_ticks"] == N_STRAY
-    assert r["first_raw"].startswith(f"{day} 20:") and r["last_raw"].startswith(f"{day} 20:")
+    assert r["first_raw"].startswith(f"{day} 20:05:00")   # min der betroffenen Rohzeiten
+    assert r["last_raw"].startswith(f"{day} 20:59:00")    # max
     assert r["weekend_closed"] is True
     assert rep["reversal_ticks_total"] == N_STRAY
     rw = rep["releasable_weekend"]
@@ -589,8 +590,70 @@ def test_check_timezone_reports_weekend_reversal(ym):
     assert all(day in str(x) for x in rw["raw_ranges"])
 
 
-def test_weekend_closed_constant_exists():
-    assert fh.WEEKEND_CLOSED_RAW is not None
+def test_weekend_closed_raw_clock_exact_edges():
+    """Geschlossenes Wochenende nach ROHuhr: Fr >= 18:00, ganzer Samstag, So < 16:00."""
+    cases = [((2024, 7, 11, 23, 59, 59, 999_000), False),   # Do
+             ((2024, 7, 12, 17, 59, 0), False), ((2024, 7, 12, 17, 59, 59, 999_000), False),
+             ((2024, 7, 12, 18, 0, 0), True),
+             ((2024, 7, 13, 0, 0, 0), True), ((2024, 7, 13, 12, 0, 0), True),
+             ((2024, 7, 13, 23, 59, 59, 999_000), True),
+             ((2024, 7, 14, 0, 0, 0), True), ((2024, 7, 14, 15, 59, 0), True),
+             ((2024, 7, 14, 15, 59, 59, 999_000), True),
+             ((2024, 7, 14, 16, 0, 0), False), ((2024, 7, 14, 18, 0, 0), False),
+             ((2024, 7, 15, 3, 0, 0), False)]                  # Mo
+    raw = np.array([rms(*c) for c, _ in cases], dtype=np.int64)
+    got = np.asarray(fh.weekend_closed_raw(raw))
+    assert got.dtype == bool
+    assert list(got) == [want for _, want in cases]
+
+
+# (Ticks in Dateireihenfolge als (Tag, h, min) im Juli 2024, Minuten, freigebbar)
+WEEKEND_EDGES = {
+    "fri_1759_open": ([(12, 18, 40), (12, 17, 59)], 41.0, False),
+    "fri_1800_closed": ([(12, 18, 40), (12, 18, 0)], 40.0, True),
+    "sat_whole_day": ([(13, 23, 59), (13, 0, 0)], 1439.0, True),
+    "sun_1559_closed": ([(14, 15, 59), (14, 15, 19)], 40.0, True),
+    "sun_1600_open": ([(14, 16, 0), (14, 15, 20)], 40.0, False),
+}
+
+
+@pytest.mark.parametrize("case", sorted(WEEKEND_EDGES))
+def test_weekend_reversal_releasable_exactly_at_raw_clock_edges(case):
+    """Beobachtbar ueber check_timezone: ein Ruecksprung ist nur freigebbar, wenn ALLE
+    betroffenen Ticks (roh in [back_to, at]) im geschlossenen Wochenende liegen."""
+    ticks, minutes, closed = WEEKEND_EDGES[case]
+    ms = [rms(2024, 7, d, h, mi) for d, h, mi in ticks]
+    df = with_extra(raw_month("XAUUSD", 2024, 7, B6), ms, min(ms) - 1)
+    rep = fh.check_timezone(raw_ms_of(df), "XAUUSD", month_bounds(2024, 7), mode="tick",
+                            rule=rule(B6), neighbours=neighbours("XAUUSD", (2024, 7)))
+    lr = rep["large_reversals"]
+    assert len(lr) == 1 and lr[0]["minutes"] == minutes
+    assert lr[0]["n_ticks"] == 2
+    assert lr[0]["weekend_closed"] is closed
+    assert rep["reversal_ticks_total"] == 2
+    if closed:
+        assert rep["releasable_weekend"]["reversal_ticks"] == 2
+        assert rep["releasable_weekend"]["impossible_hour_ticks"] == 0
+    else:
+        assert "releasable_weekend" not in rep
+
+
+def test_reversal_first_last_raw_are_min_max_of_affected_ticks():
+    """Dateireihenfolge 20:30, 21:00, 20:00, 20:40 (Sa): first_raw = 20:00, last_raw = 21:00."""
+    ms = [rms(2024, 7, 13, h, mi) for h, mi in ((20, 30), (21, 0), (20, 0), (20, 40))]
+    df = with_extra(raw_month("XAUUSD", 2024, 7, B6), ms, min(ms) - 1)
+    rep = fh.check_timezone(raw_ms_of(df), "XAUUSD", month_bounds(2024, 7), mode="tick",
+                            rule=rule(B6), neighbours=neighbours("XAUUSD", (2024, 7)))
+    lr = rep["large_reversals"]
+    assert len(lr) == 1
+    r = lr[0]
+    assert r["at_raw"].startswith("2024-07-13 21:00:00")
+    assert r["back_to_raw"].startswith("2024-07-13 20:00:00")
+    assert r["minutes"] == 60.0
+    assert r["n_ticks"] == 4
+    assert r["first_raw"].startswith("2024-07-13 20:00:00")
+    assert r["last_raw"].startswith("2024-07-13 21:00:00")
+    assert r["weekend_closed"] is True
 
 
 @pytest.mark.parametrize("when,closed", [
@@ -609,7 +672,7 @@ def test_weekend_closed_by_raw_clock(when, closed):
     rep = fh.check_timezone(raw_ms_of(df), "XAUUSD", month_bounds(2024, 7), mode="tick",
                             rule=rule(B6), neighbours=neighbours("XAUUSD", (2024, 7)))
     lr = rep["large_reversals"]
-    assert len(lr) == 1 and 57 <= lr[0]["minutes"] <= 59
+    assert len(lr) == 1 and lr[0]["minutes"] == 58.0
     assert lr[0]["weekend_closed"] is closed
     assert lr[0]["n_ticks"] == 2
     assert rep["reversal_ticks_total"] == 2
@@ -617,7 +680,7 @@ def test_weekend_closed_by_raw_clock(when, closed):
         rw = rep["releasable_weekend"]
         assert rw["reversal_ticks"] == 2 and rw["impossible_hour_ticks"] == 0
     else:
-        assert not rep.get("releasable_weekend")
+        assert "releasable_weekend" not in rep
 
 
 def test_reversal_on_wednesday_is_never_releasable():
@@ -628,14 +691,14 @@ def test_reversal_on_wednesday_is_never_releasable():
                             rule=rule(B6), neighbours=neighbours("XAUUSD", (2024, 10)))
     assert rep["status"] == "failed"
     assert [r["weekend_closed"] for r in rep["large_reversals"]] == [False]
-    assert 59 <= rep["large_reversals"][0]["minutes"] <= 61
-    assert not rep.get("releasable_weekend")
+    assert rep["large_reversals"][0]["minutes"] == 60.0
+    assert "releasable_weekend" not in rep
     # zusammen mit den Wochenend-Streuticks: auch nicht freigebbar (nicht ALLE im Wochenende)
     both = with_extra(weekend_reversal_month((2024, 10)), wed, rms(2024, 10, 23, 12))
     rep2 = fh.check_timezone(raw_ms_of(both), "XAUUSD", month_bounds(2024, 10), mode="tick",
                              rule=rule(B6), neighbours=neighbours("XAUUSD", (2024, 10)))
     assert sorted(r["weekend_closed"] for r in rep2["large_reversals"]) == [False, True]
-    assert not rep2.get("releasable_weekend")
+    assert "releasable_weekend" not in rep2
 
 
 @pytest.mark.parametrize("ym", sorted(FALL_SATURDAYS))
@@ -689,10 +752,11 @@ def test_weekend_reversal_quarantine_accept_and_write(tmp_path, ym, monkeypatch,
     assert not any(lo <= x < hi for x in ts)
     assert utc_dt(fri.year, fri.month, fri.day, 20, 59) in ts and hi in ts
     mrep = json.loads(month_report_file(tmp_path, "XAUUSD", *ym).read_text())
-    dropped = find_key(mrep, "dropped_ticks")
-    assert dropped and N_STRAY in dropped, mrep
-    draw = [x for v in find_key(mrep, "dropped_raw") for x in v]
-    assert draw and all(f"{sat:%Y-%m-%d} 20:" in str(x) for x in draw)
+    assert mrep["dropped_ticks"] == N_STRAY, mrep
+    draw = mrep["dropped_raw"]
+    assert isinstance(draw, list) and draw
+    strays = {f"{sat:%Y-%m-%d} {h:02d}:{mi:02d}:00" for h, mi in FIRST_FOLD + SECOND_FOLD}
+    assert all(str(x)[:19] in strays for x in draw), draw
 
 
 def test_wednesday_reversal_cannot_be_accepted(tmp_path, monkeypatch, capsys):
@@ -707,7 +771,7 @@ def test_wednesday_reversal_cannot_be_accepted(tmp_path, monkeypatch, capsys):
     assert q.exists()
     before = json.loads(q.read_text())
     assert before["accepted"] is False
-    assert not before.get("releasable_weekend")
+    assert "releasable_weekend" not in before
     monkeypatch.setenv("MARKETDATA_DATA_ROOT", str(tmp_path))
     code = call_main(["--symbol", "XAUUSD", "--accept-weekend-ticks", "2024-07"])
     assert code == 2
@@ -842,8 +906,7 @@ def test_survey_one_switch_with_open_years_proposes_undecided_block(tmp_path, mo
     assert code == 3                                     # 2019/2020 fehlen (offline), kein Konflikt
     assert sched(res) == [("2000-01", NYL), ("2018-12", "undecided"), ("2021-03", B6)]
     und = res["schedule"][1]
-    if "candidates" in und:
-        assert list(und["candidates"]) == [NYL, B6]
+    assert list(und["candidates"]) == [NYL, B6]
     assert re.search(r'from: "2018-12", rule: undecided, candidates: \[ny_local, berlin_minus_6\]',
                      out), out
     assert re.search(r'from: "2021-03", rule: berlin_minus_6', out)
@@ -867,7 +930,7 @@ def test_survey_switch_without_open_period_has_no_undecided_block(tmp_path, monk
     rows = month_rows(res)
     assert rows["2019-03"]["winner"] == NYL and rows["2019-10"]["winner"] == NYL
     assert rows["2020-03"]["decisive"] and rows["2020-03"]["winner"] == B6
-    assert code != 4, out
+    assert code == 3, out                              # 2020-10/11 fehlen (offline)
     assert sched(res) == [("2000-01", NYL), ("2020-03", B6)]
     assert "undecided" not in [e["rule"] for e in res["schedule"]]
 
@@ -910,3 +973,235 @@ def test_survey_weekend_reversal_month_is_decisive_for_berlin(tmp_path, monkeypa
     assert any(re.search(rf"\b{N_STRAY}\b", ln) and re.search(r"verworfen|dropped|Wochenend", ln)
                for ln in lines), lines
     assert md is not None and str(N_STRAY) in md
+
+
+# ============================================================ review v6 ====
+def test_plain_accepted_on_wednesday_reversal_does_not_release(tmp_path):
+    """Ein von Hand gesetztes "accepted": true auf der Quarantaene eines NICHT
+    freigebbaren Ruecksprungs (Mittwoch) schreibt den Monat nicht."""
+    ym = (2024, 7)
+    seed_raw(tmp_path, [(2024, 5), (2024, 6), (2024, 8)])
+    wed = [rms(2024, 7, 10, 11, mi) for mi in range(0, 60, 10)]
+    write_raw(tmp_path, ym, zip_of("XAUUSD", *ym, with_extra(raw_month("XAUUSD", *ym, B6), wed,
+                                                              rms(2024, 7, 10, 12))))
+    rep = do_run(tmp_path, Site(), ym)
+    assert rep["exit_code"] == 4, rep
+    q = qmarker_path(tmp_path, "XAUUSD", *ym)
+    info = json.loads(q.read_text())
+    assert "releasable_weekend" not in info
+    info["accepted"] = True
+    q.write_text(json.dumps(info))
+    site = Site()
+    rep = do_run(tmp_path, site, ym)
+    assert rep["exit_code"] == 4, rep
+    assert site.requests == 0
+    assert "2024-07" in rep["summary"]["months_quarantine"]
+    assert "2024-07" not in rep["summary"]["months_written"]
+    assert not store_file(tmp_path, "XAUUSD", *ym).exists()
+    assert not month_report_file(tmp_path, "XAUUSD", *ym).exists()
+    assert q.exists()
+
+
+# ---- HIGH 1: undecided mit verirrtem Tick in der verbotenen Stunde einer Regel ----
+STRAY_2019 = rms(2019, 10, 26, 20, 30)      # Sa vor dem letzten So Okt: berlin_minus_6 mehrdeutig
+
+
+def oct2019_with_stray() -> pd.DataFrame:
+    return with_extra(raw_month("XAUUSD", 2019, 10, B6), [STRAY_2019], STRAY_2019 - 1)
+
+
+def nov2019_from_4th() -> pd.DataFrame:
+    df = raw_month("XAUUSD", 2019, 11, B6)
+    return df[raw_ms_of(df) >= rms(2019, 11, 4)].reset_index(drop=True)
+
+
+def ref_candidates_utc(raw_ms: np.ndarray):
+    """Referenz (zoneinfo/pandas): UTC-ms je Kandidat, None-Maske fuer nicht eindeutige."""
+    idx = pd.to_datetime(raw_ms, unit="ms")
+    out = {}
+    for st in (NYL, B6):
+        loc = (idx + pd.Timedelta(hours=6) if st == B6 else idx).tz_localize(
+            BER if st == B6 else NYZ, ambiguous="NaT", nonexistent="NaT")
+        valid = np.asarray(~loc.isna())
+        ms = np.zeros(len(idx), dtype=np.int64)
+        ms[valid] = ms_of(loc[valid].tz_convert("UTC"))
+        out[st] = (ms, valid)
+    return out
+
+
+def differing_counts(raw_ms: np.ndarray, ym) -> tuple[int, int]:
+    """(differing ticks im Rohmonat gesamt, davon unter irgendeinem Kandidaten im UTC-Monat ym)."""
+    ref = ref_candidates_utc(raw_ms)
+    (a, va), (b, vb) = ref[NYL], ref[B6]
+    diff = ~va | ~vb | (a != b)
+    lo, hi = month_bounds(*ym)
+    land = (va & (a >= lo) & (a < hi)) | (vb & (b >= lo) & (b < hi))
+    return int(diff.sum()), int((diff & land).sum())
+
+
+def test_undecided_stray_tick_reference_selftest():
+    raw = raw_ms_of(oct2019_with_stray())
+    ref = ref_candidates_utc(raw)
+    i = int(np.nonzero(raw == STRAY_2019)[0][0])
+    assert ref[NYL][1][i] and not ref[B6][1][i]               # nur unter berlin_minus_6 mehrdeutig
+    total, in_oct = differing_counts(raw, (2019, 10))
+    _, in_nov = differing_counts(raw, (2019, 11))
+    assert total > 4 * 1300                                    # die ganze Fensterwoche 27.-31.10
+    # Ticks vom 31.10 19:00-19:59 roh liegen unter ny_local im Oktober, unter berlin_minus_6
+    # im November: in beiden UTC-Monaten mitgezaehlt
+    assert 0 < in_nov < total and in_oct + in_nov == total + 60
+    # die Abend-Ticks vom 31.10 landen unter BEIDEN Kandidaten im UTC-November
+    ev = raw[(raw >= rms(2019, 10, 31, 20)) & (raw < rms(2019, 11, 1))]
+    assert len(ev) > 100
+    r2 = ref_candidates_utc(ev)
+    lo = utc_dt(2019, 11, 1)
+    assert (r2[NYL][0] >= lo).all() and (r2[B6][0] >= lo).all()
+    assert (r2[NYL][0] != r2[B6][0]).all()
+    # Rohmonat November ab dem 4.: beide Kandidaten identisch
+    nov = raw_ms_of(nov2019_from_4th())
+    r3 = ref_candidates_utc(nov)
+    assert r3[NYL][1].all() and r3[B6][1].all() and np.array_equal(r3[NYL][0], r3[B6][0])
+
+
+def test_undecided_stray_tick_holds_october_and_november(tmp_path):
+    seed_raw(tmp_path, [(2019, 8), (2019, 9)], stamping=NYL)
+    seed_raw(tmp_path, [(2019, 12)], stamping=B6)
+    oct_df, nov_df = oct2019_with_stray(), nov2019_from_4th()
+    write_raw(tmp_path, (2019, 10), zip_of("XAUUSD", 2019, 10, oct_df))
+    write_raw(tmp_path, (2019, 11), zip_of("XAUUSD", 2019, 11, nov_df))
+    assert isinstance(fh.rule_for("tick", (2019, 10)), fh.UndecidedRule)
+    site = Site()
+    rep = do_run(tmp_path, site, (2019, 10), (2019, 11))
+    assert rep["exit_code"] == 4, rep
+    assert site.requests == 0
+    und = rep["summary"]["months_rule_undecided"]
+    assert set(und) >= {"2019-10", "2019-11"}, und
+    assert rep["summary"]["months_written"] == []
+    for m in (10, 11):
+        assert not store_file(tmp_path, "XAUUSD", 2019, m).exists()
+    assert markers(tmp_path) == []
+    raw = raw_ms_of(oct_df)
+    total, in_oct = differing_counts(raw, (2019, 10))
+    _, in_nov = differing_counts(raw, (2019, 11))
+    assert und["2019-10"]["raw_month"] == "2019-10"
+    assert und["2019-10"]["differing_ticks"] in (in_oct, total), (und["2019-10"], in_oct, total)
+    assert und["2019-10"]["differing_ticks"] > 1000            # ganze Fensterwoche, nicht 1
+    assert und["2019-11"]["raw_month"] == "2019-10"
+    assert und["2019-11"]["differing_ticks"] in (in_nov, total), (und["2019-11"], in_nov, total)
+    assert any("2019-10-31" in str(r) for r in und["2019-11"]["raw_ranges"])
+    # zweiter Lauf: unveraendert gehalten, keine Requests
+    site2 = Site()
+    rep2 = do_run(tmp_path, site2, (2019, 11))
+    assert rep2["exit_code"] == 4 and site2.requests == 0
+    assert "2019-11" in rep2["summary"]["months_rule_undecided"]
+    assert not store_file(tmp_path, "XAUUSD", 2019, 11).exists()
+
+
+# ---- HIGH 2: Survey-Vorschlag bei Wechsel im Okt/Nov-Paar ----
+def test_survey_switch_at_raw_2019_11_real_data(tmp_path, monkeypatch, capsys, no_http):
+    """Okt 2019 ny_local (entscheidend), Nov 2019 berlin_minus_6 (nur EINE Fensterluecke:
+    nicht entscheidend): 2019-11 darf nicht unter ny_local landen."""
+    root = tmp_path / "data"
+    seed_years(root, (2018,), NYL)
+    seed_raw(root, [(2019, 3), (2019, 10)], stamping=NYL)
+    seed_raw(root, [(2019, 11)], stamping=B6)
+    seed_years(root, (2020,), B6)
+    code, res, out, md = survey_cli(tmp_path, monkeypatch, capsys, root, periods_of((2018, 2019, 2020)))
+    rows = month_rows(res)
+    assert rows["2019-10"]["decisive"] and rows["2019-10"]["winner"] == NYL
+    assert not rows["2019-11"]["decisive"]
+    assert rows["2019-11"]["results"][B6]["status"] == "ok"
+    assert rows["2020-03"]["decisive"] and rows["2020-03"]["winner"] == B6
+    assert sched(res) == [("2000-01", NYL), ("2019-11", "undecided"), ("2020-03", B6)], out
+    assert res["schedule"][1]["candidates"] == [NYL, B6]
+    assert code == 0, out
+
+
+DEC_NY = {NYL: "ok", B6: "failed", "fixed_est": "failed"}
+DEC_B6 = {NYL: "failed", B6: "ok", "fixed_est": "failed"}
+BOTH = {NYL: "ok", B6: "ok", "fixed_est": "failed"}
+
+
+def fake_month_results(table: dict):
+    """evaluate_raw_month-Ersatz: Status je (Rohmonat, Regel) aus `table`."""
+    def ev(data_root, symbol, ym, mode="tick", rule=None, drop_releasable_weekend=False):
+        name = getattr(rule, "name", rule)
+        st = table[tuple(ym)].get(name, "failed")
+        return {"status": st, "ok": st == "ok", "reason": None if st == "ok" else "synthetisch",
+                "cached": True, "anchors": 40, "median_deviation_h": 0.0 if st == "ok" else 1.0,
+                "dropped_weekend_ticks": 0, "releasable_weekend": None, "large_reversals": [],
+                "rule": name, "symbol": symbol, "month": f"{ym[0]}-{ym[1]:02d}"}
+    return ev
+
+
+def survey_mocked(tmp_path, monkeypatch, capsys, table, cfg_lines=None):
+    if cfg_lines is not None:
+        monkeypatch.setenv(ENV, str(write_cfg(tmp_path / "tz.yaml", cfg_lines)))
+    root = tmp_path / "data"
+    for ym in table:
+        p = fh.Unit("XAUUSD", "tick", *ym).path(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"PK-synthetisch")
+    monkeypatch.setattr(fh, "evaluate_raw_month", fake_month_results(table))
+    return survey_cli(tmp_path, monkeypatch, capsys, root,
+                      [f"{y}-{m:02d}" for y, m in sorted(table)])
+
+
+OPEN_FROM_2018_12 = ['{from: "2000-01", rule: ny_local}',
+                     '{from: "2018-12", rule: undecided, candidates: [ny_local, berlin_minus_6]}']
+
+
+def test_survey_mocked_switch_in_november_not_decisive(tmp_path, monkeypatch, capsys, no_http):
+    table = {(2018, 3): DEC_NY, (2018, 10): DEC_NY, (2018, 11): DEC_NY,
+             (2019, 3): DEC_NY, (2019, 10): DEC_NY, (2019, 11): BOTH,
+             (2020, 3): DEC_B6, (2020, 10): DEC_B6, (2020, 11): BOTH}
+    code, res, out, _ = survey_mocked(tmp_path, monkeypatch, capsys, table, OPEN_FROM_2018_12)
+    assert sched(res) == [("2000-01", NYL), ("2019-11", "undecided"), ("2020-03", B6)], out
+    assert res["schedule"][1]["candidates"] == [NYL, B6]
+    assert code == 0, out
+
+
+def test_survey_mocked_undecided_runs_until_first_decisive_berlin_month(tmp_path, monkeypatch,
+                                                                         capsys, no_http):
+    table = {(2018, 3): DEC_NY, (2018, 10): DEC_NY, (2018, 11): DEC_NY,
+             (2019, 3): DEC_NY, (2019, 10): DEC_NY, (2019, 11): BOTH,
+             (2020, 3): BOTH, (2020, 10): DEC_B6, (2020, 11): BOTH,
+             (2021, 3): DEC_B6, (2021, 10): DEC_B6, (2021, 11): BOTH}
+    code, res, out, _ = survey_mocked(tmp_path, monkeypatch, capsys, table, OPEN_FROM_2018_12)
+    assert sched(res) == [("2000-01", NYL), ("2019-11", "undecided"), ("2020-10", B6)], out
+    assert res["schedule"][1]["candidates"] == [NYL, B6]
+    assert code == 0, out
+
+
+def test_survey_mocked_mirror_october_not_decisive(tmp_path, monkeypatch, capsys, no_http):
+    """EU-Ende am 31.10. (2021): Oktober nicht entscheidend, November entscheidend
+    berlin_minus_6 -> berlin_minus_6 erst ab 2021-11, davor undecided ab 2021-04."""
+    assert last_sunday(2021, 10) == date(2021, 10, 31)
+    table = {(2020, 3): DEC_NY, (2020, 10): DEC_NY, (2020, 11): DEC_NY,
+             (2021, 3): DEC_NY, (2021, 10): BOTH, (2021, 11): DEC_B6,
+             (2022, 3): DEC_B6, (2022, 10): DEC_B6, (2022, 11): BOTH}
+    code, res, out, _ = survey_mocked(tmp_path, monkeypatch, capsys, table, OPEN_FROM_2018_12)
+    assert sched(res) == [("2000-01", NYL), ("2021-04", "undecided"), ("2021-11", B6)], out
+    assert res["schedule"][1]["candidates"] == [NYL, B6]
+    assert code == 0, out
+
+
+def test_survey_mocked_switch_exactly_at_october_november_boundary(tmp_path, monkeypatch, capsys,
+                                                                   no_http):
+    table = {(2018, 3): DEC_NY, (2018, 10): DEC_NY, (2018, 11): DEC_NY,
+             (2019, 3): DEC_NY, (2019, 10): DEC_NY, (2019, 11): DEC_B6,
+             (2020, 3): DEC_B6, (2020, 10): DEC_B6, (2020, 11): DEC_B6}
+    code, res, out, _ = survey_mocked(tmp_path, monkeypatch, capsys, table, OPEN_FROM_2018_12)
+    assert sched(res) == [("2000-01", NYL), ("2019-11", B6)], out
+    assert code == 0, out
+
+
+def test_survey_mocked_weak_evidence_is_exit_4(tmp_path, monkeypatch, capsys, no_http):
+    """berlin_minus_6 nur in EINEM Rohmonat eines Symbols entscheidend: kein Vorschlag, Exit 4."""
+    table = {(2017, 3): DEC_NY, (2017, 10): DEC_NY, (2018, 3): DEC_NY,
+             (2021, 3): BOTH, (2021, 10): DEC_B6, (2021, 11): BOTH}
+    code, res, out, _ = survey_mocked(tmp_path, monkeypatch, capsys, table, OPEN_FROM_2018_12)
+    assert res["schedule"] == []
+    assert "schedule:" not in out
+    assert res["weak_evidence"]
+    assert code == 4, out

@@ -158,6 +158,44 @@ def ny_then_berlin(ym):
 
 
 # --------------------------------------------------------------- plan ---
+def test_wait_months_are_not_planned_as_requests(tmp_path, cfg, monkeypatch):
+    """LOW 5: leer, unbestaetigt, letzte Pruefung < CONFIRM_AFTER_S -> fh.Ctx.get fragt
+    nicht an: "warten auf Bestaetigung", nicht im Request-Plan, aber unvollstaendig."""
+    monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(lambda ym: "berlin_minus_6"))
+    root = tmp_path / "data"
+    u = fh.Unit("XAUUSD", "tick", 2016, 3)
+    mk = u.marker(root, "empty")
+    mk.parent.mkdir(parents=True, exist_ok=True)
+    recent = (NOW - timedelta(hours=2)).isoformat()
+    mk.write_text(json.dumps({"first_seen": recent, "last_checked": recent, "confirmed": None}))
+    assert sv.cache_state(root, "XAUUSD", (2016, 3), NOW) == "wait"
+    assert sv.cache_state(root, "XAUUSD", (2016, 3), NOW + timedelta(days=2)) == "missing"
+    site = Site()
+    res, out = run(tmp_path, site, years=[2016], months=[3, 10], controls=[])
+    assert "1 fehlen; 1 warten auf Bestaetigung" in out and "Geplant: 1 Rohmonate laden = 2 Requests" in out
+    assert site.requests == 2 and res["planned_requests"] == 2
+    st = {m["month"]: m["state"] for m in res["months"]}
+    assert st == {"2016-03": "wait", "2016-10": "cached"}
+    assert res["exit_code"] == 3 and res["incomplete"] == [
+        {"symbol": "XAUUSD", "month": "2016-03", "state": "wait"}]
+
+
+def test_unproven_switch_is_exit_4_when_complete_and_3_when_incomplete(tmp_path, cfg, monkeypatch):
+    """LOW 5: Vorschlag nur wegen zu wenig Evidenz verweigert -> Exit 4 ("Wechsel nicht
+    belegt"), solange nichts fehlt; fehlen noch Monate, Exit 3 (mehr Daten koennen belegen)."""
+    cfg((("2000-01", "ny_local"), ("2016-03", "berlin_minus_6")))
+    monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(ny_then_berlin))
+    for ym in [(2015, 3), (2015, 10), (2016, 3)]:
+        touch_cache(tmp_path / "data", "XAUUSD", ym)
+    res, out = run(tmp_path, years=[2015, 2016], months=[3], controls=[], offline=True,
+                   periods=[(2015, 10)])
+    assert res["configured_failed"] == [] and res["incomplete"] == []
+    assert res["schedule"] == [] and res["unproven"]
+    assert "Wechsel nicht belegt" in out and res["exit_code"] == 4
+    res, out = run(tmp_path, years=[2015, 2016], months=[3, 10], controls=[], offline=True)
+    assert res["unproven"] and res["incomplete"] and res["exit_code"] == 3
+
+
 def test_planned_request_count():
     assert sv.planned_requests(5, 60) == 10
     assert sv.planned_requests(100, 60) == 120
@@ -254,13 +292,16 @@ def test_ny_until_2015_then_berlin_gives_two_entry_schedule_and_exit_4(tmp_path,
             touch_cache(root, "XAUUSD", (y, m))
             touch_cache(root, "XAGUSD", (y, m))
     res, out = run(tmp_path, years=years, symbols=["XAUUSD", "XAGUSD"], offline=True, **NO_MONTHS)
-    # Wechsel an den Beginn der ersten berlin-Periode (2016 Maerz); 2015 Okt/Nov -> 2016 Maerz
-    # sind benachbarte Perioden: kein undecided-Eintrag noetig
+    # Rohmonatsebene: letzter ny-Beleg 2015-10, erster berlin-Beleg 2016-03; 2015-11 hat
+    # ein Umstellungsfenster und wurde nicht untersucht -> undecided ab 2015-11
     assert res["schedule"] == [{"from": "2000-01", "rule": "ny_local"},
+                               {"from": "2015-11", "rule": "undecided",
+                                "candidates": ["ny_local", "berlin_minus_6"]},
                                {"from": "2016-03", "rule": "berlin_minus_6"}]
     an = res["switch_analysis"]
-    assert (an["switches"], an["last_old"], an["first_new"], an["between"]) == \
-        (1, "2015 Okt/Nov", "2016 Maerz", [])
+    assert (an["switches"], an["last_old"], an["first_new"], an["undecided_months"]) == \
+        (1, "2015-10", "2016-03", ["2015-11"])
+    assert [b["month"] for b in an["between"]] == ["2015-11", "2015-12", "2016-01", "2016-02"]
     assert res["verdicts"]["2012"]["verdict"] == "nur ny_local passt"
     assert res["verdicts"]["2015"]["verdict"] == "nur ny_local passt"
     assert res["verdicts"]["2016"]["verdict"] == "berlin_minus_6 passt"
@@ -280,7 +321,8 @@ def test_ny_until_2015_then_berlin_gives_two_entry_schedule_and_exit_4(tmp_path,
     import yaml
     snippet = out[out.index("# Vorschlag"):].split("\n\n")[0]
     parsed = fh.build_tz_config({"rules": [], **yaml.safe_load(snippet)})
-    assert fh.rule_for("tick", (2016, 2), parsed).name == "ny_local"
+    assert fh.rule_for("tick", (2015, 10), parsed).name == "ny_local"
+    assert fh.rule_for("tick", (2016, 2), parsed).name == "undecided"
     assert fh.rule_for("tick", (2016, 3), parsed).name == "berlin_minus_6"
     # Config nicht angefasst
     assert "ny_local" not in (tmp_path / "tz-0.yaml").read_text()
@@ -408,8 +450,9 @@ def test_cli_offline_json(tmp_path, cfg, monkeypatch):
     monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(lambda ym: "berlin_minus_6"))
     monkeypatch.setenv("MARKETDATA_DATA_ROOT", str(tmp_path / "data"))
     touch_cache(tmp_path / "data", "XAUUSD", (2024, 3))
+    touch_cache(tmp_path / "data", "XAUUSD", (2024, 10))     # 2 Belege: Block nicht schwach
     out = tmp_path / "survey.json"
-    code = sv.main(["--symbols", "XAUUSD", "--years", "2024", "--months", "3", "--controls",
+    code = sv.main(["--symbols", "XAUUSD", "--years", "2024", "--months", "3", "10", "--controls",
                     "--offline", "--json", str(out)])
     res = json.loads(out.read_text())
     assert code == res["exit_code"] == 0
@@ -489,9 +532,11 @@ def test_integration_weekend_reversal_dropped_and_schedule(tmp_path, cfg):
     rev = res["reversals"]["XAUUSD"]
     assert rev == ["2024-10: 2024-10-26 20:59:02 -> 2024-10-26 20:00:05 (59.0 min, 4 Ticks, "
                    "Wochenende (Markt zu), verworfen)"], rev
+    # letzter ny-Beleg 2018-10 (2018-11 nicht untersucht, hat Fenster) -> undecided ab 2018-11
     assert [(e["from"], e["rule"]) for e in res["schedule"]] == [
-        ("2000-01", "ny_local"), ("2018-12", "undecided"), ("2021-03", "berlin_minus_6")], out
-    assert res["switch_analysis"]["last_old"] == "2018 Okt/Nov"
+        ("2000-01", "ny_local"), ("2018-11", "undecided"), ("2021-03", "berlin_minus_6")], out
+    assert res["switch_analysis"]["last_old"] == "2018-10"
+    assert res["exit_code"] == 4                             # konfiguriert berlin, 2018 faellt durch
 
 
 # ------------------------------------------------ Review v5: Evidenz, Exit ---
@@ -520,19 +565,16 @@ def test_configured_rule_outside_rules_selection_is_still_checked(tmp_path, cfg,
 
 def test_block_needs_two_months_or_both_symbols():
     """Review v5 (3): ein einzelner entscheidender Monat eines Symbols reicht nicht."""
-    one = [mrow("XAUUSD", (2012, 3), "ny_local")]
-    an = sv.analyze_switches(sv.build_periods(one, sv.SYMBOLS))
-    assert sv.propose_schedule(an, (2000, 1), fh.TZ_RULES)[0] == []
-    assert an["weak"][0]["months"] == ["2012-03"]
-    both = [mrow("XAUUSD", (2012, 3), "ny_local"), mrow("XAGUSD", (2012, 3), "ny_local")]
-    an = sv.analyze_switches(sv.build_periods(both, sv.SYMBOLS))
-    sched, _ = sv.propose_schedule(an, (2000, 1), fh.TZ_RULES)
+    _, an, sched, _ = analyse([mrow("XAUUSD", (2012, 3), "ny_local")])
+    assert sched == [] and an["weak"][0]["months"] == ["2012-03"]
+    _, an, sched, _ = analyse([mrow("XAUUSD", (2012, 3), "ny_local"),
+                               mrow("XAGUSD", (2012, 3), "ny_local")])
     assert [(e["from"], e["rule"]) for e in sched] == [("2000-01", "ny_local")]
-    two = [mrow("XAUUSD", (2012, 3), "ny_local"), mrow("XAUUSD", (2012, 10), "ny_local"),
-           mrow("XAUUSD", (2016, 3), "berlin_minus_6")]
-    an = sv.analyze_switches(sv.build_periods(two, sv.SYMBOLS))
+    _, an, sched, _ = analyse([mrow("XAUUSD", (2012, 3), "ny_local"),
+                               mrow("XAUUSD", (2012, 10), "ny_local"),
+                               mrow("XAUUSD", (2016, 3), "berlin_minus_6")])
     assert an["switches"] == 1 and [w["rule"] for w in an["weak"]] == ["berlin_minus_6"]
-    assert sv.propose_schedule(an, (2000, 1), fh.TZ_RULES)[0] == []      # berlin: 1 Monat
+    assert sched == []                                           # berlin: 1 Monat
 
 
 # ------------------------------------- v6: Umstellungsperioden, Wechsel ---
@@ -567,10 +609,14 @@ def berlin_years(*years):
 
 
 def analyse(rows):
-    periods = sv.build_periods(rows, sv.SYMBOLS)
-    an = sv.analyze_switches(periods)
+    months = sv.build_months(rows, sv.SYMBOLS)
+    an = sv.analyze_switches(months, fh.TZ_RULES)
     sched, just = sv.propose_schedule(an, (2000, 1), fh.TZ_RULES)
-    return periods, an, sched, just
+    return sv.build_periods(rows, sv.SYMBOLS, months), an, sched, just
+
+
+def entries(sched):
+    return [(e["from"], e["rule"]) for e in sched]
 
 
 def test_one_switch_with_gap_gives_three_entries_with_undecided():
@@ -579,23 +625,22 @@ def test_one_switch_with_gap_gives_three_entries_with_undecided():
     rows += both((2019, 10)) + both((2019, 11), text="keine Regel passt")   # nicht entscheidend
     periods, an, sched, just = analyse(rows)
     assert an["ok"] and an["switches"] == 1 and an["conflicts"] == []
-    assert (an["last_old"], an["first_new"]) == ("2018 Okt/Nov", "2021 Maerz")
-    # auch nicht untersuchte Perioden (2020) liegen dazwischen
-    assert [b["period"] for b in an["between"]] == ["2019 Maerz", "2019 Okt/Nov", "2020 Maerz",
-                                                    "2020 Okt/Nov"]
-    assert an["between"][2]["state"] == "nicht untersucht"
-    assert "03 fehlt" in an["between"][0]["state"]
+    assert (an["last_old"], an["first_new"]) == ("2018-11", "2021-03")
+    # JEDER Rohmonat dazwischen, auch nicht untersuchte; Fenster nur in 03/10/11
+    assert [b["month"] for b in an["between"]][:3] == ["2018-12", "2019-01", "2019-02"]
+    assert an["undecided_months"] == ["2019-03", "2019-10", "2019-11", "2020-03", "2020-10",
+                                      "2020-11"]
+    by = {b["month"]: b for b in an["between"]}
+    assert by["2020-03"]["state"] == "nicht untersucht" and "fehlt" in by["2019-03"]["state"]
+    assert not by["2019-07"]["window"] and by["2019-07"]["windows"] == ""
+    assert by["2019-03"]["windows"] == "10.03. 02:00-30.03. 21:00 roh", by["2019-03"]
     assert [{k: e.get(k) for k in ("from", "rule", "candidates")} for e in sched] == [
         {"from": "2000-01", "rule": "ny_local", "candidates": None},
         {"from": "2018-12", "rule": "undecided", "candidates": ["ny_local", "berlin_minus_6"]},
         {"from": "2021-03", "rule": "berlin_minus_6", "candidates": None}]
-    # Begruendung: Abweichungen nur in Umstellungsperioden, Monate dazwischen identisch
-    assert just["equivalent"] and just["outside"] == []
-    assert set(just["windows"]) == {"2018 Okt/Nov", "2019 Maerz", "2019 Okt/Nov", "2020 Maerz",
-                                    "2020 Okt/Nov", "2021 Maerz"}
-    assert just["windows"]["2019 Maerz"] == ["10.03.2019 07:00-31.03.2019 01:00 UTC"]
+    assert just["equivalent"] and just["uncovered"] == [] and just["undecided"] == ["2018-12", "2021-02"]
+    assert set(just["window_months"]) == set(an["undecided_months"])
     assert just["plain_months"][:3] == ["2018-12", "2019-01", "2019-02"]
-    assert "2019-03" not in just["plain_months"] and "2020-07" in just["plain_months"]
     # YAML ist eine gueltige Config (Parser des Fetchers, undecided mit Kandidaten)
     import yaml
     txt = sv.schedule_yaml(sched, comment=sv.proposal_comment(periods, an, just, sv.SYMBOLS, "x"))
@@ -609,19 +654,73 @@ def test_one_switch_with_gap_gives_three_entries_with_undecided():
     assert "# Begruendung:" in txt and "#   2019 Maerz" in txt
 
 
-def test_one_switch_without_gap_two_entries():
-    _, an, sched, just = analyse(ny_years(2019, 2020) + berlin_years(2021))
-    assert an["between"] == [] and (an["last_old"], an["first_new"]) == ("2020 Okt/Nov", "2021 Maerz")
-    assert [(e["from"], e["rule"]) for e in sched] == [("2000-01", "ny_local"),
-                                                      ("2021-03", "berlin_minus_6")]
-    assert just["plain_months"] == ["2020-12", "2021-01", "2021-02"]
-    # Wechsel innerhalb eines Jahres: letzte alte Periode Maerz, erste neue Okt/Nov
-    rows = ny_years(2020) + both((2021, 3), "ny_local") + both((2021, 10), "berlin_minus_6") + \
-        berlin_years(2022)
+def test_switch_at_raw_november_with_undecisive_november():
+    """Review v6 HIGH 1: wahrer Wechsel ab Rohmonat 2019-11, 2019-11 nicht entscheidend
+    (nur eine Fenster-Luecke) -> ny bis 2019-10, undecided ab 2019-11, berlin ab 2020-03.
+    Vorher: Periode "2019 Okt/Nov" galt als ny_local bestaetigt, Exit 0."""
+    rows = ny_years(2018) + both((2019, 3), "ny_local") + both((2019, 10), "ny_local") + \
+        both((2019, 11)) + berlin_years(2020, 2021)
+    periods, an, sched, just = analyse(rows)
+    assert an["ok"] and an["switches"] == 1
+    assert (an["last_old"], an["first_new"]) == ("2019-10", "2020-03")
+    assert an["undecided_months"] == ["2019-11"]
+    assert entries(sched) == [("2000-01", "ny_local"), ("2019-11", "undecided"),
+                              ("2020-03", "berlin_minus_6")]
+    assert just["equivalent"] and just["undecided"] == ["2019-11", "2020-02"]
+    assert next(p for p in periods if p["label"] == "2019 Okt/Nov")["text"] == \
+        "ny_local (XAUUSD, XAGUSD)"                               # Anzeige: nur Oktober belegt
+
+
+def test_switch_mirror_october_not_decisive():
+    """Spiegelfall (EU-Ende 30./31.10.): Oktober nicht entscheidend, November allein."""
+    rows = ny_years(2020) + both((2021, 3), "ny_local") + both((2021, 10)) + \
+        both((2021, 11), "berlin_minus_6") + berlin_years(2022)
     _, an, sched, just = analyse(rows)
-    assert [(e["from"], e["rule"]) for e in sched] == [("2000-01", "ny_local"),
-                                                      ("2021-10", "berlin_minus_6")]
+    assert (an["last_old"], an["first_new"]) == ("2021-03", "2021-11")
+    assert an["undecided_months"] == ["2021-10"]
+    assert entries(sched) == [("2000-01", "ny_local"), ("2021-04", "undecided"),
+                              ("2021-11", "berlin_minus_6")]
     assert just["plain_months"] == [f"2021-{m:02d}" for m in range(4, 10)]
+
+
+def test_switch_exactly_at_10_11_boundary():
+    """Oktober ny_local, November berlin_minus_6, beide entscheidend: gueltiger
+    Wechsel an der Rohmonatsgrenze 10/11, kein undecided, kein Konflikt."""
+    rows = ny_years(2018) + both((2019, 3), "ny_local") + both((2019, 10), "ny_local") + \
+        both((2019, 11), "berlin_minus_6") + berlin_years(2020)
+    periods, an, sched, just = analyse(rows)
+    assert an["ok"] and an["switches"] == 1 and an["conflicts"] == [] and an["between"] == []
+    assert entries(sched) == [("2000-01", "ny_local"), ("2019-11", "berlin_minus_6")]
+    assert just["undecided"] is None and just["equivalent"]
+    p = next(p for p in periods if p["label"] == "2019 Okt/Nov")
+    assert p["status"] == "split" and p["text"] == "Wechsel: 10 ny_local -> 11 berlin_minus_6"
+    assert p["symbols"]["XAUUSD"]["cell"] == "10: ny_local -> 11: berlin_minus_6"
+
+
+def test_one_switch_without_gap_two_entries():
+    # 2020-11 ny, 2021-03 berlin: dazwischen nur Monate ohne Fenster -> kein undecided
+    _, an, sched, just = analyse(ny_years(2019, 2020) + berlin_years(2021))
+    assert an["undecided_months"] == [] and (an["last_old"], an["first_new"]) == ("2020-11", "2021-03")
+    assert entries(sched) == [("2000-01", "ny_local"), ("2021-03", "berlin_minus_6")]
+    assert just["plain_months"] == ["2020-12", "2021-01", "2021-02"] and just["undecided"] is None
+    # Maerz ny, Okt/Nov berlin im selben Jahr
+    rows = ny_years(2020) + both((2021, 3), "ny_local") + both((2021, 10), "berlin_minus_6") + \
+        both((2021, 11), "berlin_minus_6") + berlin_years(2022)
+    _, an, sched, just = analyse(rows)
+    assert entries(sched) == [("2000-01", "ny_local"), ("2021-10", "berlin_minus_6")]
+    assert just["plain_months"] == [f"2021-{m:02d}" for m in range(4, 10)]
+
+
+def test_justify_rejects_window_month_outside_undecided_block():
+    """justify prueft wirklich: ein Fenster-Monat ausserhalb des undecided-Blocks
+    -> nicht gleichwertig (keine Ausnahme mehr fuer Maerz/Oktober/November)."""
+    _, an, _, _ = analyse(ny_years(2018) + both((2019, 10)) + berlin_years(2020))
+    assert an["undecided_months"] == ["2019-03", "2019-10", "2019-11"]
+    an["undecided_months"] = []                    # Block kuenstlich entfernt
+    just = sv.justify(an, fh.TZ_RULES)
+    assert not just["equivalent"] and just["uncovered"] == ["2019-03", "2019-10", "2019-11"]
+    assert sv.month_windows(fh.TZ_RULES["ny_local"], fh.TZ_RULES["berlin_minus_6"], (2019, 7)) == ()
+    assert sv.month_windows(fh.TZ_RULES["ny_local"], fh.TZ_RULES["berlin_minus_6"], (2019, 11))
 
 
 def test_two_switches_no_proposal():
@@ -629,7 +728,11 @@ def test_two_switches_no_proposal():
     _, an, sched, _ = analyse(rows)
     assert an["switches"] == 2 and not an["ok"] and sched == []
     assert "2 Wechsel statt hoechstens einem" in an["explanation"][0]
-    assert "ny_local (2010 Maerz .. 2010 Okt/Nov) -> berlin_minus_6" in an["explanation"][0]
+    assert "ny_local (2010-03..2010-11) -> berlin_minus_6 (2012-03..2012-11)" in an["explanation"][0]
+    # umgekehrter Split in einer Periode (10 berlin, 11 ny) zwischen ny-Jahren: 2 Wechsel
+    rows = ny_years(2017) + both((2018, 10), "berlin_minus_6") + both((2018, 11), "ny_local")
+    _, an, sched, _ = analyse(rows)
+    assert an["switches"] == 2 and sched == []
 
 
 def test_two_switches_exit_4_even_when_config_matches(tmp_path, cfg, monkeypatch):
@@ -653,30 +756,26 @@ def test_symbol_conflict_is_conflict():
                              mrow("XAGUSD", (2018, 3), "berlin_minus_6")] + berlin_years(2021)
     periods, an, sched, _ = analyse(rows)
     p = next(p for p in periods if p["label"] == "2018 Maerz")
-    assert p["status"] == "conflict" and p["conflict"] == "symbol"
-    assert p["text"] == "KONFLIKT (Symbole: XAGUSD berlin_minus_6, XAUUSD ny_local)"
-    assert not an["ok"] and sched == [] and an["conflicts"][0]["period"] == "2018 Maerz"
-    # nur ein Symbol entscheidend, das andere offen: kein Konflikt, bestaetigt
+    assert p["status"] == "conflict"
+    assert p["text"] == "03: KONFLIKT (Symbole: XAUUSD ny_local, XAGUSD berlin_minus_6)"
+    assert not an["ok"] and sched == [] and an["conflicts"][0]["month"] == "2018-03"
+    # nur ein Symbol entscheidend, das andere offen: kein Konflikt
     rows = [mrow("XAUUSD", (2018, 3), "ny_local"), mrow("XAGUSD", (2018, 3), state="over_limit")]
-    p = sv.build_periods(rows, sv.SYMBOLS)[0]
-    assert p["status"] == "confirmed" and p["rule"] == "ny_local"
+    m = sv.build_months(rows, sv.SYMBOLS)[0]
+    assert m["status"] == "decisive" and m["rule"] == "ny_local" and m["support"] == ["XAUUSD"]
+    # Symbole in VERSCHIEDENEN Rohmonaten einer Periode (Gold 10 ny, Silber 11 berlin): Wechsel 10/11
+    rows = ny_years(2018) + [mrow("XAUUSD", (2019, 10), "ny_local"),
+                             mrow("XAGUSD", (2019, 11), "berlin_minus_6")] + berlin_years(2020)
+    _, an, sched, _ = analyse(rows)
+    assert an["ok"] and entries(sched) == [("2000-01", "ny_local"), ("2019-11", "berlin_minus_6")]
 
 
-def test_month_conflict_inside_okt_nov():
-    rows = ny_years(2017) + [mrow("XAUUSD", (2018, 10), "berlin_minus_6"),
-                             mrow("XAUUSD", (2018, 11), "ny_local"),
-                             mrow("XAGUSD", (2018, 10), "ny_local")]
-    periods, an, sched, _ = analyse(rows)
-    p = periods[-1]
-    assert p["label"] == "2018 Okt/Nov" and p["status"] == "conflict" and p["conflict"] == "month"
-    assert p["symbols"]["XAUUSD"]["cell"] == "KONFLIKT (10: berlin_minus_6, 11: ny_local)"
-    assert p["symbols"]["XAGUSD"]["status"] == "rule"
-    assert not an["ok"] and sched == [] and "Konflikt in 2018 Okt/Nov" in an["explanation"][0]
-    # nicht entscheidender Monat (alle/keine bestehen) widerspricht NICHT
+def test_undecisive_month_does_not_contradict():
     rows = [mrow("XAUUSD", (2018, 10), "ny_local"),
             mrow("XAUUSD", (2018, 11), text="keine Regel passt")]
     p = sv.build_periods(rows, ["XAUUSD"])[0]
     assert p["status"] == "confirmed" and p["symbols"]["XAUUSD"]["cell"] == "ny_local (10)"
+    assert sv.build_months(rows, ["XAUUSD"])[1]["status"] == "open"
 
 
 def test_weekend_dropped_month_counts_as_decisive(tmp_path, cfg, monkeypatch):
@@ -685,13 +784,16 @@ def test_weekend_dropped_month_counts_as_decisive(tmp_path, cfg, monkeypatch):
         lambda ym: "berlin_minus_6", drop_flags=flags,
         dropped={("XAUUSD", (2021, 10), "berlin_minus_6"): 3}))
     touch_cache(tmp_path / "data", "XAUUSD", (2021, 10))
-    res, out = run(tmp_path, years=[2021], months=[10], controls=[], offline=True)
+    touch_cache(tmp_path / "data", "XAUUSD", (2021, 3))
+    res, out = run(tmp_path, years=[2021], months=[3, 10], controls=[], offline=True)
     assert flags and all(flags)                                  # immer drop_releasable_weekend=True
-    m = res["months"][0]
+    m = res["months"][1]
     assert m["decisive"] and m["winner"] == "berlin_minus_6"
     assert m["results"]["berlin_minus_6"]["dropped_weekend_ticks"] == 3
     assert "ok +0.0 (3 Wochenend-Ticks verworfen)" in out
-    p = res["periods"][0]
+    assert res["switch_analysis"]["blocks"][0]["decisive_months"] == \
+        {"2021-03": ["XAUUSD"], "2021-10": ["XAUUSD"]}
+    p = res["periods"][1]
     assert p["status"] == "confirmed"
     assert p["symbols"]["XAUUSD"]["cell"] == \
         "berlin_minus_6 (10) [10: 3 Wochenend-Ticks verworfen]"
@@ -781,7 +883,7 @@ def test_preset_full_request_count_and_remaining(tmp_path, cfg, monkeypatch):
     assert "Geplant: 3 Rohmonate laden = 6 Requests" in txt
     assert "62 weitere ueber --max-downloads 3 (naechster Aufruf, 124 Requests)" in txt
     assert site.requests == 6 and res["requests"] == 6
-    assert res["exit_code"] in (3, 4) and res["remaining_raw_months"] == 62
+    assert res["exit_code"] == 3 and res["remaining_raw_months"] == 62   # nichts widerspricht
     assert "noch fehlend: 62 Rohmonate" in txt
     assert "UNVOLLSTAENDIG: noch 62 Rohmonate offen (= 124 Requests" in txt
 
@@ -809,7 +911,9 @@ def test_cli_markdown_and_json(tmp_path, cfg, monkeypatch):
     assert "```yaml" in text
     assert '    - {from: "2018-12", rule: undecided, candidates: [ny_local, berlin_minus_6]}' in text
     assert '    - {from: "2021-03", rule: berlin_minus_6}' in text
-    assert "## Begruendung" in text and "jede Grenze zwischen 2018 Okt/Nov und 2021 Maerz" in text
+    assert "## Begruendung" in text
+    assert "Der Vorschlag fuehrt ny_local bis einschliesslich 2018-11 und berlin_minus_6 ab 2021-03" in text
     assert res["schedule"][1] == {"from": "2018-12", "rule": "undecided",
                                   "candidates": ["ny_local", "berlin_minus_6"]}
-    assert res["switch_analysis"]["between"][0]["period"] == "2019 Maerz"
+    assert res["switch_analysis"]["between"][0]["month"] == "2018-12"
+    assert res["switch_analysis"]["undecided_months"][0] == "2019-03"

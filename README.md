@@ -252,7 +252,10 @@ Time zone:
   2024-10 fit except for one 60-minute reversal of stray ticks in the closed
   weekend market). Years 2009, 2011, 2013, 2014, 2016, 2017, 2019, 2020, 2022,
   2023 and 2025 are not surveyed yet.
-- **Why the switch can sit at any raw-month boundary in between**: the two
+- **Why the switch can sit at any raw-month boundary in between that is
+  outside a transition window** (so not between raw October and raw November:
+  the Oct/Nov window spans both; the March window lies entirely in raw
+  March): the two
   rules differ only in two windows a year, where `ny_local` gives UTC-4 and
   `berlin_minus_6` UTC-5: March from the US start (2nd Sunday of March, 07:00
   UTC) to the EU start (last Sunday of March, 01:00 UTC), and Oct/Nov from the
@@ -365,7 +368,10 @@ Time zone:
   - Deleting the ZIP downloads it again; the new download removes the
     marker and the month is checked again.
   - Setting `"accepted": true` in the marker releases the month after a
-    manual check.
+    manual check - except for reversals of 30 minutes or more and ticks at
+    ambiguous or nonexistent local times: there a plain `"accepted": true` is
+    ignored (ERROR, the month stays quarantined); only weekend ticks can be
+    dropped, via `--accept-weekend-ticks` (see below).
   - Markers carry `tz_rule`, `raw_tz` (zone), `tz_shift_h` and
     `tz_check_version`. A marker that is not released and comes from an
     older check version or another rule (e.g. check v4 with `ny_local`) is
@@ -390,7 +396,9 @@ Time zone:
     the marker is not releasable). Those ticks are then **dropped** (never
     converted), the rest is re-checked and written if it passes; the monthly
     report gets `dropped_ticks`, `dropped_raw` and a `warning`. Ticks outside
-    the closed weekend market are never releasable.
+    the closed weekend market are never releasable. Under `undecided` the
+    impossible-hour set is the union over all candidates, and a tick that
+    any candidate cannot convert counts as converted differently.
   - An unreadable marker (invalid JSON, e.g. a typo while setting
     `"accepted": true`) is kept, logged as ERROR and keeps blocking.
 - Monthly files carry the parquet metadata `source_timezone`, derived from

@@ -24,14 +24,17 @@
 #   2015  Okt/Nov    ny_local         ny_local         ny_local eindeutig
 #   2018  Maerz      ny_local         ny_local         ny_local eindeutig
 #   2018  Okt/Nov    ny_local         ny_local         ny_local eindeutig
-#   2021  Maerz      berlin_minus_6   berlin_minus_6   berlin_minus_6 eindeutig (ny_local faellt durch)
-#   2021  Okt        (keine passt)    (keine passt)    berlin_minus_6 bis auf EINEN 60-min-
-#                                                      Ruecksprung (roh Sa 21:00 -> 20:00,
-#                                                      verirrte Ticks im geschlossenen Markt)
-#   2024  Maerz      berlin_minus_6   berlin_minus_6   berlin_minus_6 eindeutig (ny_local faellt durch)
-#   2024  Okt        (keine passt)    (keine passt)    wie 2021-10 (ein Ruecksprung Sa-Nacht)
-#   (2010-2018: beide Symbole gemeldet; 2021/2024: Ergebnis je Monat gemeldet,
-#   nicht getrennt nach Symbol)
+#   2021  Maerz      (beide Symbole, gemeinsam    berlin_minus_6 eindeutig (ny_local faellt durch)
+#                     gemeldet)
+#   2021  Okt        (beide Symbole, gemeinsam    keine Regel passt - berlin_minus_6 bis auf
+#                     gemeldet)                    EINEN 60-min-Ruecksprung (roh Sa 21:00 ->
+#                                                  20:00, verirrte Ticks im geschlossenen Markt)
+#   2024  Maerz      (beide Symbole, gemeinsam    berlin_minus_6 eindeutig (ny_local faellt durch)
+#                     gemeldet)
+#   2024  Okt        (beide Symbole, gemeinsam    wie 2021-10 (ein Ruecksprung Sa-Nacht)
+#                     gemeldet)
+#   (2010-2018: je Symbol gemeldet; 2021/2024: Ergebnis je Monat fuer beide
+#   Symbole gemeinsam gemeldet, nicht getrennt)
 #   nicht untersucht: 2009, 2011, 2013, 2014, 2016, 2017, 2019, 2020, 2022, 2023, 2025
 #
 # Der Wechsel ny_local -> berlin_minus_6 liegt also nach den Okt/Nov-Wochen 2018
@@ -68,10 +71,14 @@
 #   2024  03-10 07:00 .. 03-31 01:00  (20d18h)   10-27 01:00 .. 11-03 06:00  (7d05h)
 #   2025  03-09 07:00 .. 03-30 01:00  (20d18h)   10-26 01:00 .. 11-02 06:00  (7d05h)
 #
-# Folge: Der Wechsel kann an JEDER Rohmonatsgrenze zwischen dem letzten
-# ny_local- und dem ersten berlin_minus_6-Umstellungszeitraum liegen - die
-# Monate dazwischen sind unter beiden Regeln gleich. Nur Monate mit Ticks in
-# einem Fenster (Maerz, Oktober, November) koennen ihn eingrenzen.
+# Folge: Zwischen dem letzten ny_local- und dem ersten berlin_minus_6-
+# Umstellungszeitraum ist der Wechsel an jeder Rohmonatsgrenze AUSSERHALB
+# eines Fensters gleichwertig - die Monate dazwischen sind unter beiden Regeln
+# gleich. NICHT gleichwertig ist die Grenze zwischen Rohmonat 10 und 11: das
+# Okt/Nov-Fenster ueberspannt beide (Ende Oktober bis Anfang November), ein
+# Wechsel dort teilte das Fenster. (Das Maerz-Fenster liegt ganz im Rohmaerz.)
+# Nur Monate mit Ticks in einem Fenster (Maerz, Oktober, November) koennen den
+# Wechsel eingrenzen.
 #
 # Eigene Regeln (optional), Namen eindeutig, nur a-z 0-9 _:
 #   rules:
