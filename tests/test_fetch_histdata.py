@@ -1363,22 +1363,62 @@ def test_unreadable_quarantine_marker_keeps_blocking(tmp_path, clock, caplog):
     assert not hd.store_path(tmp_path, "XAUUSD", 2024, 7).exists()
 
 
-def test_accepted_marker_does_not_bypass_ambiguous_local_time(tmp_path, clock):
-    """Freigegeben (aktuelle Umrechnung), aber ein Tick in der doppelten Stunde:
-    nie raten -> bleibt gesperrt."""
+def _oct_with_saturday_tick():
     oct_ = raw_month_ticks("XAUUSD", 2024, 10)
-    extra = oct_.iloc[[0]].assign(raw=pd.Timestamp("2024-10-26 20:30:00"))
+    extra = oct_.iloc[[0]].assign(raw=pd.Timestamp("2024-10-26 20:30:00"))   # Berlin 02:30, doppelt
     oct_ = pd.concat([oct_, extra]).sort_values("raw", kind="stable")
-    site = Site(clock, {("T", "202409"): tick_zip("XAUUSD", 2024, 9),
-                        ("T", "202410"): _zip_from(oct_, "XAUUSD", 2024, 10)})
+    return {("T", "202409"): tick_zip("XAUUSD", 2024, 9),
+            ("T", "202410"): _zip_from(oct_, "XAUUSD", 2024, 10)}
+
+
+def test_weekend_tick_in_impossible_hour_can_be_released(tmp_path, clock):
+    """Review v5 (4): ein verirrter Tick in der unmoeglichen Stunde (roh Sa 20:30 in
+    der EU-Umstellungsnacht, Markt zu) sperrt den Rohmonat - per Default. Nach
+    "accepted": true werden genau diese Ticks VERWORFEN (nie umgerechnet) und gemeldet."""
+    site = Site(clock, _oct_with_saturday_tick())
     now = datetime(2025, 1, 15, tzinfo=UTC)
-    assert run(tmp_path, clock, site, start=(2024, 10), now=now)["exit_code"] == 4
-    q = hd.Unit("XAUUSD", "tick", 2024, 10).qmarker(tmp_path, (2024, 10))
-    info = json.loads(q.read_text())
-    q.write_text(json.dumps({**info, "accepted": True}))
     rep = run(tmp_path, clock, site, start=(2024, 10), now=now)
     assert rep["exit_code"] == 4 and "mehrdeutiger Ortszeit" in rep["quarantine"][0]["reason"]
+    assert "freigebbar" in rep["quarantine"][0]["reason"]
+    q = hd.Unit("XAUUSD", "tick", 2024, 10).qmarker(tmp_path, (2024, 10))
+    info = json.loads(q.read_text())
+    assert info["tz_error_releasable"] is True and info["accepted"] is False
     assert not hd.store_path(tmp_path, "XAUUSD", 2024, 10).exists()
+    q.write_text(json.dumps({**info, "accepted": True}))
+    rep = run(tmp_path, clock, site, start=(2024, 10), now=now)
+    assert rep["exit_code"] == 0 and rep["summary"]["months_written"] == ["2024-10"], rep
+    mrep = json.loads(hd.report_path(tmp_path, "XAUUSD", 2024, 10).read_text())
+    tz = mrep["raw_months"]["2024-10"]["timezone"]
+    assert tz["accepted_manually"] and tz["dropped_ticks"] == 1
+    assert tz["dropped_raw"] == ["2024-10-26 20:30:00.000"]
+    df = pd.read_parquet(hd.store_path(tmp_path, "XAUUSD", 2024, 10))
+    utc = pd.concat([raw_month_ticks("XAUUSD", 2024, k)["utc"] for k in (9, 10)])
+    utc = utc[(utc >= pd.Timestamp("2024-10-01", tz="UTC")) & (utc < pd.Timestamp("2024-11-01", tz="UTC"))]
+    assert list(df["ts"]) == sorted(set(utc.dt.floor("1min")))       # Tick verworfen, nichts geraten
+
+
+def test_non_weekend_impossible_tick_is_never_releasable(tmp_path, clock, monkeypatch):
+    """Liegt ein nicht umrechenbarer Tick nicht im geschlossenen Wochenendmarkt,
+    hilft auch "accepted": true nicht (hier per Ersatzfunktion simuliert)."""
+    assert hd.weekend_closed_raw(np.array([_ms("2024-10-26 20:30"), _ms("2024-03-30 20:00")])).all()
+    # Regel mit +14 h: die unmoegliche Stunde laege roh am Sonntagnachmittag (Markt-naehe)
+    plus14 = hd.TzRule("berlin_plus_14", "Europe/Berlin", 14)
+    with pytest.raises(hd.TimezoneError) as e:
+        hd.raw_to_utc_ms(np.array([_ms("2024-10-27 16:30")]), plus14)
+    assert not hd.weekend_closed_raw(np.array([_ms("2024-10-27 16:30")])).any()
+    assert e.value.bad_mask.tolist() == [True]
+    site = Site(clock, _oct_with_saturday_tick())
+    now = datetime(2025, 1, 15, tzinfo=UTC)
+    monkeypatch.setattr(hd, "weekend_closed_raw", lambda raw: np.zeros(len(raw), bool))
+    rep = run(tmp_path, clock, site, start=(2024, 10), now=now)
+    assert rep["exit_code"] == 4 and "nicht freigebbar" in rep["quarantine"][0]["reason"]
+    q = hd.Unit("XAUUSD", "tick", 2024, 10).qmarker(tmp_path, (2024, 10))
+    info = json.loads(q.read_text())
+    assert info["tz_error_releasable"] is False
+    q.write_text(json.dumps({**info, "accepted": True}))
+    monkeypatch.undo()
+    rep = run(tmp_path, clock, site, start=(2024, 10), now=now)
+    assert rep["exit_code"] == 4 and not hd.store_path(tmp_path, "XAUUSD", 2024, 10).exists()
 
 
 def test_month_boundary_stitching_across_year_end(tmp_path, clock):
@@ -1476,3 +1516,57 @@ def test_eurusd_removed_from_histdata(tmp_path, clock, capsys):
         hd.verify_month("EURUSD", (2024, 1), tmp_path, now=at(NOW), **kw(clock, Site(clock)))
     with pytest.raises(ValueError, match="Referenzkurs"):
         hd.evaluate_raw_month(tmp_path, "EURUSD", (2024, 1))
+
+
+# ================================================ Review v5: Konfiguration ---
+def test_schedule_must_cover_earliest_raw_month(tmp_path):
+    """Review v5 (5): der Fahrplan muss ab Historienbeginn minus 1 Monat (2009-02)
+    gelten - sonst Fehler beim Laden, nicht Exit 1 mitten im Lauf."""
+    late = tmp_path / "late.yaml"
+    late.write_text("schedule:\n  tick:\n    - {from: '2009-03', rule: berlin_minus_6}\n"
+                    "  m1:\n    - {from: '2000-01', rule: fixed_est}\n")
+    with pytest.raises(ValueError, match="2009-02"):
+        hd.load_tz_config(late)
+    ok = tmp_path / "ok.yaml"
+    ok.write_text("schedule:\n  tick:\n    - {from: '2009-02', rule: berlin_minus_6}\n"
+                  "  m1:\n    - {from: '2009-02', rule: fixed_est}\n")
+    assert hd.rule_for("tick", (2009, 2), hd.load_tz_config(ok)).name == "berlin_minus_6"
+    noschedule = tmp_path / "nos.yaml"
+    noschedule.write_text("rules: []\n")
+    with pytest.raises(ValueError, match="schedule"):
+        hd.load_tz_config(noschedule)
+
+
+def test_missing_default_config_is_an_error(tmp_path, monkeypatch):
+    """Fehlt config/histdata_timezone.yaml, kein stiller Rueckfall auf eingebaute Werte."""
+    monkeypatch.delenv(hd.TZ_CONFIG_ENV, raising=False)
+    monkeypatch.setattr(hd, "DEFAULT_TZ_CONFIG", tmp_path / "gibt_es_nicht.yaml")
+    with pytest.raises(ValueError, match="fehlt"):
+        hd.load_tz_config()
+    with pytest.raises(ValueError, match="fehlt"):
+        hd.rule_for("tick", (2024, 1))
+
+
+def test_old_eurusd_store_is_retired_on_any_run(tmp_path, clock, caplog):
+    """Review v5 (6): HistData-EURUSD-Dateien aus v4 liegen sonst ewig im Store
+    (EURUSD wird abgelehnt). Jeder Lauf verschiebt das Verzeichnis nach metals/stale/;
+    Roh-Cache und Marker bleiben."""
+    sdir = hd.store_dir(tmp_path, "EURUSD", "tick")
+    f = sdir / "year=2024" / "EURUSD-1m-2024-07.parquet"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"alt")
+    raw = hd.raw_dir(tmp_path, "EURUSD", "tick") / "HISTDATA_COM_ASCII_EURUSD_T202407.zip"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"PK")
+    (raw.parent / (raw.name + ".quarantine")).write_text("{}")
+    with caplog.at_level("WARNING", logger="histdata"):
+        rep = run(tmp_path, clock, feb_site(clock))
+    assert rep["exit_code"] == 0 and not sdir.exists()
+    assert [r["symbol"] for r in rep["retired_removed_symbols"]] == ["EURUSD"]
+    moved = list((tmp_path / "metals" / "stale").rglob("EURUSD-1m-2024-07.parquet"))
+    assert len(moved) == 1 and moved[0].read_bytes() == b"alt"
+    assert not list((tmp_path / "metals").glob("source=*/symbol=EURUSD*"))
+    assert raw.exists() and (raw.parent / (raw.name + ".quarantine")).exists()
+    assert sum("EURUSD" in r.getMessage() for r in caplog.records) == 1
+    rep = run(tmp_path, clock, feb_site(clock))                      # danach: nichts mehr zu tun
+    assert rep["retired_removed_symbols"] == []

@@ -202,7 +202,9 @@ Store and validation:
 time anchors per month, and its 2024-11 `--verify-month` passed although the
 stamping was wrong. The bot uses a daily reference rate (ECB/FRED) instead;
 `--symbol EURUSD` is rejected with that hint (`fetch_dukascopy.py` is
-unchanged).
+unchanged). Any run moves an old HistData EURUSD store directory (written by
+check version 4) to `metals/stale/` once (WARNING, run report
+`retired_removed_symbols`); its raw cache is left alone.
 Dukascopy answers HTTP 429 per client IP in the homelab, even with one
 worker. The output is the same as the Dukascopy store (columns, dtypes,
 atomic writes, reports, exit codes). The bot can tell the two sources apart
@@ -274,8 +276,11 @@ Time zone:
       - {from: "2000-01", rule: fixed_est}
   ```
 
-  An unknown rule or zone, an unsorted or duplicate `from`, or a missing mode
-  stops the run; there is never a silent fallback. Before changing the
+  An unknown rule or zone, an unsorted or duplicate `from`, a missing mode
+  or schedule, a schedule that starts after the earliest raw month needed
+  (first history month minus one, i.e. 2009-02), or a missing config file
+  (also the repo default) stops at load time; there is never a silent
+  fallback. Before changing the
   schedule, compare candidate rules offline against the raw cache with
   `scripts/histdata_tz_survey.py` (uses `evaluate_raw_month`: cached raw files
   only, no download, no markers). After a change, the next run detects every
@@ -352,8 +357,16 @@ Time zone:
   - `"accepted": true` holds only for the same rule (zone and shift). A
     release made under another rule is re-checked: if the month passes, the
     marker is removed; if not, it is rewritten with `"accepted": false` and a
-    note that the earlier release applied to the old conversion. A tick at an
-    ambiguous or nonexistent local time blocks even a released month.
+    note that the earlier release applied to the old conversion.
+  - A tick at an ambiguous or nonexistent local time quarantines the raw
+    month (default: error, never a guess). If **all** such ticks lie in the
+    closed weekend market (raw Saturday, or Sunday before 12:00; for
+    `berlin_minus_6` that is raw Saturday 20:00–20:59 in the transition
+    nights), the marker says `"tz_error_releasable": true` and a human may set
+    `"accepted": true`: those ticks are then **dropped** (never converted) and
+    their count and raw timestamps go into the monthly report
+    (`dropped_ticks`, `dropped_raw`). A tick outside the weekend is never
+    releasable.
   - An unreadable marker (invalid JSON, e.g. a typo while setting
     `"accepted": true`) is kept, logged as ERROR and keeps blocking.
 - Monthly files carry the parquet metadata `source_timezone`, derived from

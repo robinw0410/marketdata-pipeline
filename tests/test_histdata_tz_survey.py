@@ -298,8 +298,12 @@ def test_fixed_est_period_is_decisive_in_july_and_change_inside_year(tmp_path, c
     res, out = run(tmp_path, years=[2012], offline=True, **NO_MONTHS)
     v = res["verdicts"]["2012"]["verdict"]
     assert v.startswith("Wechsel im Jahr: fixed_est (2012-03..2012-03) -> berlin_minus_6"), v
-    assert res["schedule"] == [{"from": "2000-01", "rule": "fixed_est"},
-                               {"from": "2012-04", "rule": "berlin_minus_6"}]
+    # je Block nur EIN entscheidender Monat eines Symbols: zu wenig Evidenz fuer einen
+    # Vorschlag (Review v5) - Belege werden gedruckt, aber nicht vorgeschlagen
+    assert res["schedule"] == []
+    assert [(b["rule"], b["months"]) for b in res["weak_evidence"]] == \
+        [("fixed_est", ["2012-03"]), ("berlin_minus_6", ["2012-10"])]
+    assert "zu wenig Evidenz" in out
     jan = next(m for m in res["months"] if m["month"] == "2012-01")
     assert jan["text"] == "Kontrolle ok: berlin_minus_6, ny_local, fixed_est"
     assert res["exit_code"] == 4
@@ -316,7 +320,11 @@ def test_no_rule_passes_and_control_failure(tmp_path, cfg, monkeypatch):
     assert v["verdict"] == "keine Regel passt"
     assert any("Kontrolle gescheitert" in n for n in v["notes"])
     assert "Kein Fahrplan-Vorschlag" in out
-    assert res["exit_code"] == 0                             # nichts Entscheidendes, nichts fehlt
+    # die konfigurierte Regel faellt durch, auch wenn keine andere besteht -> Exit 4
+    assert res["exit_code"] == 4
+    assert {(c["month"], c["configured"]) for c in res["configured_failed"]} == \
+        {("2010-01", "berlin_minus_6"), ("2010-03", "berlin_minus_6")}
+    assert "KONFIGURIERTE REGEL FAELLT DURCH" in out
 
 
 def test_symbols_disagree_month_left_out_of_schedule(tmp_path, cfg, monkeypatch):
@@ -439,9 +447,48 @@ def test_integration_with_synthetic_raw_zips(tmp_path, cfg):
     assert by["2024-10"]["winner"] == "berlin_minus_6"
     assert by["2015-07"]["control_ok"] and by["2024-07"]["control_ok"]
     assert by["2015-07"]["results"]["fixed_est"]["status"] == "failed"
-    assert res["schedule"] == [{"from": "2000-01", "rule": "ny_local"},
-                               {"from": "2024-01", "rule": "berlin_minus_6"}]
+    # je Block nur ein entscheidender Monat eines Symbols -> kein Vorschlag (zu wenig Evidenz)
+    assert res["schedule"] == []
+    assert {b["rule"] for b in res["weak_evidence"]} == {"ny_local", "berlin_minus_6"}
     assert res["verdicts"]["2015"]["verdict"] == "nur ny_local passt"
     assert res["verdicts"]["2024"]["verdict"] == "berlin_minus_6 passt"
     assert res["exit_code"] == 4                             # 2015-03 widerspricht berlin_minus_6
     assert {m["month"] for m in res["incomplete"]} == {"2015-10", "2024-03"}
+
+
+# ------------------------------------------------ Review v5: Evidenz, Exit ---
+def test_configured_rule_failing_where_two_others_pass_is_exit_4(tmp_path, cfg, monkeypatch):
+    """Review v5 (2): konfigurierte Regel faellt durch, zwei andere bestehen
+    (kein entscheidender Monat) -> trotzdem Exit 4 mit Liste."""
+    cfg((("2000-01", "fixed_est"),))
+    monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(lambda ym: "berlin_minus_6"))
+    touch_cache(tmp_path / "data", "XAUUSD", (2018, 7))       # Juli: berlin = ny, fixed_est faellt
+    res, out = run(tmp_path, years=[2018], months=[], controls=[7], offline=True)
+    m = res["months"][0]
+    assert not m["decisive"] and set(m["passing"]) == {"berlin_minus_6", "ny_local"}
+    assert res["contradictions"] == [] and res["exit_code"] == 4
+    assert [(c["month"], c["configured"]) for c in res["configured_failed"]] == [("2018-07", "fixed_est")]
+
+
+def test_configured_rule_outside_rules_selection_is_still_checked(tmp_path, cfg, monkeypatch):
+    calls = []
+    monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(lambda ym: "ny_local", calls))
+    touch_cache(tmp_path / "data", "XAUUSD", (2018, 3))
+    res, out = run(tmp_path, years=[2018], months=[3], controls=[], offline=True,
+                   rules=["ny_local", "fixed_est"])
+    assert ("XAUUSD", (2018, 3), "berlin_minus_6") in calls     # konfiguriert, nicht gewaehlt
+    assert res["exit_code"] == 4 and res["configured_failed"][0]["configured"] == "berlin_minus_6"
+
+
+def test_block_needs_two_months_or_both_symbols():
+    """Review v5 (3): ein einzelner entscheidender Monat eines Symbols reicht nicht."""
+    one = {(2012, 3): "ny_local"}
+    assert sv.suggest_schedule(one, (2000, 1), {(2012, 3): {"XAUUSD"}}) == []
+    assert sv.weak_blocks(one, {(2012, 3): {"XAUUSD"}})[0]["months"] == ["2012-03"]
+    both = sv.suggest_schedule(one, (2000, 1), {(2012, 3): {"XAUUSD", "XAGUSD"}})
+    assert [(e["from"], e["rule"]) for e in both] == [("2000-01", "ny_local")]
+    two = {(2012, 3): "ny_local", (2012, 10): "ny_local", (2016, 3): "berlin_minus_6"}
+    sup = {k: {"XAUUSD"} for k in two}
+    sched = sv.suggest_schedule(two, (2000, 1), sup)
+    assert [(e["from"], e["rule"]) for e in sched] == [("2000-01", "ny_local")]   # berlin: 1 Monat
+    assert [b["rule"] for b in sv.weak_blocks(two, sup)] == ["berlin_minus_6"]

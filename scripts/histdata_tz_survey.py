@@ -16,6 +16,11 @@ Ein Befehl:
    `schedule` in config/histdata_timezone.yaml. Die Config selbst wird NIE
    geschrieben.
 
+Fahrplan-Vorschlag: ein Block (gleiche Regel) kommt nur in den YAML-Vorschlag,
+wenn er durch mindestens 2 entscheidende Monate ODER durch beide Symbole im
+selben Monat belegt ist; sonst wird er als "zu wenig Evidenz" gedruckt (JSON
+"weak_evidence"), aber nicht vorgeschlagen.
+
 Monate: Umstellungsmonate (Default Maerz, April, Oktober, November: dort
 unterscheiden sich EU- und US-Sommerzeit bzw. Sommerzeit und feste Zeit) und
 Kontrollmonate (Default Januar, Juli). Entscheidend ist nur ein Rohmonat, in
@@ -29,8 +34,12 @@ nicht mehr).
 
 Exit-Codes:
   0  alle entscheidenden Monate passen zum konfigurierten Fahrplan (fh.rule_for)
-  4  mindestens ein entscheidender Monat widerspricht dem Fahrplan (Liste auf
-     der Konsole und im JSON)
+     und die konfigurierte Regel faellt in keinem ausgewerteten Monat durch
+  4  mindestens ein entscheidender Monat widerspricht dem Fahrplan, ODER die
+     konfigurierte Regel hat in mindestens einem ausgewerteten Monat Status
+     "failed" (auch wenn dort keine oder mehrere andere Regeln bestehen) -
+     beide Listen auf der Konsole und im JSON ("contradictions",
+     "configured_failed")
   3  unvollstaendig: Download gescheitert, 429 (Sperre aktiv oder neu),
      --max-downloads erreicht, Symbol-Lock belegt, im --offline-Modus nicht
      im Cache. Teilergebnisse werden trotzdem ausgewertet und gedruckt.
@@ -273,14 +282,19 @@ def _runs(items: list[tuple[tuple[int, int], str]]) -> list[dict]:
     return runs
 
 
-def decisive_by_month(rows: list[dict]) -> tuple[dict, list[str]]:
+def decisive_by_month(rows: list[dict], support: dict | None = None) -> tuple[dict, list[str]]:
     """{ym: regel} aus allen Symbolen; Monate mit verschiedenen Gewinnern je
-    Symbol sind Konflikte (nicht im Fahrplan)."""
+    Symbol sind Konflikte (nicht im Fahrplan). support (optional, wird
+    gefuellt): {ym: Menge der Symbole, die den Gewinner stuetzen}."""
     winners: dict[tuple[int, int], set] = {}
+    syms: dict[tuple[int, int], set] = {}
     for r in rows:
         if r["decisive"]:
             winners.setdefault(r["ym"], set()).add(r["winner"])
+            syms.setdefault(r["ym"], set()).add(r["symbol"])
     good = {ym: next(iter(w)) for ym, w in winners.items() if len(w) == 1}
+    if support is not None:
+        support.update({ym: syms[ym] for ym in good})
     conflicts = [f"{ymstr(ym)}: {', '.join(sorted(w))}" for ym, w in sorted(winners.items())
                  if len(w) > 1]
     return good, conflicts
@@ -328,14 +342,35 @@ def year_verdicts(rows: list[dict]) -> dict[int, dict]:
     return out
 
 
-def suggest_schedule(decisive: dict, first_from: tuple[int, int]) -> list[dict]:
+MIN_BLOCK_MONTHS = 2   # so viele entscheidende Monate je Block, sonst beide Symbole im selben Monat
+
+
+def weak_blocks(decisive: dict, support: dict | None) -> list[dict]:
+    """Bloecke (gleiche Regel in Folge) mit zu wenig Evidenz: weniger als
+    MIN_BLOCK_MONTHS entscheidende Monate und kein Monat, in dem beide Symbole
+    uebereinstimmen. support None = ohne Symbol-Info (jeder Monat zaehlt einfach)."""
+    out = []
+    for r in _runs(list(decisive.items())):
+        months = [ym for ym in sorted(decisive) if r["first"] <= ym <= r["last"]]
+        both = any(len((support or {}).get(ym, ())) >= 2 for ym in months)
+        if len(months) < MIN_BLOCK_MONTHS and not both:
+            out.append({"rule": r["rule"], "months": [ymstr(m) for m in months],
+                        "symbols": sorted({s for m in months for s in (support or {}).get(m, ())})})
+    return out
+
+
+def suggest_schedule(decisive: dict, first_from: tuple[int, int],
+                     support: dict | None = None) -> list[dict]:
     """
     Fahrplan aus den entscheidenden Monaten: je Block gleicher Regel ein
     Eintrag. Erster Eintrag ab first_from (Historienbeginn). Ein Wechsel liegt
     irgendwo zwischen dem letzten Beleg der alten und dem ersten Beleg der neuen
     Regel; "from" = fruehester Monat, der noch zum Jahr des ersten Belegs
-    gehoert, aber nach dem letzten Beleg der alten Regel liegt.
+    gehoert, aber nach dem letzten Beleg der alten Regel liegt. Bloecke mit zu
+    wenig Evidenz (weak_blocks) fallen vorher heraus (nur Bericht).
     """
+    weak = {m for b in weak_blocks(decisive, support) for m in b["months"]}
+    decisive = {ym: w for ym, w in decisive.items() if ymstr(ym) not in weak}
     runs = _runs(list(decisive.items()))
     sched = []
     for i, r in enumerate(runs):
@@ -474,11 +509,21 @@ def survey(symbols=SYMBOLS, years=DEFAULT_YEARS, months=DEFAULT_MONTHS,
             r.update(classify(r["results"], r["kind"], dst_rules(sel, r["ym"][0])))
             if r["decisive"] and r["configured"] is not None and r["winner"] != r["configured"]:
                 r["contradiction"] = True
+            # konfigurierte Regel selbst durchgefallen (auch ohne/mit mehreren Gewinnern)
+            conf = r["configured"]
+            if conf is not None and conf not in r["results"] and cfg is not None and conf in cfg.rules:
+                r["configured_result"] = evaluate(data_root, r["symbol"], r["ym"],
+                                                  {conf: cfg.rules[conf]})[conf]
+            else:
+                r["configured_result"] = r["results"].get(conf)
+            if (r["configured_result"] or {}).get("status") == "failed":
+                r["configured_failed"] = True
         elif "text" not in r:
             r["text"] = texts.get(r["state"], f"nicht geladen ({r['state']})")
     incomplete = [r for r in rows if r["state"] not in
                   ("cached", "empty", "before_history", "not_closed")]
     contradictions = [r for r in rows if r.get("contradiction")]
+    configured_failed = [r for r in rows if r.get("configured_failed")]
 
     # 4) Ausgabe
     for sym in symbols:
@@ -488,13 +533,19 @@ def survey(symbols=SYMBOLS, years=DEFAULT_YEARS, months=DEFAULT_MONTHS,
     for y, v in verdicts.items():
         print(f"  {y}: {v['verdict']}" + (f"  ({'; '.join(v['notes'])})" if v["notes"] else ""),
               file=out)
-    decisive, conflicts = decisive_by_month(rows)
+    support: dict = {}
+    decisive, conflicts = decisive_by_month(rows, support)
     # erster Eintrag ab dem Beginn des aktuellen Fahrplans (deckt alles davor ab)
     first_from = cfg.schedule[MODE][0][0] if cfg is not None else \
         min(fh.HISTORY_START[s] for s in symbols)
-    sched = suggest_schedule(decisive, first_from) if decisive else []
+    weak = weak_blocks(decisive, support) if decisive else []
+    sched = suggest_schedule(decisive, first_from, support) if decisive else []
     if conflicts:
         print("\nSymbole widersprechen sich (nicht im Vorschlag): " + "; ".join(conflicts), file=out)
+    for b in weak:
+        print(f"\nzu wenig Evidenz (nicht im Vorschlag): {b['rule']} nur in "
+              f"{', '.join(b['months'])} ({', '.join(b['symbols'])}) - mindestens "
+              f"{MIN_BLOCK_MONTHS} entscheidende Monate oder beide Symbole noetig", file=out)
     if sched:
         print("\n" + schedule_yaml(sched, cfg), file=out)
         if any(e["change_between"] for e in sched):
@@ -507,13 +558,20 @@ def survey(symbols=SYMBOLS, years=DEFAULT_YEARS, months=DEFAULT_MONTHS,
         for r in contradictions:
             print(f"  {r['symbol']} {r['month']}: Daten -> {r['winner']}, konfiguriert "
                   f"{r['configured']}", file=out)
+    if configured_failed:
+        print("\nKONFIGURIERTE REGEL FAELLT DURCH (fh.rule_for):", file=out)
+        for r in configured_failed:
+            res_ = r["configured_result"]
+            print(f"  {r['symbol']} {r['month']}: {r['configured']} failed "
+                  f"({res_.get('reason') or 'ohne Grund'}); Ergebnis: {r['text']}", file=out)
     if incomplete:
         print(f"\nUNVOLLSTAENDIG: {len(incomplete)} Rohmonate fehlen (" + ", ".join(
             f"{r['symbol']} {r['month']} {r['state']}" for r in incomplete[:12]) +
             (", ..." if len(incomplete) > 12 else "") + ") - erneut starten setzt fort.", file=out)
     if stop_reason:
         print(f"Downloads abgebrochen: {stop_reason}", file=out)
-    code = EXIT_CONTRADICTION if contradictions else EXIT_INCOMPLETE if incomplete else EXIT_OK
+    code = EXIT_CONTRADICTION if (contradictions or configured_failed) else \
+        EXIT_INCOMPLETE if incomplete else EXIT_OK
     print(f"\nExit {code}; Requests: {requests}", file=out)
 
     return {
@@ -524,7 +582,11 @@ def survey(symbols=SYMBOLS, years=DEFAULT_YEARS, months=DEFAULT_MONTHS,
         "months": [{k: v for k, v in r.items() if k != "ym"} for r in rows],
         "verdicts": {str(y): v for y, v in verdicts.items()},
         "schedule": [{"from": e["from"], "rule": e["rule"]} for e in sched],
-        "schedule_details": sched, "symbol_conflicts": conflicts,
+        "schedule_details": sched, "symbol_conflicts": conflicts, "weak_evidence": weak,
+        "configured_failed": [{"symbol": r["symbol"], "month": r["month"],
+                               "configured": r["configured"],
+                               "reason": (r["configured_result"] or {}).get("reason")}
+                              for r in configured_failed],
         "contradictions": [{"symbol": r["symbol"], "month": r["month"], "winner": r["winner"],
                             "configured": r["configured"]} for r in contradictions],
         "incomplete": [{"symbol": r["symbol"], "month": r["month"], "state": r["state"]}

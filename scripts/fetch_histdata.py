@@ -35,8 +35,9 @@ POST -> nach der Pause wieder ab dem Seiten-GET (frisches Token).
 
 Zeitzone = Stempelungsregel (TzRule: Rohzeit = Ortszeit in `zone` + shift_h)
 je ROHmonat nach Fahrplan in config/histdata_timezone.yaml (load_tz_config,
-rule_for; andere Datei per $HISTDATA_TZ_CONFIG; Fehler -> Abbruch, nie still
-ein Default). Wechsel nur an Rohmonatsgrenzen.
+rule_for; andere Datei per $HISTDATA_TZ_CONFIG; Datei muss existieren und ab
+spaetestens 2009-02 gelten; Fehler -> Abbruch beim Laden, nie still ein
+Default). Wechsel nur an Rohmonatsgrenzen.
 - tick: berlin_minus_6 = Europe/Berlin - 6 h: UTC-5 im EU-Winter, UTC-4 in
   der EU-Sommerzeit (Wechsel letzter So Maerz/Oktober 01:00 UTC). Im Homelab
   an echten Ticks aller drei Symbole gemessen: 2024-03 bleibt nach der
@@ -111,6 +112,12 @@ tz_check_version. Nicht freigegebene Marker aelterer Version/anderer Regel
 fuer dieselbe Regel (Zone + Verschiebung); eine Freigabe unter anderer
 Regel wird neu geprueft - besteht: Marker weg, sonst neuer Marker accepted
 false mit Hinweis. Unlesbarer Marker: ERROR, bleibt, sperrt weiter.
+Nicht eindeutige Ortszeit sperrt per Default; liegen alle betroffenen Ticks im
+geschlossenen Wochenendmarkt (roh Sa oder So vor 12:00), ist der Marker
+freigebbar (tz_error_releasable): mit "accepted": true werden genau diese
+Ticks verworfen (nie umgerechnet) und im Monatsreport gemeldet.
+EURUSD-Storeverzeichnisse aus Pruefversion 4 verschiebt jeder Lauf nach
+metals/stale/ (retired_removed_symbols).
 
 Ablage (DATA_ROOT = $MARKETDATA_DATA_ROOT, sonst <repo>/data), SRC =
 histdata (tick) bzw. histdata_m1 (m1):
@@ -336,6 +343,29 @@ def retire_stale_store_file(data_root: Path, out: Path) -> Path:
     return dest
 
 
+def retire_removed_symbol_stores(data_root: Path) -> list[dict]:
+    """Store-Verzeichnisse nicht mehr unterstuetzter Symbole (REMOVED_SYMBOLS,
+    z.B. EURUSD aus Pruefversion 4 mit falscher Stempelung) nach metals/stale/
+    verschieben - der Bot soll sie nicht mehr lesen. Roh-Cache und Marker
+    bleiben unberuehrt. Rueckgabe: [{symbol, mode, from, to}]."""
+    out = []
+    for sym in REMOVED_SYMBOLS:
+        for mode in MODES:
+            d = store_dir(data_root, sym, mode)
+            if not d.is_dir():
+                continue
+            rel = d.relative_to(data_root / "metals")
+            dest = data_root / "metals" / "stale" / rel.parent / (
+                f"{d.name}.{datetime.now(UTC):%Y%m%dT%H%M%S%f}.stale")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(d, dest)
+            dk._fsync_dir(d.parent)
+            log.warning("%s wird nicht mehr ueber HistData geladen: Store %s nach %s verschoben "
+                        "(Roh-Cache bleibt)", sym, d, dest)
+            out.append({"symbol": sym, "mode": mode, "from": str(d), "to": str(dest)})
+    return out
+
+
 def store_path(data_root: Path, symbol: str, y: int, m: int, mode: str = "tick") -> Path:
     return store_dir(data_root, symbol, mode) / f"year={y}" / f"{symbol}-1m-{y}-{m:02d}.parquet"
 
@@ -447,6 +477,7 @@ TZ_RULES = {"berlin_minus_6": TzRule("berlin_minus_6", "Europe/Berlin", -6),
 # Default-Fahrplan, falls die Konfiguration keinen liefert (identisch mit der
 # ausgelieferten config/histdata_timezone.yaml). M1 ist NICHT verifiziert.
 DEFAULT_TZ_SCHEDULE = {"tick": [((2000, 1), "berlin_minus_6")], "m1": [((2000, 1), "fixed_est")]}
+# (nur fuer build_tz_config(None) ohne Datei; load_tz_config verlangt immer eine Datei)
 
 
 @dataclass(frozen=True)
@@ -494,6 +525,8 @@ def build_tz_config(data: dict | None, path: str | None = None) -> TzConfig:
         rules[name] = TzRule(name, str(r["zone"]), int(r["shift_h"]))
     sched_in = data.get("schedule")
     if sched_in is None:
+        if path is not None:
+            raise ValueError(f"{path}: Abschnitt schedule fehlt")
         sched_in = {m: [{"from": f"{y}-{mm:02d}", "rule": n} for (y, mm), n in v]
                     for m, v in DEFAULT_TZ_SCHEDULE.items()}
     if not isinstance(sched_in, dict) or set(sched_in) != set(MODES):
@@ -514,6 +547,12 @@ def build_tz_config(data: dict | None, path: str | None = None) -> TzConfig:
             if out and ym <= out[-1][0]:
                 raise ValueError(f"{where}: 'from' {e['from']} nicht aufsteigend/doppelt")
             out.append((ym, rules[e["rule"]]))
+        earliest = _ym_add(min(HISTORY_START.values()), -1)   # Rohmonat vor dem ersten UTC-Monat
+        if out[0][0] > earliest:
+            raise ValueError(f"{path}: schedule.{mode} beginnt erst {out[0][0][0]}-{out[0][0][1]:02d}; "
+                             f"er muss spaetestens ab {earliest[0]}-{earliest[1]:02d} gelten "
+                             f"(fruehester benoetigter Rohmonat: Historienbeginn "
+                             f"{min(HISTORY_START.values())} minus 1 Monat)")
         schedule[mode] = tuple(out)
     return TzConfig(rules, schedule, path)
 
@@ -523,14 +562,13 @@ _TZ_CFG_CACHE: dict = {}
 
 def load_tz_config(path: str | Path | None = None) -> TzConfig:
     """config/histdata_timezone.yaml (oder $HISTDATA_TZ_CONFIG, oder `path`) laden
-    und pruefen. Fehlt die Default-Datei, gilt DEFAULT_TZ_SCHEDULE; eine
-    ausdruecklich angegebene Datei muss existieren. Fehler -> ValueError."""
-    explicit = path is not None or bool(os.environ.get(TZ_CONFIG_ENV))
+    und pruefen. Die Datei muss existieren (auch die Default-Datei im Repo: kein
+    stiller Rueckfall auf eingebaute Werte) und einen Abschnitt schedule haben.
+    Fehler -> ValueError."""
     p = Path(path or os.environ.get(TZ_CONFIG_ENV) or DEFAULT_TZ_CONFIG)
     if not p.exists():
-        if explicit:
-            raise ValueError(f"Zeitzonen-Konfiguration {p} fehlt")
-        return build_tz_config(None, None)
+        raise ValueError(f"Zeitzonen-Konfiguration {p} fehlt (Default: {DEFAULT_TZ_CONFIG}, "
+                         f"andere Datei per ${TZ_CONFIG_ENV}) - ohne sie wird nichts umgerechnet")
     key = (str(p.resolve()), p.stat().st_mtime_ns)
     if key not in _TZ_CFG_CACHE:
         import yaml
@@ -643,6 +681,7 @@ def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
         out[ok] = u[ok]
         n_ok += ok
     if (n_ok != 1).any():
+        bad = n_ok != 1
         msg = []
         for mask, what in ((n_ok == 0, "nicht existierender Ortszeit (Sommerzeitbeginn)"),
                            (n_ok > 1, "mehrdeutiger Ortszeit (Sommerzeitende)")):
@@ -650,8 +689,20 @@ def raw_to_utc_ms(raw_ms: np.ndarray, rule: TzRule) -> np.ndarray:
             if len(idx):
                 ex = ", ".join(_raw_iso(int(raw_ms[i]), ms_digits=True) for i in idx[:5])
                 msg.append(f"{len(idx)} Zeitstempel (roh) in {what} nach {rule.describe()}, z.B. {ex}")
-        raise TimezoneError("; ".join(msg) + " - Markt ist dann geschlossen, nicht umgerechnet")
+        err = TimezoneError("; ".join(msg) + " - Markt ist dann geschlossen, nicht umgerechnet")
+        err.bad_mask = bad
+        raise err
     return out
+
+
+def weekend_closed_raw(raw_ms: np.ndarray) -> np.ndarray:
+    """Rohzeit am Samstag oder Sonntag vor 12:00 (Markt geschlossen, weit weg von
+    jeder Oeffnung) - dort liegen die verbotenen Stunden der Regeln
+    (berlin_minus_6: Sa 20:00-20:59, ny_local: So 01:00-02:59)."""
+    raw_ms = np.asarray(raw_ms, dtype=np.int64)
+    wd = (raw_ms // DAY_MS + 3) % 7
+    hour = (raw_ms % DAY_MS) // HOUR_MS
+    return (wd == 5) | ((wd == 6) & (hour < 12))
 
 
 def _raw_month_index(ms: np.ndarray) -> np.ndarray:
@@ -1245,9 +1296,14 @@ def _ambig_before_run(run: list, entries: list, ambig: list, own_lo: int) -> boo
     Wochenende im Vormonat, das zur Abweichung des Laufs passt? Dann kann der
     Wechsel schon dort begonnen haben (duenne Daten: Oeffnung nicht eindeutig)."""
     start, dev = run[0][0], run[0][1]
-    zeros = [e[0] for e in entries if e[1] == 0 and e[0] < start]
-    after = max(zeros) if zeros else -1
-    return any(after < a < start and a < own_lo and lo <= dev <= hi for a, lo, hi in ambig)
+    for a, lo, hi in ambig:
+        # Null-Eintraege DESSELBEN mehrdeutigen Wochenendes (z.B. sein Freitags-
+        # schluss) trennen nicht: der Wechsel kann in genau dieser Luecke liegen
+        zeros = [e[0] for e in entries if e[1] == 0 and e[0] < start and e[2] != a]
+        after = max(zeros) if zeros else -1
+        if after < a < start and a < own_lo and lo <= dev <= hi:
+            return True
+    return False
 
 
 def _wd(ms: int) -> int:
@@ -1920,14 +1976,35 @@ class Ctx:
             self._quarantine(u, ym, f"Format nicht lesbar: {e}", None, note)
         try:
             sel = sel.assign(utc_ms=raw_to_utc_ms(sel["raw_ms"].to_numpy(), rule_for(self.mode, ym)))
+            dropped = None
         except TimezoneError as e:
-            # auch bei "accepted": nicht eindeutige Ortszeit wird nie geraten
-            reason = f"Rohzeit nicht eindeutig nach UTC umrechenbar: {e}"
-            if accepted:
+            # Default: nie raten -> Quarantaene. Liegen ALLE betroffenen Ticks im
+            # geschlossenen Wochenendmarkt (z.B. roh Sa 20:00-20:59 in den EU-
+            # Umstellungsnaechten), darf ein Mensch per "accepted": true freigeben:
+            # diese Ticks werden dann VERWORFEN (nie umgerechnet) und gemeldet.
+            bad = getattr(e, "bad_mask", None)
+            raw_all = sel["raw_ms"].to_numpy()
+            releasable = bad is not None and bool(weekend_closed_raw(raw_all[bad]).all())
+            reason = (f"Rohzeit nicht eindeutig nach UTC umrechenbar: {e}" + (
+                " [nur Ticks im geschlossenen Wochenendmarkt: nach Pruefung mit \"accepted\": "
+                "true freigebbar, diese Ticks werden dann verworfen]" if releasable else
+                " [nicht freigebbar: Ticks ausserhalb des Wochenendes]"))
+            marker_info = self.read_qmarker(q) if q.exists() else None
+            if accepted and releasable and (marker_info or {}).get("tz_error_releasable"):
+                keep = ~bad
+                dropped = {"dropped_ticks": int(bad.sum()),
+                           "dropped_raw": [_raw_iso(int(x), ms_digits=True) for x in raw_all[bad][:N_EXAMPLES]]}
+                log.warning("%s Rohmonat %s: %d Tick(s) in nicht eindeutiger Ortszeit (geschlossener "
+                            "Wochenendmarkt) nach Freigabe verworfen, z.B. %s", u.key, _ymstr(ym),
+                            dropped["dropped_ticks"], ", ".join(dropped["dropped_raw"][:3]))
+                sel = sel[keep].assign(utc_ms=raw_to_utc_ms(raw_all[keep], rule_for(self.mode, ym)))
+            elif accepted:
                 raise Quarantined(u, ym, reason, None)
-            self._quarantine(u, ym, reason, None, note)
+            else:
+                self._tz_error_releasable = releasable
+                self._quarantine(u, ym, reason, None, note)
         if accepted:
-            return sel, {"accepted_manually": True, "marker": str(q)}
+            return sel, {"accepted_manually": True, "marker": str(q), **(dropped or {})}
         if not len(sel):
             return sel, {}
         nb, pad = self._neighbours(ym)
@@ -2033,6 +2110,11 @@ class Ctx:
         info = {"reason": reason, "check": check, "since": self.now().isoformat(),
                 "accepted": False, "tz_rule": rule.name, "raw_tz": rule.zone,
                 "tz_shift_h": rule.shift_h, "tz_check_version": TZ_CHECK_VERSION}
+        if getattr(self, "_tz_error_releasable", None) is not None:
+            # Quarantaene wegen nicht eindeutiger Ortszeit: freigebbar nur, wenn alle
+            # betroffenen Ticks im geschlossenen Wochenendmarkt liegen
+            info["tz_error_releasable"] = self._tz_error_releasable
+            self._tz_error_releasable = None
         if note:
             info["note"] = note
             reason = f"{reason} [{note}]"
@@ -2164,6 +2246,7 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
         return (f"{out} hat histdata_mode={have!r}, Lauf ist {PARQUET_MODE[mode]!r} - "
                 "nicht ueberschrieben (Datei pruefen/verschieben)")
 
+    removed_stores = retire_removed_symbol_stores(data_root)
     in_range = set(dk.months(start, end))
     stale_out: dict[str, dict] = {}
     relabelled: list[tuple[int, int]] = []
@@ -2353,7 +2436,7 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
         rep = _run_report(ctx, start, end, started, todo, outcomes, written, validation_errors,
                           quarantine, pending, unavailable, missing, conflicts, skipped_existing,
                           state, reported_gaps, rebuild, stale_tz, stale_out, relabelled,
-                          retired_recheck, unverified)
+                          retired_recheck, unverified, removed_stores)
         dk.write_json_atomic(run_report_path(data_root, sym, mode), rep)
         log.info("FERTIG %s: status=%s exit=%d, %d Monate geschrieben, %d Requests (Report %s)", sym,
                  rep["status"], rep["exit_code"], len(written), client.requests,
@@ -2364,7 +2447,7 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
 def _run_report(ctx, start, end, started, todo, outcomes, written, validation_errors, quarantine,
                 pending, unavailable, missing, conflicts, skipped_existing, state, reported_gaps,
                 rebuild, stale_tz=None, stale_out=None, relabelled=None, retired_recheck=None,
-                unverified=None) -> dict:
+                unverified=None, removed_stores=None) -> dict:
     stale_tz, stale_out, relabelled = stale_tz or {}, stale_out or {}, relabelled or []
     client = ctx.client
     manual = [{"month": _ymstr(k), "kind": "quarantine", **{x: v[x] for x in ("reason", "path")}}
@@ -2451,6 +2534,8 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
         "retired_after_recheck": retired_recheck or {},
         # aeltere Pruefversion, Roh-Cache fehlt: Datei bleibt ungeprueft
         "unverified_after_version_bump": [_ymstr(k) for k in sorted(unverified or [])],
+        # Store-Verzeichnisse nicht mehr unterstuetzter Symbole (EURUSD) nach metals/stale/
+        "retired_removed_symbols": removed_stores or [],
         "started": started.isoformat(), "finished": dk.utc_now().isoformat(),
         "range": {"start": f"{start:%Y-%m}", "end": f"{end:%Y-%m}"},
         "options": {"pause": client.pause, "attempts": client.attempts,

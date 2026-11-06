@@ -25,7 +25,9 @@
 # erkannt (source_timezone passt nicht), verschobene sofort nach metals/stale/
 # gelegt und aus dem Roh-Cache neu gebaut. Pruefen vorher offline:
 #   python scripts/histdata_tz_survey.py ...   (nutzt evaluate_raw_month)
-# Ungueltige Datei (unbekannte Regel/Zone, unsortiert) -> Abbruch, nie still ein Default.
+# Ungueltige Datei (unbekannte Regel/Zone, unsortiert/doppelt, fehlender Modus,
+# erster Eintrag nach 2009-02 = Historienbeginn minus 1 Monat) -> Abbruch beim
+# Laden, nie still ein Default. Diese Datei muss existieren.
 # Andere Datei: Umgebungsvariable HISTDATA_TZ_CONFIG.
 
 rules: []

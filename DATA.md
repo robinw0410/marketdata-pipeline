@@ -204,7 +204,10 @@ Symbole:  XAUUSD, XAGUSD (1m, Bid- und Ask-OHLC). EURUSD NICHT mehr ueber
           HistData (keine Tagespause, zu wenige Zeitanker, --verify-month
           2024-11 bestand faelschlich); der Bot nutzt einen Tages-
           Referenzkurs (EZB/FRED). --symbol EURUSD wird mit diesem Hinweis
-          abgelehnt; fetch_dukascopy.py unveraendert.
+          abgelehnt; fetch_dukascopy.py unveraendert. Jeder Lauf verschiebt
+          ein altes HistData-EURUSD-Storeverzeichnis (Pruefversion 4) einmal
+          nach metals/stale/ (WARNING, Laufreport retired_removed_symbols);
+          Roh-Cache und Marker bleiben.
 Stand:    noch nicht geladen (scripts/fetch_histdata.py)
 Quelle:   histdata.com, Generic ASCII; Default Ticks je Monat (--mode tick),
           optional M1 nur Bid (--mode m1, EIGENE Partition). Dukascopy
@@ -242,7 +245,15 @@ Store (SRC = histdata im Tickmodus, histdata_m1 im M1-Modus):
                                    eine Freigabe unter anderer Regel wird neu
                                    geprueft: besteht -> Marker
                                    weg, sonst accepted false mit "note"; Tick in
-                                   nicht eindeutiger Ortszeit sperrt immer;
+                                   nicht eindeutiger Ortszeit sperrt per Default;
+                                   liegen ALLE solchen Ticks im geschlossenen
+                                   Wochenendmarkt (roh Samstag oder Sonntag vor
+                                   12:00, z.B. Sa 20:00-20:59 bei berlin_minus_6),
+                                   steht "tz_error_releasable": true und "accepted":
+                                   true gibt frei: diese Ticks werden VERWORFEN
+                                   (nie umgerechnet), Anzahl und Zeiten im
+                                   Monatsreport (dropped_ticks, dropped_raw);
+                                   ausserhalb des Wochenendes nie freigebbar;
                                    unlesbarer Marker (JSON-Fehler): ERROR, bleibt,
                                    sperrt weiter
         <zip>.failed               dauerhafter Inhaltsfehler (JSON: error, count,
@@ -302,7 +313,9 @@ Zeitzone und Monatsgrenze:
   in der Datei (Name eindeutig, Zone geprueft). schedule je Modus:
   [{from: "YYYY-MM", rule: name}] aufsteigend, Wechsel nur an
   Rohmonatsgrenzen. Unbekannte Regel/Zone, unsortiert/doppelt, fehlender
-  Modus -> Abbruch (nie still ein Default). Default: tick berlin_minus_6 ab
+  Modus oder schedule, Fahrplan beginnt nach dem fruehesten benoetigten
+  Rohmonat (Historienbeginn minus 1 Monat = 2009-02), fehlende Datei (auch
+  die Default-Datei im Repo) -> Abbruch beim Laden (nie still ein Default). Default: tick berlin_minus_6 ab
   2000-01, m1 fixed_est ab 2000-01.
 - tick berlin_minus_6 = UTC-5 im EU-Winter, UTC-4 in der EU-Sommerzeit
   (Wechsel letzter So Maerz/Oktober 01:00 UTC). Gemessen im Homelab an
@@ -544,11 +557,19 @@ Ergebnis lesen:
   (anders als konfiguriert), "Wechsel im Jahr: ...", "keine Regel passt",
   "nicht entscheidbar" (keine entscheidenden Monate).
 - Vorschlag fuer den Abschnitt `schedule` (YAML zum Kopieren). Die Datei wird
-  nicht geschrieben. Ein Wechsel liegt irgendwo zwischen den beiden
+  nicht geschrieben. Ein Block (gleiche Regel) kommt nur hinein, wenn er durch
+  mindestens 2 entscheidende Monate ODER durch beide Symbole im selben Monat
+  belegt ist; sonst steht er als "zu wenig Evidenz" auf der Konsole (JSON
+  weak_evidence), aber nicht im Vorschlag. Ein Wechsel liegt irgendwo zwischen den beiden
   genannten Belegmonaten: vor dem Uebernehmen mit --years/--months (z.B. alle
   Monate der Jahre dazwischen) genauer eingrenzen.
-- Exit 0: alle entscheidenden Monate passen zum Fahrplan. Exit 4: mindestens
-  ein entscheidender Monat widerspricht (Liste "WIDERSPRUCH"). Exit 3:
+- Exit 0: alle entscheidenden Monate passen zum Fahrplan und die konfigurierte
+  Regel faellt nirgends durch. Exit 4: mindestens ein entscheidender Monat
+  widerspricht (Liste "WIDERSPRUCH") ODER die konfigurierte Regel hat in
+  mindestens einem ausgewerteten Monat Status failed, auch wenn dort keine
+  oder mehrere andere Regeln bestehen (Liste "KONFIGURIERTE REGEL FAELLT
+  DURCH", JSON configured_failed; die konfigurierte Regel wird auch geprueft,
+  wenn --rules sie nicht nennt). Exit 3:
   unvollstaendig (Download gescheitert, 429, --max-downloads erreicht,
   Symbol-Lock belegt, bei --offline nicht im Cache). 4 geht vor 3.
 

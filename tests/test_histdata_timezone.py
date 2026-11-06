@@ -1219,3 +1219,43 @@ def test_v4_failure_without_expected_neighbour_is_not_persisted(tmp_path):
     rep = do_run(tmp_path, Site(clock), clock, (2024, 7))
     assert rep["exit_code"] == 4 and _markers(tmp_path)
     assert not any("VORLAEUFIG" in q["reason"] for q in rep["quarantine"])
+
+
+# ===== 12. Review v5: mehrdeutiges Wochenende am EU-Umstellungssonntag 31.10. ---
+def _thin_silver_us_rule_2010(seed):
+    """XAGUSD 2010-09..12, duenn (~1 Tick je 3,5 min), nach US-Regel (ny_local)
+    gestempelt, Fahrplan berlin_minus_6. 2010 ist die EU-Umstellung am So 31.10.:
+    das Wochenende Fr 29.10. -> So 31.10. ist mehrdeutig."""
+    import test_fetch_histdata as tf
+    rng = np.random.default_rng(seed)
+    utc = tf.market_utc("XAGUSD", pd.Timestamp("2010-08-25", tz="UTC"), pd.Timestamp("2011-01-05", tz="UTC"), 60)
+    utc = utc[rng.random(len(utc)) < 1 / 3.5]
+    raw = utc.tz_convert(NY).tz_localize(None)
+    i = (utc.as_unit("ms").asi8 // 60_000).astype(float)
+    bid = np.round(18.0 * (1 + 0.002 * np.sin(i / 97.0)), 4)
+    df = pd.DataFrame({"raw": raw, "utc": utc, "bid": bid, "ask": bid + 0.02})
+    files = {}
+    for y, m in ((2010, 9), (2010, 10), (2010, 11), (2010, 12)):
+        sel = (df.raw >= pd.Timestamp(y, m, 1)) & (df.raw < pd.Timestamp(y, m, 1) + pd.offsets.MonthBegin(1))
+        files[("T", f"{y}{m:02d}")] = tf._zip_from(df[sel], "XAGUSD", y, m)
+    return utc, files
+
+
+@pytest.mark.parametrize("seed", [1, 5])     # mit der alten Logik: UTC-Oktober mit 43/35 falschen Minuten
+def test_v5_ambiguous_weekend_zero_side_does_not_hide_switch(tmp_path, seed):
+    """Review v5 (1): der Null-Eintrag DESSELBEN mehrdeutigen Wochenendes (sein
+    Freitagsschluss) darf den Lauf nicht vom Vormonat trennen - sonst wurde UTC-
+    Oktober mit verschobenem So 31.10. 22-23 UTC geschrieben."""
+    import test_fetch_histdata as tf
+    utc, files = _thin_silver_us_rule_2010(seed)
+    clock = tf.Clock()
+    rep = fh.run("XAGUSD", date(2010, 10, 1), date(2010, 11, 1), tmp_path, mode="tick",
+                 now=lambda: datetime(2011, 3, 1, tzinfo=UTC), **tf.kw(clock, tf.Site(clock, files)))
+    for ym in ((2010, 10), (2010, 11)):
+        p = fh.store_path(tmp_path, "XAGUSD", *ym)
+        if p.exists():                                 # wenn geschrieben, dann ohne verschobene Bars
+            lo = pd.Timestamp(datetime(*ym, 1, tzinfo=UTC))
+            hi = lo + pd.offsets.MonthBegin(1)
+            truth = set(utc[(utc >= lo) & (utc < hi)].floor("1min"))
+            assert set(pd.read_parquet(p)["ts"]) == truth, (ym, rep["summary"]["months_written"])
+    assert "2010-10" not in rep["summary"]["months_written"]
