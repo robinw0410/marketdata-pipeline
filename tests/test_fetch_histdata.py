@@ -56,9 +56,37 @@ def _use_config(tmp_path_factory, monkeypatch, text, stamping):
     return p
 
 
+# Bereich wie vor v8 (HistData-Listenbeginn, vorlaeufige Quarantaene aus) fuer die
+# Mechanik-Tests; die v8-Tests (Fixture v8_range) nutzen config/histdata.yaml
+OLD_RANGE = """\
+history:
+  start: {XAUUSD: "2009-03", XAGUSD: "2009-05"}
+  end: "2099-12"
+provisional:
+  window_days: 0
+  recheck_days: 30
+  max_rechecks: 3
+"""
+
+
+def _use_range(tmp_path_factory, monkeypatch, text):
+    p = tmp_path_factory.mktemp("rng") / "histdata.yaml"
+    p.write_text(text)
+    monkeypatch.setenv(hd.RANGE_CONFIG_ENV, str(p))
+    return p
+
+
 @pytest.fixture(autouse=True)
 def _berlin_everywhere(tmp_path_factory, monkeypatch):
+    _use_range(tmp_path_factory, monkeypatch, OLD_RANGE)
     return _use_config(tmp_path_factory, monkeypatch, BERLIN_EVERYWHERE, "berlin")
+
+
+@pytest.fixture
+def v8_range(monkeypatch):
+    """Ausgelieferte config/histdata.yaml (Beginn 2009-06, Ende 2026-09, vorlaeufig 60/30/3)."""
+    monkeypatch.setenv(hd.RANGE_CONFIG_ENV, str(hd.DEFAULT_RANGE_CONFIG))
+    return hd.DEFAULT_RANGE_CONFIG
 
 
 @pytest.fixture
@@ -2339,3 +2367,189 @@ def test_review_v7_undecided_with_daily_candidate_skips_expected_fold():
     assert len(hd.expected_fold_jumps(raw, "tick", und)) == 1
     rep = hd.check_timezone(raw, "XAUUSD", hd.raw_month_bounds_ms((2024, 10)), rule=und)
     assert rep["large_reversals"] == [] and len(rep["expected_reversals"]) == 1
+
+
+# ================================ v8: Historienbereich, vorlaeufige Quarantaene ---
+def test_v8_range_config_defaults_and_validation(tmp_path, v8_range, monkeypatch):
+    rc = hd.load_range_config()
+    assert rc.start == {"XAUUSD": (2009, 6), "XAGUSD": (2009, 6)} and rc.end == (2026, 9)
+    assert (rc.window_days, rc.recheck_days, rc.max_rechecks) == (60, 30, 3)
+    assert hd.HISTORY_START["XAUUSD"] == hd.history_start("XAGUSD") == (2009, 6)
+    assert hd.history_end() == (2026, 9) and min(hd.HISTORY_START.values()) == (2009, 6)
+    good = hd.DEFAULT_RANGE_CONFIG.read_text()
+    for bad, word in ((good.replace('end: "2026-09"', 'end: "2026-13"'), "YYYY-MM"),
+                      (good.replace('end: "2026-09"', 'end: "2008-12"'), "vor dem Historienbeginn"),
+                      (good.replace("max_rechecks: 3", "max_rechecks: 0"), "max_rechecks"),
+                      (good.replace("recheck_days: 30", "recheck_days: x"), "recheck_days"),
+                      (good.replace("  window_days: 60", "  window_days: 60\n  extra: 1"), "provisional"),
+                      (good.replace(", XAGUSD: \"2009-06\"", ""), "Symbole")):
+        p = tmp_path / f"bad{len(word)}.yaml"
+        p.write_text(bad)
+        with pytest.raises(ValueError, match=word):
+            hd.load_range_config(p)
+    monkeypatch.setenv(hd.RANGE_CONFIG_ENV, str(tmp_path / "fehlt.yaml"))
+    with pytest.raises(ValueError, match="fehlt"):
+        hd.load_range_config()
+
+
+def test_v8_months_before_start_never_loaded_and_first_month_partial(tmp_path, clock, v8_range, caplog):
+    """--start 2009-03 (HistData-Liste) wird auf den konfigurierten Beginn 2009-06
+    hochgesetzt: 2009-03..05 ohne Request, nicht geschrieben, kein Exit 2/3/4; UTC 2009-06
+    nur aus Rohmonaten >= 2009-06 (partial_start); ms_zero_share im Monatsreport."""
+    site = Site(clock, {("T", f"2009{m:02d}"): tick_zip("XAUUSD", 2009, m) for m in range(3, 9)})
+    with caplog.at_level("WARNING", logger="histdata"):
+        rep = run(tmp_path, clock, site, start=(2009, 3), end=(2009, 7))
+    assert rep["exit_code"] == 0 and rep["status"] == "complete", rep["quarantined"]
+    assert rep["summary"]["months_written"] == ["2009-06", "2009-07"]
+    assert rep["clamped_before_start"] == ["2009-03", "2009-04", "2009-05"]
+    un = rep["summary"]["months_unavailable"]
+    assert set(un) == {"2009-03", "2009-04", "2009-05"} and all("konfiguriertem" in v for v in un.values())
+    asked = [u for verb, u, _ in site.calls if verb == "GET"]
+    assert asked and not any(re.search(r"/2009/[345]$", u) for u in asked), asked
+    assert site.requests == 4                                   # nur Rohmonate 2009-06, 2009-07
+    assert any("vor dem konfigurierten Historienbeginn" in r.getMessage() for r in caplog.records)
+    jun = json.loads(hd.report_path(tmp_path, "XAUUSD", 2009, 6).read_text())
+    jul = json.loads(hd.report_path(tmp_path, "XAUUSD", 2009, 7).read_text())
+    assert jun["partial_start"] is True and jul["partial_start"] is False
+    assert list(jun["raw_months"]) == ["2009-06"]               # Rohmonat 2009-05 nie gelesen
+    assert jun["ms_zero_share"] == 0.0 and jun["raw_months"]["2009-06"]["ms_zero_share"] == 0.0
+    df = pd.read_parquet(hd.store_path(tmp_path, "XAUUSD", 2009, 6))
+    assert df["ts"].min() > pd.Timestamp("2009-06-01 00:00", tz="UTC")     # erste Stunden fehlen
+    assert not hd.Unit("XAUUSD", "tick", 2009, 5).path(tmp_path).exists()
+
+
+def test_v8_store_files_before_start_are_retired(tmp_path, clock, v8_range):
+    site = Site(clock, {("T", f"2009{m:02d}"): tick_zip("XAUUSD", 2009, m) for m in (6, 7)})
+    assert run(tmp_path, clock, site, start=(2009, 6))["exit_code"] == 0
+    old = hd.store_path(tmp_path, "XAUUSD", 2009, 5)
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_bytes(hd.store_path(tmp_path, "XAUUSD", 2009, 6).read_bytes())
+    rep = run(tmp_path, clock, site, start=(2009, 6))
+    assert not old.exists() and list(rep["retired_before_start"]) == ["2009-05"]
+    assert any("2009-05" in n for n in _stale_files(tmp_path))
+    assert hd.store_path(tmp_path, "XAUUSD", 2009, 6).exists()
+
+
+def test_v8_cli_history_uses_configured_range(monkeypatch, v8_range, tmp_path):
+    seen = {}
+
+    def fake_run(sym, start, end, *a, **kw):
+        seen.update(sym=sym, start=start, end=end, history=kw.get("history"))
+        return {"exit_code": 0}
+    monkeypatch.setattr(hd, "run", fake_run)
+    assert hd.main(["--symbol", "XAGUSD", "--history"]) == 0
+    assert seen == {"sym": "XAGUSD", "start": date(2009, 6, 1), "end": date(2026, 9, 1), "history": True}
+    for extra in (["--start", "2010-01"], ["--end", "2026-10"]):
+        with pytest.raises(SystemExit):
+            hd.main(["--symbol", "XAGUSD", "--history", *extra])
+    cfg = tmp_path / "r.yaml"
+    cfg.write_text(hd.DEFAULT_RANGE_CONFIG.read_text().replace('end: "2026-09"', 'end: "2026-12"'))
+    monkeypatch.setenv(hd.RANGE_CONFIG_ENV, str(cfg))
+    assert hd.main(["--symbol", "XAUUSD", "--history"]) == 0 and seen["end"] == date(2026, 12, 1)
+    assert hd.main(["--symbol", "XAUUSD", "--start", "2009-01", "--end", "2009-08"]) == 0
+    assert seen["start"] == date(2009, 1, 1) and seen["history"] is False      # run setzt hoch
+
+
+NOW8 = datetime(2026, 11, 8, 12, tzinfo=UTC)
+
+
+def _oct26(fixed=False):
+    """Rohmonat 2026-10 nach der Tagesregel; fixed=False: ohne zweite Runde der doppelten
+    Stunde (Mo 26.10. 00:00-01:00 UTC) und mit .000 ms - wie die vorlaeufige Datei."""
+    oct_ = raw_month_ticks("XAUUSD", 2026, 10)
+    if fixed:
+        return oct_
+    gap = (oct_["utc"] >= pd.Timestamp("2026-10-26 00:00", tz="UTC")) & \
+        (oct_["utc"] < pd.Timestamp("2026-10-26 01:00", tz="UTC"))
+    oct_ = oct_[~gap.to_numpy()].reset_index(drop=True)
+    return oct_.assign(raw=oct_["raw"].dt.floor("1s"))
+
+
+def _site26(clock, fixed=False):
+    files = {("T", f"2026{m:02d}"): tick_zip("XAUUSD", 2026, m) for m in (8, 9)}
+    files[("T", "202610")] = _zip_from(_oct26(fixed), "XAUUSD", 2026, 10)
+    return Site(clock, files)
+
+
+def test_v8_provisional_quarantine_exit_0_then_rechecks(tmp_path, clock, v8_range, v7_default, caplog):
+    """metals-fetch-artiger Lauf 2026-09..2026-10, 2026-10 mit unaufgeloester doppelter
+    Stunde: vorlaeufig (kein Exit 4/3), months_provisional, ms_zero_share 1.0. Nach 30 Tagen
+    ZIP neu laden: faellt durch -> rechecks + 1; nach 3 Fehlschlaegen dauerhaft (Exit 4)."""
+    q = hd.Unit("XAUUSD", "tick", 2026, 10).qmarker(tmp_path, (2026, 10))
+    zp = hd.Unit("XAUUSD", "tick", 2026, 10).path(tmp_path)
+    site = _site26(clock)
+    with caplog.at_level("WARNING", logger="histdata"):
+        rep = run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=NOW8)
+    assert rep["exit_code"] == 0 and rep["status"] == "provisional_pending", rep["quarantined"]
+    assert rep["summary"]["months_written"] == ["2026-09"] and rep["quarantined"] == []
+    prov = rep["months_provisional"]["2026-10"]
+    assert prov["status"] == "provisional_pending" and prov["recheck_after"].startswith("2026-12-08")
+    assert prov["rechecks"] == 0 and rep["summary"]["months_provisional"] == rep["months_provisional"]
+    assert any("VORLAEUFIGE QUARANTAENE" in r.getMessage() and r.levelname == "WARNING"
+               for r in caplog.records)
+    info = json.loads(q.read_text())
+    assert info["provisional"]["rechecks"] == 0 and info["ms_zero_share"] == 1.0
+    assert info["fold_unresolved"]["date"] == "2026-10-25"
+    # noch nicht faellig: keine Requests, weiter Exit 0
+    n = site.requests
+    rep = run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=NOW8 + timedelta(days=10))
+    assert rep["exit_code"] == 0 and site.requests == n and rep["provisional_rechecked"] == []
+    # faellig, HistData liefert dieselbe Datei: 3 Neupruefungen, danach dauerhaft
+    t = NOW8
+    for k in (1, 2, 3):
+        t += timedelta(days=31)
+        n = site.requests
+        rep = run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=t)
+        assert site.requests - n == 2, k                             # nur Rohmonat 2026-10 neu
+        assert zp.with_name(zp.name + ".superseded").exists() and zp.exists()
+        info = json.loads(q.read_text())
+        assert rep["provisional_rechecked"][0]["raw_month"] == "2026-10"
+        if k < 3:
+            assert rep["exit_code"] == 0 and info["provisional"]["rechecks"] == k
+            assert info["provisional"]["recheck_after"].startswith(f"{(t + timedelta(days=30)):%Y-%m-%d}")
+            assert rep["provisional_rechecked"][0]["result"] == "still_provisional"
+        else:
+            assert rep["exit_code"] == 4 and "provisional" not in info
+            assert info["provisional_expired"]["rechecks"] == 3
+            assert rep["provisional_rechecked"][0]["result"] == "permanent_quarantine"
+            assert [x["month"] for x in rep["quarantined"]] == ["2026-10"]
+    n = site.requests
+    rep = run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=t + timedelta(days=40))
+    assert rep["exit_code"] == 4 and site.requests == n                   # dauerhaft, kein Neuladen
+
+
+def test_v8_provisional_recheck_passes_with_corrected_file(tmp_path, clock, v8_range, v7_default):
+    site = _site26(clock)
+    assert run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=NOW8)["exit_code"] == 0
+    site.files[("T", "202610")] = _zip_from(_oct26(fixed=True), "XAUUSD", 2026, 10)
+    n = site.requests
+    rep = run(tmp_path, clock, site, start=(2026, 9), end=(2026, 9), now=NOW8 + timedelta(days=31))
+    assert site.requests - n == 2 and rep["exit_code"] == 0, rep["quarantined"]
+    assert "2026-10" in rep["summary"]["months_written"]          # ausserhalb des Bereichs nachgeholt
+    assert rep["provisional_rechecked"][0]["result"] == "passed"
+    assert not hd.Unit("XAUUSD", "tick", 2026, 10).qmarker(tmp_path, (2026, 10)).exists()
+    assert rep["months_provisional"] == {}
+    mrep = json.loads(hd.report_path(tmp_path, "XAUUSD", 2026, 10).read_text())
+    assert mrep["ms_zero_share"] == 0.0
+
+
+def test_v8_history_run_does_not_touch_after_end(tmp_path, clock, v8_range, v7_default):
+    site = _site26(clock)
+    assert run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=NOW8)["exit_code"] == 0
+    n = site.requests
+    rep = hd.run("XAUUSD", date(2026, 9, 1), date(2026, 9, 1), tmp_path, now=at(NOW8 + timedelta(days=31)),
+                 history=True, **kw(clock, site))
+    assert rep["exit_code"] == 0 and site.requests == n and rep["provisional_rechecked"] == []
+    assert json.loads(hd.Unit("XAUUSD", "tick", 2026, 10).qmarker(tmp_path, (2026, 10)).read_text()
+                      )["provisional"]["rechecks"] == 0
+
+
+def test_v8_old_month_quarantine_is_not_provisional(tmp_path, clock, v8_range, v7_default):
+    """Rohmonat lange vorbei: echte Quarantaene, Exit 4 wie bisher."""
+    oct_ = _oct26()
+    files = {("T", "202609"): tick_zip("XAUUSD", 2026, 9), ("T", "202610"): _zip_from(oct_, "XAUUSD", 2026, 10)}
+    rep = run(tmp_path, clock, Site(clock, files), start=(2026, 10), end=(2026, 10),
+              now=NOW8 + timedelta(days=90))
+    assert rep["exit_code"] == 4 and rep["months_provisional"] == {}
+    info = json.loads(hd.Unit("XAUUSD", "tick", 2026, 10).qmarker(tmp_path, (2026, 10)).read_text())
+    assert "provisional" not in info

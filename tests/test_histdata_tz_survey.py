@@ -230,11 +230,15 @@ def test_months_before_history_or_not_closed_are_skipped(tmp_path, cfg, monkeypa
     monkeypatch.setattr(fh, "evaluate_raw_month", fake_evaluator(lambda ym: "berlin_minus_6"))
     res, out = run(tmp_path, years=[2009, 2025], months=[3, 10], controls=[], offline=True)
     st = {m["month"]: m["state"] for m in res["months"]}
-    # XAUUSD-Historie ab 2009-03; 2025-10 liegt nach NOW
-    assert st == {"2009-03": "not_cached", "2009-10": "not_cached", "2025-03": "not_cached",
-                  "2025-10": "not_closed"}
+    # Historienbeginn aus config/histdata.yaml (fh.HISTORY_START, derzeit 2009-06 wegen
+    # vertauschter Bid/Ask-Spalten davor); 2025-10 liegt nach NOW
+    def pre(sym, ym):
+        return "before_history" if fh.before_history(sym, ym) else "not_cached"
+    assert fh.before_history("XAUUSD", (2009, 3))            # Bestand: Beginn nach 2009-03
+    assert st == {"2009-03": pre("XAUUSD", (2009, 3)), "2009-10": pre("XAUUSD", (2009, 10)),
+                  "2025-03": "not_cached", "2025-10": "not_closed"}
     res, _ = run(tmp_path, symbols=["XAGUSD"], years=[2009], months=[3], controls=[], offline=True)
-    assert res["months"][0]["state"] == "before_history"     # XAGUSD erst ab 2009-05
+    assert res["months"][0]["state"] == "before_history"
     assert res["exit_code"] == 0                             # nichts zu tun = nichts fehlt
 
 
@@ -889,15 +893,22 @@ def test_preset_full_request_count_and_remaining(tmp_path, cfg, monkeypatch):
                     now=lambda: datetime(2026, 11, 6, tzinfo=UTC), pause=0.0, out=out,
                     max_downloads=3, session=site, sleep=clock.sleep, clock=clock, wall=clock)
     txt = out.getvalue()
-    # 17 Jahre x 5 Monate x 2 Symbole = 170; vor Historienbeginn: XAUUSD 2009-01, XAGUSD
-    # 2009-01/03; im Cache 101 (03/10/11) + 24 (01/07 erster Survey); fehlen 42 = 84 Requests
-    assert "Plan: 85 Rohmonate x 2 Symbole = 170 Rohdateien (34 Umstellungsperioden), " \
-        "125 im Cache, 42 fehlen" in txt
+    # 17 Jahre x 5 Monate x 2 Symbole = 170 Rohdateien; davon vor Historienbeginn (aus
+    # config/histdata.yaml) und im Cache wie oben angelegt; der Rest fehlt
+    plan = [(y, m, s) for y in range(2009, 2026) for m in (1, 3, 7, 10, 11) for s in sv.SYMBOLS]
+    before = sum(fh.before_history(s, (y, m)) for y, m, s in plan)
+    cached = sum(1 for y, m, s in plan if not fh.before_history(s, (y, m))
+                 and (m in (3, 10, 11) or y in first))
+    missing = len(plan) - before - cached
+    assert (len(plan), before, cached, missing) == (170, 4, 124, 42)   # Beginn 2009-06 (beide)
+    assert ("Plan: 85 Rohmonate x 2 Symbole = 170 Rohdateien (34 Umstellungsperioden), "
+            f"{cached} im Cache, {missing} fehlen") in txt
     assert "Geplant: 3 Rohmonate laden = 6 Requests" in txt
-    assert "39 weitere ueber --max-downloads 3 (naechster Aufruf, 78 Requests)" in txt
+    rest = missing - 3
+    assert f"{rest} weitere ueber --max-downloads 3 (naechster Aufruf, {2 * rest} Requests)" in txt
     assert site.requests == 6 and res["requests"] == 6
-    assert res["exit_code"] == 3 and res["remaining_raw_months"] == 39   # nichts widerspricht
-    assert "noch fehlend: 39 Rohmonate" in txt
+    assert res["exit_code"] == 3 and res["remaining_raw_months"] == rest   # nichts widerspricht
+    assert f"noch fehlend: {rest} Rohmonate" in txt
     assert {m["month"][-2:] for m in res["months"] if m["kind"] == "control"} == {"01", "07"}
 
 

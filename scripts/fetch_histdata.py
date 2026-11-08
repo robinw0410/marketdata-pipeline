@@ -37,7 +37,7 @@ Zeitzone = Stempelungsregel (TzRule: Rohzeit - UTC = Offset(zone) + shift_h;
 kind zone_shift: Offset im Zeitpunkt selbst, kind dst_daily_utc: Offset um
 00:00 UTC des UTC-Tages) je ROHmonat nach Fahrplan in
 config/histdata_timezone.yaml (load_tz_config, rule_for; andere Datei per
-$HISTDATA_TZ_CONFIG; Datei muss existieren und ab spaetestens 2009-02 gelten;
+$HISTDATA_TZ_CONFIG; Datei muss existieren und ab spaetestens Historienbeginn - 1 Monat gelten;
 Fehler -> Abbruch beim Laden, nie still ein Default). Wechsel nur an
 Rohmonatsgrenzen.
 - tick (Fahrplan nach dem erweiterten Survey 2009-2025, s. Kommentar in der
@@ -160,6 +160,18 @@ verbotene Stunden = Vereinigung ueber alle Kandidaten; ein Tick, den ein
 Kandidat nicht umrechnen kann, zaehlt als verschieden umgerechnet.
 first_raw/last_raw = frueheste/spaeteste Rohzeit des Intervalls; n_ticks
 je Ruecksprung (ueberlappende zaehlen doppelt, reversal_ticks_total nicht).
+Bereich (config/histdata.yaml, load_range_config, $HISTDATA_CONFIG):
+history.start je Symbol (2009-06: fruehe HistData-Dateien mit vertauschtem
+Bid/Ask, 76-99 % ask < bid in XAUUSD 2009-03..05 und XAGUSD 2009-05 - nie
+tauschen, nie raten). Rohmonate davor nie angefragt/geschrieben ("vor
+konfiguriertem Historienbeginn", kein Exit), frueheres --start hochgesetzt,
+Store-Dateien davor -> metals/stale/; erster UTC-Monat partial_start.
+history.end (2026-09) = Ende von --history (2026-10 vorlaeufig in
+Quarantaene). Vorlaeufige Quarantaene (provisional): Rohmonat bei der
+ersten Quarantaene vor < window_days beendet -> bis recheck_after kein
+Exit 3/4 (months_provisional, status provisional_pending), dann ZIP
+beiseite (.superseded), neu laden, neu pruefen; nach max_rechecks normale
+Quarantaene. ms_zero_share (Anteil .000-ms-Ticks) nur Diagnose.
 EURUSD-Storeverzeichnisse aus Pruefversion 4 verschiebt jeder Lauf nach
 metals/stale/ (retired_removed_symbols).
 
@@ -196,7 +208,8 @@ Exit-Codes (Vorrang in dieser Reihenfolge, wie fetch_dukascopy.py):
      leerer Monat INNERHALB der Historie, Monatsdatei mit anderem Modus,
      Fahrplan "undecided" mit verschieden umgerechneten Ticks
      (months_rule_undecided; status "rule_undecided", wenn nur das)
-  0  vollstaendig
+  0  vollstaendig - auch wenn nur Monate vor dem konfigurierten Beginn, nach
+     dem Bereichsende oder vorlaeufig in Quarantaene (provisional_pending) fehlen
   3 geht bewusst vor 4: die systemd-Units starten bei 3 neu, bei 4 nicht -
   ein Exit 4 bei offenen Luecken wuerde den Backfill anhalten. Quarantaene
   ist trotzdem nicht zu uebersehen: ERROR-Zeile in jedem Lauf, Laufreport
@@ -206,7 +219,7 @@ Lizenz: HistData-Nutzungsbedingungen selbst pruefen. Daten (roh wie
 abgeleitet) nicht weitergeben und nicht committen (data/ ist git-ignored).
 
 Usage:
-    python fetch_histdata.py --symbol XAUUSD --start 2009-03
+    python fetch_histdata.py --symbol XAUUSD --history              # config/histdata.yaml
     python fetch_histdata.py --symbol XAGUSD --start 2024-01 --end 2024-06 --mode m1
     python fetch_histdata.py --symbol XAUUSD --verify-month 2024-03
     python fetch_histdata.py --symbol XAUUSD --accept-weekend-ticks 2024-10   # Exit 0/2
@@ -228,6 +241,7 @@ import sys
 import threading
 import time
 import zipfile
+from collections.abc import Mapping
 from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -269,10 +283,11 @@ TF_PATH = {"tick": "tick-data-quotes", "m1": "1-minute-bar-quotes"}
 TF_CODE = {"tick": "T", "m1": "M1"}
 PARQUET_MODE = {"tick": "histdata_tick", "m1": "histdata_m1"}
 
-# Erster Monat laut HistData-Auswahlliste (ASCII M1; Quellen: histdatacom
-# data/.repo, ai-trader QA). Fuer TICKS nicht verifiziert - fehlen dort
-# fruehe Monate, werden sie als "keine Daten" bestaetigt (24 h) und gelistet.
-HISTORY_START = {"XAUUSD": (2009, 3), "XAGUSD": (2009, 5)}
+# Historienbeginn/-ende und vorlaeufige Quarantaene: config/histdata.yaml
+# (load_range_config; HISTORY_START liest daraus). HistData listet XAUUSD ab
+# 2009-03, XAGUSD ab 2009-05; die ersten Tick-Monate haben aber vertauschte
+# Bid/Ask-Spalten (76-99 % ask < bid) -> konfigurierter Beginn 2009-06.
+HISTDATA_LISTED_START = {"XAUUSD": (2009, 3), "XAGUSD": (2009, 5)}
 
 HOUR_MS, MIN_MS, DAY_MS = 3_600_000, 60_000, 86_400_000
 
@@ -299,6 +314,8 @@ TZ_CHECK_VERSION = 7
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_TZ_CONFIG = REPO_ROOT / "config" / "histdata_timezone.yaml"
 TZ_CONFIG_ENV = "HISTDATA_TZ_CONFIG"
+DEFAULT_RANGE_CONFIG = REPO_ROOT / "config" / "histdata.yaml"
+RANGE_CONFIG_ENV = "HISTDATA_CONFIG"
 # Fruehere Metadaten -> damalige Umrechnung (Zone, Verschiebung) fuer "gleiche Umrechnung?"
 LEGACY_TZ_META = {"EST fixed UTC-5, converted to UTC, checked per month": ("Etc/GMT+5", 0)}
 # ---- Drosselung / Wiederholung (Defaults, alle per CLI aenderbar) ----------
@@ -381,9 +398,11 @@ class Restart(Exception):
 
 
 class Quarantined(Exception):
-    def __init__(self, unit: "Unit", ym: tuple[int, int], reason: str, check: dict | None = None):
+    def __init__(self, unit: "Unit", ym: tuple[int, int], reason: str, check: dict | None = None,
+                 provisional: dict | None = None):
         super().__init__(reason)
         self.unit, self.ym, self.reason, self.check = unit, ym, reason, check
+        self.provisional = provisional          # vorlaeufige Quarantaene (Marker), sonst None
 
 
 # ------------------------------------------------------------------ pfade ---
@@ -762,6 +781,96 @@ def source_tz_label(rules) -> str:
 def store_tz_label(mode: str, ym: tuple[int, int]) -> str:
     """Erwartetes source_timezone fuer UTC-Monat ym (Regeln seiner Rohmonate)."""
     return source_tz_label([rule_for(mode, r) for r in _raw_months_for(ym, mode)])
+
+
+# ------------------------------------------------- historienbereich (v8) ---
+@dataclass(frozen=True)
+class RangeConfig:
+    start: dict                   # symbol -> (y, m): erster Rohmonat, der geladen/geschrieben wird
+    end: tuple                    # (y, m): Ende des --history-Bereichs
+    window_days: int              # Quarantaene eines Rohmonats, der vor < window_days endete: vorlaeufig
+    recheck_days: int             # dann ZIP neu laden und neu pruefen nach recheck_days
+    max_rechecks: int             # danach normale (dauerhafte) Quarantaene
+    path: str | None = None
+
+
+def _nonneg_int(v, where: str, minimum: int) -> int:
+    if not isinstance(v, int) or isinstance(v, bool) or v < minimum:
+        raise ValueError(f"{where}: ganze Zahl >= {minimum} erwartet, nicht {v!r}")
+    return v
+
+
+def build_range_config(data, path: str | None = None) -> RangeConfig:
+    """config/histdata.yaml pruefen; jeder Fehler -> ValueError (nie still ein Default)."""
+    if not isinstance(data, dict) or set(data) != {"history", "provisional"}:
+        raise ValueError(f"{path}: genau die Abschnitte history und provisional erwartet")
+    h, pv = data["history"], data["provisional"]
+    if not isinstance(h, dict) or set(h) != {"start", "end"}:
+        raise ValueError(f"{path}: history braucht genau start und end")
+    st = h["start"]
+    if not isinstance(st, dict) or set(st) != set(SYMBOLS):
+        raise ValueError(f"{path}: history.start braucht genau die Symbole {list(SYMBOLS)}")
+    start = {sym: _parse_ym_str(st[sym], f"{path}: history.start.{sym}") for sym in SYMBOLS}
+    end = _parse_ym_str(h["end"], f"{path}: history.end")
+    if end < max(start.values()):
+        raise ValueError(f"{path}: history.end {end} vor dem Historienbeginn")
+    if not isinstance(pv, dict) or set(pv) != {"window_days", "recheck_days", "max_rechecks"}:
+        raise ValueError(f"{path}: provisional braucht genau window_days, recheck_days, max_rechecks")
+    return RangeConfig(start, end,
+                       _nonneg_int(pv["window_days"], f"{path}: provisional.window_days", 0),
+                       _nonneg_int(pv["recheck_days"], f"{path}: provisional.recheck_days", 1),
+                       _nonneg_int(pv["max_rechecks"], f"{path}: provisional.max_rechecks", 1), path)
+
+
+_RANGE_CFG_CACHE: dict = {}
+
+
+def load_range_config(path: str | Path | None = None) -> RangeConfig:
+    """config/histdata.yaml (oder $HISTDATA_CONFIG, oder `path`) laden und pruefen.
+    Die Datei muss existieren; Fehler -> ValueError (wie die Zeitzonen-Konfiguration)."""
+    p = Path(path or os.environ.get(RANGE_CONFIG_ENV) or DEFAULT_RANGE_CONFIG)
+    if not p.exists():
+        raise ValueError(f"Bereichs-Konfiguration {p} fehlt (Default: {DEFAULT_RANGE_CONFIG}, "
+                         f"andere Datei per ${RANGE_CONFIG_ENV})")
+    key = (str(p.resolve()), p.stat().st_mtime_ns)
+    if key not in _RANGE_CFG_CACHE:
+        import yaml
+        try:
+            data = yaml.safe_load(p.read_text())
+        except yaml.YAMLError as e:
+            raise ValueError(f"{p}: kein gueltiges YAML ({e})")
+        _RANGE_CFG_CACHE[key] = build_range_config(data, str(p))
+    return _RANGE_CFG_CACHE[key]
+
+
+def history_start(symbol: str) -> tuple[int, int]:
+    """Erster Rohmonat, der geladen und geschrieben wird (config/histdata.yaml)."""
+    return load_range_config().start[symbol]
+
+
+def history_end() -> tuple[int, int]:
+    """Ende des --history-Bereichs (config/histdata.yaml)."""
+    return load_range_config().end
+
+
+class _HistoryStart(Mapping):
+    """HISTORY_START[symbol] = history_start(symbol), bei jedem Zugriff aus der
+    Konfiguration (Umgebungsvariable wird beachtet); verhaelt sich wie ein dict."""
+
+    def __getitem__(self, sym):
+        return load_range_config().start[sym]
+
+    def __iter__(self):
+        return iter(SYMBOLS)
+
+    def __len__(self):
+        return len(SYMBOLS)
+
+    def __repr__(self):
+        return repr(dict(self.items()))
+
+
+HISTORY_START = _HistoryStart()
 
 
 class _SourceTzMeta(dict):
@@ -2362,6 +2471,10 @@ class Ctx:
         # (unit, ym) -> (Rohzeit, [UTC je Kandidat]) der Ticks, die die Kandidaten einer
         # "undecided"-Regel verschieden umrechnen (build_month entscheidet je UTC-Monat)
         self.undecided: dict[tuple, tuple] = {}
+        # vorlaeufige Quarantaene, faellige Neupruefung: (unit, ym) -> alter provisional-Stand
+        self.provisional_carry: dict[tuple, dict] = {}
+        self.ms_zero: dict[tuple, float | None] = {}      # (unit, ym) -> Anteil Ticks mit .000 ms
+        self.history_run = False                          # --history: nichts nach history.end anfassen
         self.downloaded = 0
         self.empty_streak = self.content_streak = 0
         self.first_data = self._first_cached_month()
@@ -2612,7 +2725,8 @@ class Ctx:
         if not info.get("accepted") and same_tz and info.get("tz_check_version") == TZ_CHECK_VERSION:
             if isinstance(info.get("fold_resolution"), dict):
                 return False, None          # menschliche Faltenaufloesung: neu rechnen, Marker bleibt
-            raise Quarantined(u, ym, info.get("reason") or "Quarantaene", info.get("check"))
+            raise Quarantined(u, ym, info.get("reason") or "Quarantaene", info.get("check"),
+                              provisional=info.get("provisional"))
         log.warning("Quarantaene-Marker %s stammt aus aelterer Zeitzonen-Pruefung (Version %s, %s%s) - "
                     "Rohmonat wird neu geprueft (ohne Download)", q.name,
                     info.get("tz_check_version", 1), info.get("tz_rule") or info.get("raw_tz") or "fest UTC-5",
@@ -2712,6 +2826,7 @@ class Ctx:
                 raise Quarantined(u, ym, f"Format nicht lesbar: {e}", None)
             self._quarantine(u, ym, f"Format nicht lesbar: {e}", None, note)
         raw_all = sel["raw_ms"].to_numpy()
+        self.ms_zero[(u, ym)] = ms_zero_share(raw_all) if self.mode == "tick" else None
         # menschliche Aufloesung einer Herbstnacht ohne erkennbaren Ruecksprung
         # (--resolve-fold): nur aus einem aktuellen, nicht freigegebenen Marker
         fres = None
@@ -2893,7 +3008,8 @@ class Ctx:
                 raise Quarantined(q.unit, q.ym, (
                     f"Folge-Rohmonat {_ymstr(nxt)}: Stempelungswechsel beginnt schon in {_ymstr(ym)} "
                     f"({first.get('raw')} {first.get('kind')} {first.get('deviation_h', 0):+d} h) - "
-                    f"{_ymstr(ym)} nicht geschrieben. Folgemonat: {q.reason}"), q.check)
+                    f"{_ymstr(ym)} nicht geschrieben. Folgemonat: {q.reason}"), q.check,
+                    provisional=q.provisional)
         except (CorruptZip, FormatError):
             return
 
@@ -2938,16 +3054,55 @@ class Ctx:
             # doppelte Herbststunde ohne erkennbaren Ruecksprung: nur von Hand
             # aufloesbar (--resolve-fold), gilt dann genau fuer diese Ticks
             info["fold_unresolved"] = fold_unresolved
+        if self.ms_zero.get((u, ym)) is not None:
+            info["ms_zero_share"] = self.ms_zero[(u, ym)]      # Diagnose (.000 ms), keine Entscheidung
+        prov, why = self._provisional_state(u, ym)
+        if prov:
+            info["provisional"] = prov
+            reason = (f"{reason} [VORLAEUFIGE Quarantaene: Rohmonat erst vor kurzem beendet - ZIP wird "
+                      f"ab {prov['recheck_after'][:10]} neu geladen und neu geprueft "
+                      f"(Neupruefung {prov['rechecks']}/{load_range_config().max_rechecks})]")
+        elif why:
+            info["provisional_expired"] = why
+            reason = (f"{reason} [nach {why['rechecks']} Neupruefung(en) nicht behoben: dauerhafte "
+                      "Quarantaene]")
         if note:
             info["note"] = note
             reason = f"{reason} [{note}]"
-            info["reason"] = reason
+        info["reason"] = reason
         if self.report_only:
             log.error("QUARANTAENE (nur Bericht, kein Marker) %s Rohmonat %d-%02d: %s", u.key, *ym, reason)
         else:
             dk.write_json_atomic(u.qmarker(self.data_root, ym), info)
-            log.error("QUARANTAENE %s Rohmonat %d-%02d: %s", u.key, *ym, reason)
-        raise Quarantined(u, ym, reason, check)
+            (log.warning if prov else log.error)("QUARANTAENE %s Rohmonat %d-%02d: %s", u.key, *ym, reason)
+        raise Quarantined(u, ym, reason, check, provisional=prov)
+
+    def _provisional_state(self, u: Unit, ym) -> tuple[dict | None, dict | None]:
+        """
+        provisional fuer einen neuen Quarantaene-Marker -> (provisional, abgelaufen).
+        - faellige Neupruefung (provisional_carry): rechecks + 1, neues recheck_after;
+          ab max_rechecks keine vorlaeufige mehr (abgelaufen = alter Stand)
+        - vorhandener Marker (aeltere Version) mit provisional: uebernehmen
+        - sonst neu, wenn der Rohmonat beim ersten Mal vor < window_days endete
+        """
+        rc = load_range_config()
+        now = self.now()
+        nxt = (now + timedelta(days=rc.recheck_days)).isoformat()
+        carry = self.provisional_carry.pop((u, ym), None)
+        if carry is not None:
+            n = int(carry.get("rechecks", 0)) + 1
+            if n >= rc.max_rechecks:
+                return None, {**carry, "rechecks": n, "expired_at": now.isoformat()}
+            return {**carry, "rechecks": n, "recheck_after": nxt, "last_recheck": now.isoformat()}, None
+        q = u.qmarker(self.data_root, ym)
+        old = self.read_qmarker(q) if q.exists() else None
+        if old and isinstance(old.get("provisional"), dict):
+            return old["provisional"], None
+        if old and old.get("provisional_expired"):
+            return None, old["provisional_expired"]
+        if rc.window_days and now - raw_month_end_utc(ym, self.mode) < timedelta(days=rc.window_days):
+            return {"since": now.isoformat(), "recheck_after": nxt, "rechecks": 0}, None
+        return None, None
 
 
 # ------------------------------------------------------------- monatsbau ---
@@ -2979,6 +3134,9 @@ def build_month(ctx: Ctx, ym: tuple[int, int]) -> tuple[pd.DataFrame, dict]:
     ms, me = (pd.Timestamp(datetime(*ym, 1, tzinfo=UTC)),
               pd.Timestamp(datetime(*_ym_add(ym, 1), 1, tzinfo=UTC)))
     parts, stats = [], {"raw_months": {}, "histdata_status": {}, "tz_right_padding": True}
+    # erster UTC-Monat am konfigurierten Historienbeginn: Rohmonat M-1 wird nie geladen,
+    # seine Stunden am Monatsanfang fehlen (kein Fehler)
+    stats["partial_start"] = any(before_history(ctx.symbol, r) for r in _raw_months_for(ym, ctx.mode))
     for r in needed(ctx.symbol, ym, ctx.mode):
         u = ctx.unit(r)
         info = {"file": u.name, "state": ctx.state(u)[0]}
@@ -2997,11 +3155,14 @@ def build_month(ctx: Ctx, ym: tuple[int, int]) -> tuple[pd.DataFrame, dict]:
         if tz.get("dropped_ticks"):
             stats["dropped_ticks"] = stats.get("dropped_ticks", 0) + tz["dropped_ticks"]
             stats["dropped_raw"] = (stats.get("dropped_raw", []) + tz["dropped_raw"])[:N_EXAMPLES]
-        info.update(file_rows=ctx.decode(u).stats, rows_in_month=int(len(sel)), timezone=tz)
+        info.update(file_rows=ctx.decode(u).stats, rows_in_month=int(len(sel)), timezone=tz,
+                    ms_zero_share=ctx.ms_zero.get((u, r)))
         stats["histdata_status"][u.name] = ctx.decode(u).status
         parts.append(sel)
     ctx.check_following(ym)
     raw = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    stats["ms_zero_share"] = (ms_zero_share(raw["raw_ms"].to_numpy())
+                              if ctx.mode == "tick" and not raw.empty else None)
     if raw.empty:
         return pd.DataFrame(columns=dk.COLUMNS), stats
     if ctx.mode == "tick":
@@ -3032,7 +3193,7 @@ def month_report(df: pd.DataFrame, symbol: str, ym, mode: str, stats: dict) -> d
 # ------------------------------------------------------------------ driver ---
 def run(symbol: str, start: date, end: date, data_root: Path | None = None, *,
         mode: str = "tick", rebuild: bool = False, now=None,
-        stop: threading.Event | None = None, **client_kw) -> dict:
+        stop: threading.Event | None = None, history: bool = False, **client_kw) -> dict:
     """
     Laedt alle abgeschlossenen UTC-Monate [start, end] und gibt den Laufreport
     zurueck (exit_code, s. Docstring oben). Der Laufreport wird immer
@@ -3053,6 +3214,7 @@ def run(symbol: str, start: date, end: date, data_root: Path | None = None, *,
     try:
         cleanup_orphans(data_root, symbol)
         ctx = Ctx(symbol, mode, data_root, Client(data_root, stop=stop, **client_kw), now, rebuild)
+        ctx.history_run = history
         return _run_locked(ctx, start, end, rebuild)
     finally:
         lock.close()
@@ -3063,8 +3225,63 @@ def _month_closed(now: datetime, ym: tuple[int, int], mode: str = "tick") -> boo
     return now >= raw_month_end_utc(ym, mode) + timedelta(seconds=SETTLE_S)
 
 
+def ms_zero_share(raw_ms: np.ndarray) -> float | None:
+    """Anteil Ticks mit Rohzeit auf .000 ms (Diagnose: grobe/vorlaeufige Dateiversion)."""
+    raw_ms = np.asarray(raw_ms, dtype=np.int64)
+    return round(float((raw_ms % 1000 == 0).mean()), 4) if len(raw_ms) else None
+
+
 def _ymstr(ym) -> str:
     return f"{ym[0]}-{ym[1]:02d}"
+
+
+def due_provisional_rechecks(ctx: "Ctx") -> list[dict]:
+    """
+    Vorlaeufige Quarantaenen (Marker mit provisional) mit recheck_after <= jetzt:
+    ZIP nach <zip>.superseded verschieben (nichts geloescht), alten Stand merken
+    (ctx.provisional_carry, fuer rechecks + 1) und die betroffenen UTC-Monate
+    zurueckgeben - der Lauf laedt den Rohmonat neu (2 Requests) und prueft neu.
+    --history-Laeufe fassen nichts nach history.end an.
+    """
+    d = raw_dir(ctx.data_root, ctx.symbol, ctx.mode)
+    pat = re.compile(rf"HISTDATA_COM_ASCII_{ctx.symbol}_{TF_CODE[ctx.mode]}(\d{{4}})(\d{{2}})?\.zip"
+                     rf"(?:\.(\d{{4}})-(\d{{2}}))?\.quarantine$")
+    now, out = ctx.now(), []
+    for q in sorted(d.glob("*.quarantine")) if d.exists() else []:
+        m = pat.match(q.name)
+        info = ctx.read_qmarker(q) if m else None
+        prov = (info or {}).get("provisional")
+        if not isinstance(prov, dict):
+            continue
+        ym = (int(m.group(3)), int(m.group(4))) if m.group(3) else (int(m.group(1)), int(m.group(2) or 1))
+        try:
+            due = datetime.fromisoformat(prov["recheck_after"]) <= now
+        except (KeyError, TypeError, ValueError):
+            due = True                               # kaputtes Datum: lieber neu pruefen
+        if not due or before_history(ctx.symbol, ym) or (ctx.history_run and ym > history_end()):
+            continue
+        u = ctx.unit(ym)
+        zp = u.path(ctx.data_root)
+        sup = None
+        if zp.exists():
+            sup = zp.with_name(zp.name + ".superseded")
+            os.replace(zp, sup)
+            ctx.decoded.pop(u, None)
+            ctx.tz = {k: v for k, v in ctx.tz.items() if k[0] != u}
+            ctx.undecided = {k: v for k, v in ctx.undecided.items() if k[0] != u}
+            ctx.edges.clear()
+        ctx.provisional_carry[(u, ym)] = prov
+        # betroffene UTC-Monate, deren uebrige Rohmonate schon erledigt sind (keine Extra-Requests)
+        utc = [k for k in (_ym_add(ym, -1), ym, _ym_add(ym, 1)) if ym in needed(ctx.symbol, k, ctx.mode)
+               and all(r == ym or ctx.state(ctx.unit(r))[0] in ("data", "empty")
+                       for r in needed(ctx.symbol, k, ctx.mode))]
+        log.warning("%s Rohmonat %s: vorlaeufige Quarantaene faellig (Neupruefung %d/%d) - ZIP %s, "
+                    "wird neu geladen und neu geprueft", u.key, _ymstr(ym), int(prov.get("rechecks", 0)) + 1,
+                    load_range_config().max_rechecks,
+                    f"beiseitegelegt ({sup.name})" if sup else "fehlt")
+        out.append({"raw_month": _ymstr(ym), "rechecks_before": int(prov.get("rechecks", 0)),
+                    "utc_months": utc, "superseded": str(sup) if sup else None})
+    return out
 
 
 def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
@@ -3148,15 +3365,30 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
                                          "retired_to": str(moved) if moved else None}
 
 
+    # Monatsdateien vor dem konfigurierten Historienbeginn: aus dem Store nehmen
+    hs = history_start(sym)
+    retired_before_start: dict[str, str] = {}
+    for ym, out in _store_months(data_root, sym, mode):
+        if ym < hs:
+            moved = retire_stale_store_file(data_root, out)
+            retired_before_start[_ymstr(ym)] = str(moved)
+            log.warning("%s: vor dem konfigurierten Historienbeginn %s - nach %s verschoben",
+                        out.name, _ymstr(hs), moved)
+
     scan_store()
 
+    clamped = [ym for ym in dk.months(start, end) if ym < hs]
+    if clamped:
+        log.warning("%s: --start %s liegt vor dem konfigurierten Historienbeginn %s (config/histdata.yaml) "
+                    "- nicht geladen: %s", sym, _ymstr(clamped[0]), _ymstr(hs),
+                    ", ".join(_ymstr(k) for k in clamped))
     for ym in dk.months(start, end):
+        if before_history(sym, ym):
+            unavailable[ym] = f"vor konfiguriertem Historienbeginn {_ymstr(hs)}"
+            continue
         if not _month_closed(ctx.now(), ym, mode):
             log.info("skip %s %s (Monat nicht abgeschlossen: Rohmonatsende %s in UTC + %g h)", sym,
                      _ymstr(ym), rule_for(mode, ym).describe(), SETTLE_S / 3600)
-            continue
-        if before_history(sym, ym):
-            unavailable[ym] = f"vor Historienbeginn {HISTORY_START[sym][0]}-{HISTORY_START[sym][1]:02d}"
             continue
         c = mode_conflict(ym)
         if c:
@@ -3170,12 +3402,20 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
             skipped_existing += 1
             continue
         todo.append(ym)
+    # vorlaeufige Quarantaenen mit faelliger Neupruefung (unabhaengig vom Bereich;
+    # --history nur bis history.end): ZIP beiseitelegen, neu laden, neu pruefen
+    rechecked = due_provisional_rechecks(ctx)
+    for ym in sorted({m for r in rechecked for m in r["utc_months"]}):
+        if ym not in todo and _month_closed(ctx.now(), ym, mode) and not mode_conflict(ym) \
+                and not before_history(sym, ym):
+            todo.append(ym)
     log.info("START %s mode=%s: %d Monate offen (%d fertig uebersprungen, %d vor Historienbeginn, "
              "%d mit alter Zeitzone neu zu bauen)", sym, mode, len(todo), skipped_existing,
              len(unavailable), len(stale_tz))
 
     outcomes: dict[Unit, Outcome] = {}
     written, validation_errors, quarantine, pending, missing = [], {}, {}, {}, {}
+    provisional: dict[tuple[int, int], dict] = {}    # vorlaeufige Quarantaene, Neupruefung spaeter
     undecided: dict[tuple[int, int], dict] = {}      # Fahrplan "undecided", Kandidaten verschieden
     state = {"status": None, "error": None}
     reported_gaps: dict[str, dict] = {}
@@ -3190,8 +3430,18 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
         try:
             df, stats = build_month(ctx, ym)
         except Quarantined as q:
-            quarantine[ym] = {"file": q.unit.name, "raw_month": _ymstr(q.ym), "reason": q.reason,
-                              "path": str(q.unit.qmarker(data_root, q.ym)), "check": q.check}
+            entry = {"file": q.unit.name, "raw_month": _ymstr(q.ym), "reason": q.reason,
+                     "path": str(q.unit.qmarker(data_root, q.ym)), "check": q.check}
+            if q.provisional:
+                # vorlaeufig: kein Exit 4/3, WARNING je Lauf, Neupruefung ab recheck_after
+                provisional[ym] = {**entry, "status": "provisional_pending",
+                                   "recheck_after": q.provisional.get("recheck_after"),
+                                   "rechecks": q.provisional.get("rechecks", 0),
+                                   "since": q.provisional.get("since")}
+                log.warning("VORLAEUFIGE QUARANTAENE %s (Rohmonat %s): Neupruefung ab %s - %s", label,
+                            _ymstr(q.ym), (q.provisional.get("recheck_after") or "?")[:10], q.reason)
+                return
+            quarantine[ym] = entry
             return
         except RuleUndecided as e:
             undecided[ym] = undecided_entry(e)
@@ -3279,7 +3529,10 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
         rep = _run_report(ctx, start, end, started, todo, outcomes, written, validation_errors,
                           quarantine, pending, unavailable, missing, conflicts, skipped_existing,
                           state, reported_gaps, rebuild, stale_tz, stale_out, relabelled,
-                          retired_recheck, unverified, removed_stores, undecided)
+                          retired_recheck, unverified, removed_stores, undecided,
+                          extra={"provisional": provisional, "rechecked": rechecked,
+                                 "retired_before_start": retired_before_start,
+                                 "clamped": clamped, "history_start": hs})
         dk.write_json_atomic(run_report_path(data_root, sym, mode), rep)
         log.info("FERTIG %s: status=%s exit=%d, %d Monate geschrieben, %d Requests (Report %s)", sym,
                  rep["status"], rep["exit_code"], len(written), client.requests,
@@ -3290,8 +3543,10 @@ def _run_locked(ctx: Ctx, start: date, end: date, rebuild: bool) -> dict:
 def _run_report(ctx, start, end, started, todo, outcomes, written, validation_errors, quarantine,
                 pending, unavailable, missing, conflicts, skipped_existing, state, reported_gaps,
                 rebuild, stale_tz=None, stale_out=None, relabelled=None, retired_recheck=None,
-                unverified=None, removed_stores=None, undecided=None) -> dict:
+                unverified=None, removed_stores=None, undecided=None, extra=None) -> dict:
     stale_tz, stale_out, relabelled = stale_tz or {}, stale_out or {}, relabelled or []
+    extra = extra or {}
+    provisional = extra.get("provisional") or {}
     undecided = undecided or {}
     client = ctx.client
     manual = [{"month": _ymstr(k), "kind": "quarantine", **{x: v[x] for x in ("reason", "path")}}
@@ -3306,7 +3561,7 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
                for k, v in undecided.items()]
     manual.sort(key=lambda r: r["month"])
     done = set(written) | set(validation_errors) | set(quarantine) | set(unavailable) | \
-        set(missing) | set(conflicts) | set(undecided)
+        set(missing) | set(conflicts) | set(undecided) | set(provisional)
     incomplete = [ym for ym in todo if ym not in done]
     gaps = {u: o for u, o in outcomes.items() if o.status in ("failed", "skipped")}
     content = {u: o for u, o in outcomes.items() if o.status in ("content_error", "deferred")}
@@ -3332,9 +3587,25 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
         status = "rule_undecided" if all(r["kind"] == "rule_undecided" for r in manual) else "quarantine"
         code = EXIT_MANUAL
     else:
-        status, code = "complete", EXIT_OK
+        # nur bekannte Ausnahmen (vor Historienbeginn, nach Bereichsende, vorlaeufige
+        # Quarantaene noch nicht faellig): Exit 0
+        status, code = ("provisional_pending" if provisional else "complete"), EXIT_OK
     if manual and code != EXIT_MANUAL:
         status += "+quarantine"
+    if provisional:
+        log.warning("VORLAEUFIGE QUARANTAENE %s (%s): %s", ctx.symbol, ctx.mode,
+                    "; ".join(f"{_ymstr(k)} Neupruefung ab {(v.get('recheck_after') or '?')[:10]}"
+                              for k, v in sorted(provisional.items())))
+
+    def recheck_result(r) -> str:
+        ks = r["utc_months"]
+        if any(k in provisional for k in ks):
+            return "still_provisional"
+        if any(k in quarantine for k in ks):
+            return "permanent_quarantine"
+        if ks and any(k in written for k in ks) and all(k in written or k not in done for k in ks):
+            return "passed"
+        return "not_completed"
     hints = []
     if manual:
         log.error("MANUELLE PRUEFUNG NOETIG %s (%s): %s", ctx.symbol, ctx.mode,
@@ -3395,6 +3666,18 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
         "retired_removed_symbols": removed_stores or [],
         # Fahrplan "undecided": UTC-Monate mit verschieden umgerechneten Ticks (roh)
         "months_rule_undecided": {_ymstr(k): v for k, v in sorted(undecided.items())},
+        # vorlaeufige Quarantaene (Rohmonat frisch beendet): kein Exit 3/4, Neupruefung ab Datum
+        "months_provisional": {_ymstr(k): {x: v.get(x) for x in ("raw_month", "status", "recheck_after",
+                                                                 "rechecks", "since", "reason", "path")}
+                               for k, v in sorted(provisional.items())},
+        # faellige Neupruefungen in diesem Lauf (ZIP beiseitegelegt und neu geladen)
+        "provisional_rechecked": [{**r, "utc_months": [_ymstr(k) for k in r["utc_months"]],
+                                   "result": recheck_result(r)} for r in extra.get("rechecked") or []],
+        "history_start": _ymstr(extra["history_start"]) if extra.get("history_start") else None,
+        # Monatsdateien vor dem konfigurierten Historienbeginn: nach metals/stale/
+        "retired_before_start": extra.get("retired_before_start") or {},
+        # angefragter Bereich vor dem konfigurierten Historienbeginn: nicht geladen
+        "clamped_before_start": [_ymstr(k) for k in extra.get("clamped") or []],
         "started": started.isoformat(), "finished": dk.utc_now().isoformat(),
         "range": {"start": f"{start:%Y-%m}", "end": f"{end:%Y-%m}"},
         "options": {"pause": client.pause, "attempts": client.attempts,
@@ -3403,6 +3686,7 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
                     "max_consecutive_failures": client.throttle.breaker,
                     "rate_limit_pause": client.gate.min_pause,
                     "max_rate_limit_wait": client.gate.max_total_wait, "rebuild": rebuild,
+                    "history": bool(getattr(ctx, "history_run", False)),
                     "publication_lag_days": PUBLICATION_LAG_DAYS},
         "summary": {
             "months_considered": len(todo),
@@ -3414,6 +3698,9 @@ def _run_report(ctx, start, end, started, todo, outcomes, written, validation_er
             "months_incomplete": [_ymstr(k) for k in incomplete],
             "months_quarantine": [_ymstr(k) for k in sorted(quarantine)],
             "months_rule_undecided": {_ymstr(k): v for k, v in sorted(undecided.items())},
+            "months_provisional": {_ymstr(k): {x: v.get(x) for x in (
+                "raw_month", "status", "recheck_after", "rechecks", "since", "reason", "path")}
+                for k, v in sorted(provisional.items())},
             "months_store_conflict": [_ymstr(k) for k in sorted(conflicts)],
             "months_validation_error": [_ymstr(k) for k in sorted(validation_errors)],
             "months_rebuilt_timezone": [_ymstr(k) for k in sorted(stale_tz) if k in written],
@@ -3774,8 +4061,12 @@ def _ym(s: str) -> tuple[int, int]:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--symbol", required=True, type=str.upper, help=f"eines von {', '.join(SYMBOLS)}")
-    p.add_argument("--start", help="YYYY-MM (default: Historienbeginn des Symbols)")
+    p.add_argument("--start", help="YYYY-MM (default: konfigurierter Historienbeginn des Symbols, "
+                                   "config/histdata.yaml; frueher wird hochgesetzt)")
     p.add_argument("--end", default=None, help="YYYY-MM (default: laufender Monat)")
+    p.add_argument("--history", action="store_true",
+                   help="Bereich = konfigurierter Historienbeginn .. history.end (config/histdata.yaml); "
+                        "nicht mit --start/--end")
     p.add_argument("--mode", choices=MODES, default="tick",
                    help="tick: Bid+Ask aus Ticks (default, source=histdata); m1: nur Bid, "
                         "ask = bid (eigene Partition source=histdata_m1)")
@@ -3820,9 +4111,17 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--attempts >= 1, uebrige Zahlen >= 0")
     if a.rate_limit_pause < rl.MIN_PAUSE_S:
         p.error(f"--rate-limit-pause muss >= {rl.MIN_PAUSE_S:g} s sein (15 min)")
+    if a.history and (a.start or a.end):
+        p.error("--history nicht zusammen mit --start/--end")
+    try:
+        load_range_config()
+    except ValueError as e:
+        p.error(str(e))
     try:
         start = _ym(a.start) if a.start else HISTORY_START[a.symbol]
         end = _ym(a.end) if a.end else (dk.utc_now().year, dk.utc_now().month)
+        if a.history:
+            start, end = HISTORY_START[a.symbol], history_end()
         verify = _ym(a.verify_month) if a.verify_month else None
         accept = _ym(a.accept_weekend_ticks) if a.accept_weekend_ticks else None
         fold = _ym(a.resolve_fold) if a.resolve_fold else None
@@ -3855,7 +4154,11 @@ def main(argv: list[str] | None = None) -> int:
             return verify_month(a.symbol, verify, mode=a.mode, **kw)["exit_code"]
         except ValueError as e:
             p.error(str(e))
-    rep = run(a.symbol, date(*start, 1), date(*end, 1), mode=a.mode, rebuild=a.rebuild, **kw)
+    if start < HISTORY_START[a.symbol]:
+        log.warning("--start %s vor dem konfigurierten Historienbeginn %s (config/histdata.yaml) - "
+                    "hochgesetzt", _ymstr(start), _ymstr(HISTORY_START[a.symbol]))
+    rep = run(a.symbol, date(*start, 1), date(*end, 1), mode=a.mode, rebuild=a.rebuild,
+              history=a.history, **kw)
     if rep["exit_code"] == EXIT_GAPS and rep.get("summary"):
         s = rep["summary"]
         log.error("LUECKEN: %d Dateien gescheitert, %d Inhaltsfehler, %d pending, %d unbestaetigt, "

@@ -327,7 +327,7 @@ Time zone:
 
   An unknown rule or zone, an unsorted or duplicate `from`, a missing mode
   or schedule, a schedule that starts after the earliest raw month needed
-  (first history month minus one, i.e. 2009-02), or a missing config file
+  (configured history start minus one month, now 2009-05), or a missing config file
   (also the repo default) stops at load time; there is never a silent
   fallback. Before changing the
   schedule, compare candidate rules offline against the raw cache with
@@ -499,9 +499,49 @@ Unpublished and missing data:
 - Three empty answers in a row inside the known history stop the run
   (`status: aborted`, exit 3). This usually means a token, WAF or server
   problem, not missing data.
-- Months before the symbol's history need no request. The history starts
-  used are XAUUSD 2009-03 and XAGUSD 2009-05; these are the
-  M1 start dates, and the tick start dates are unverified.
+- **Range** (`config/histdata.yaml`, `$HISTDATA_CONFIG` selects another file;
+  missing or invalid file stops at load time): `history.start` per symbol is
+  **2009-06** for both. Raw months before it are never requested or written,
+  are listed as "vor konfiguriertem Historienbeginn" under
+  `months_unavailable` (no exit 2/3/4), and an earlier `--start` is clamped up
+  with a WARNING (`clamped_before_start`). Store files before the start are
+  moved to `metals/stale/` (`retired_before_start`). UTC 2009-06 is built
+  from raw months >= 2009-06 only, so its first hours are missing:
+  `partial_start: true` in its monthly report, not an error.
+  **Why 2009-06:** the owner's full history run ended with exit 2 only
+  because of the first months: XAUUSD 2009-03/04/05 and XAGUSD 2009-05 have
+  `ask_close < bid_close` in 76–99 % of bars, most likely swapped bid/ask
+  columns in the early HistData files (partly in May 2009). We never swap or
+  guess; these months are not used. (HistData lists XAUUSD from 2009-03 and
+  XAGUSD from 2009-05.)
+- `history.end` (**2026-09**) is the end of `--history` (start .. end, not
+  together with `--start/--end`); the bot's history unit runs
+  `fetch_histdata.py --symbol S --history`. Without `--history`, `--end`
+  defaults to the current month, so metals-fetch (monthly, last two months)
+  still fetches later months. **Why 2026-09:** 2026-10 (XAU and XAG) is in
+  quarantine: a double raw hour on 25.10 19:00–19:59 (XAG 8416 ticks)
+  without a reversal, all example ticks with `.000` ms - probably a
+  provisional file version.
+- **Provisional quarantine** (`provisional` in the same file): a raw month
+  quarantined for any reason (time zone, format, fold) whose raw month ended
+  less than `window_days` (60) ago at its first quarantine gets
+  `provisional: {since, recheck_after, rechecks}` in the marker. Until
+  `recheck_after` (+`recheck_days`, 30): no exit 4 and no exit 3; the run
+  status is `provisional_pending`, the run report lists it under
+  `months_provisional` with its recheck date, and every run logs a WARNING.
+  Then any run of the symbol/mode (any range; `--history` not beyond
+  `history.end`) moves the cached ZIP to `<zip>.superseded`, downloads it
+  again (2 requests) and re-checks: pass → the affected UTC months are
+  written (`provisional_rechecked`); fail → `rechecks + 1` and a new date.
+  After `max_rechecks` (3) it becomes a normal quarantine (exit 4). Monthly
+  report and marker carry `ms_zero_share` (share of ticks with `.000` ms),
+  purely informative.
+- A run whose only unwritten months are before the start, after the range
+  end, or provisional-pending exits 0 if everything else is complete.
+- **Extending the range later:** raise `history.end` once the months are
+  clean (check the run report and quarantine), then run `--history` again.
+  Move `history.start` earlier only once the early files are shown to be
+  right (they then pass validation; nothing is ever swapped).
 
 HTTP and errors:
 
@@ -573,7 +613,7 @@ top of the run report, and every run logs `MANUELLE PRUEFUNG NOETIG ...` as
 an ERROR.
 
 Request count: 2 requests per raw month in tick mode, so a full XAUUSD
-history (2009-03 to now, about 210 months) is about 420 requests, which is
+history (2009-06 to 2026-09, 208 months) is about 416 requests, which is
 about 35 minutes of pauses plus the download time. One tick month is several
 million rows; plan for 1–2 GB of RAM.
 
@@ -590,10 +630,10 @@ runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
 runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
   /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
   --symbol XAUUSD --mode m1 --verify-month 2024-07   # M1 time zone (unverified)
-# full history (default start = history start of the symbol)
+# full history (configured range, config/histdata.yaml)
 runuser -u mkt -- env MARKETDATA_DATA_ROOT=/opt/marketdata/data \
   /opt/marketdata/.venv/bin/python /opt/marketdata/scripts/fetch_histdata.py \
-  --symbol XAUUSD --start 2009-03
+  --symbol XAUUSD --history
 # bid-only fallback
 python scripts/fetch_histdata.py --symbol XAGUSD --start 2024-01 --end 2024-06 --mode m1
 ```

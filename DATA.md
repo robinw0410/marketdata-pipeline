@@ -341,7 +341,7 @@ Zeitzone und Monatsgrenze:
   [{from: "YYYY-MM", rule: name}] aufsteigend, Wechsel nur an
   Rohmonatsgrenzen. Unbekannte Regel/Zone/kind, unsortiert/doppelt, fehlender
   Modus oder schedule, Fahrplan beginnt nach dem fruehesten benoetigten
-  Rohmonat (Historienbeginn minus 1 Monat = 2009-02), fehlende Datei (auch
+  Rohmonat (konfigurierter Historienbeginn minus 1 Monat, derzeit 2009-05), fehlende Datei (auch
   die Default-Datei im Repo) -> Abbruch beim Laden (nie still ein Default).
   Eintrag {from: "YYYY-MM", rule: undecided, candidates: [a, b, ...]}
   (>= 2 bekannte Regeln) = Regel offen (UndecidedRule; nicht im Default).
@@ -470,9 +470,43 @@ Zeitzone und Monatsgrenze:
   bewusst umstellen.
 
 Verfuegbarkeit / "keine Daten":
-- Historienbeginn (ASCII M1, Auswahlliste): XAUUSD 2009-03, XAGUSD 2009-05.
-  Tick-Beginn NICHT verifiziert. Monate davor ohne Request
-  als nicht verfuegbar gelistet.
+- Bereich: config/histdata.yaml (andere Datei: $HISTDATA_CONFIG; fehlend
+  oder ungueltig -> Abbruch beim Laden). history.start = 2009-06 fuer XAUUSD
+  und XAGUSD: Rohmonate davor werden nie angefragt/geschrieben, im Laufreport
+  "vor konfiguriertem Historienbeginn" (months_unavailable, kein Exit 2/3/4);
+  frueheres --start wird hochgesetzt (WARNING, clamped_before_start);
+  Store-Dateien davor -> metals/stale/ (retired_before_start). UTC 2009-06 nur
+  aus Rohmonaten >= 2009-06: seine ersten Stunden fehlen, Monatsreport
+  partial_start: true (kein Fehler).
+  Warum 2009-06: im vollen Historienlauf (Homelab, Exit 2) bestanden nur die
+  ersten Monate die Validierung nicht - XAUUSD 2009-03/04/05 und XAGUSD
+  2009-05 mit ask_close < bid_close in 76-99 % der Bars, sehr wahrscheinlich
+  vertauschte Bid/Ask-Spalten in fruehen HistData-Dateien (Mai 2009
+  teilweise). Nie tauschen, nie raten: diese Monate werden nicht verwendet.
+  HistData listet XAUUSD ab 2009-03, XAGUSD ab 2009-05.
+- history.end = 2026-09: Ende von --history (Beginn .. Ende; nicht mit
+  --start/--end; Unit der Bot-Historie: fetch_histdata.py --symbol S
+  --history). Ohne --history ist --end der laufende Monat (metals-fetch,
+  monatlich, letzte zwei Monate). Warum: 2026-10 (XAU, XAG) in Quarantaene -
+  doppelte Rohstunde 25.10. 19:00-19:59 (XAG 8416 Ticks) ohne Ruecksprung,
+  Beispielticks alle mit .000 ms, vermutlich eine vorlaeufige Dateiversion.
+- Vorlaeufige Quarantaene (provisional: window_days 60, recheck_days 30,
+  max_rechecks 3): Quarantaene (jeder Grund) eines Rohmonats, der beim ersten
+  Mal vor < window_days endete -> Marker provisional {since, recheck_after,
+  rechecks}. Bis recheck_after kein Exit 4/3: Status provisional_pending,
+  Laufreport months_provisional mit Datum, WARNING je Lauf. Danach legt jeder
+  Lauf des Symbols/Modus (beliebiger Bereich; --history nicht ueber
+  history.end hinaus) das ZIP nach <zip>.superseded, laedt neu (2 Requests),
+  prueft neu: besteht -> betroffene UTC-Monate geschrieben
+  (provisional_rechecked), sonst rechecks + 1 und neues Datum; nach
+  max_rechecks normale Quarantaene (Exit 4). Monatsreport und Marker:
+  ms_zero_share (Anteil Ticks mit .000 ms, nur Diagnose).
+- Exit 0, wenn nur Monate vor dem Beginn, nach dem Bereichsende oder
+  provisional_pending fehlen und sonst alles vollstaendig ist.
+- Bereich spaeter erweitern: history.end hochsetzen, sobald die Monate sauber
+  sind (Laufreport/Quarantaene), dann --history; history.start nur frueher,
+  wenn die fruehen Dateien nachweislich richtig sind (dann bestehen sie die
+  Validierung - getauscht wird nie).
 - Angefragt wird ein Monat erst nach Rohmonatsende (UTC-Monatsende + 4 h
   im EU-Sommer bzw. + 5 h im EU-Winter/M1) + 6 h. Leerer Body (keine Daten):
     bis 45 Tage nach Monatsende -> pending (Exit 3), erneute Pruefung

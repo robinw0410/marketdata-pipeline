@@ -55,6 +55,11 @@ def berlin_schedule(tmp_path_factory, monkeypatch):
     p = tmp_path_factory.mktemp("cfg") / "berlin_everywhere.yaml"
     p.write_text(BERLIN_EVERYWHERE)
     monkeypatch.setenv(fh.TZ_CONFIG_ENV, str(p))
+    # Bereich wie vor v8 (Listenbeginn, vorlaeufige Quarantaene aus): Mechanik-Tests
+    r = tmp_path_factory.mktemp("rng") / "histdata.yaml"
+    r.write_text('history:\n  start: {XAUUSD: "2009-03", XAGUSD: "2009-05"}\n  end: "2099-12"\n'
+                 "provisional:\n  window_days: 0\n  recheck_days: 30\n  max_rechecks: 3\n")
+    monkeypatch.setenv(fh.RANGE_CONFIG_ENV, str(r))
     return p
 
 
