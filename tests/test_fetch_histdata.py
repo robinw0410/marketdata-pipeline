@@ -2501,7 +2501,7 @@ def test_v8_provisional_quarantine_exit_0_then_rechecks(tmp_path, clock, v8_rang
         n = site.requests
         rep = run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=t)
         assert site.requests - n == 2, k                             # nur Rohmonat 2026-10 neu
-        assert zp.with_name(zp.name + ".superseded").exists() and zp.exists()
+        assert len(list(zp.parent.glob(zp.name + ".superseded.*"))) == k and zp.exists()   # keins ueberschrieben
         info = json.loads(q.read_text())
         assert rep["provisional_rechecked"][0]["raw_month"] == "2026-10"
         if k < 3:
@@ -2553,3 +2553,153 @@ def test_v8_old_month_quarantine_is_not_provisional(tmp_path, clock, v8_range, v
     assert rep["exit_code"] == 4 and rep["months_provisional"] == {}
     info = json.loads(hd.Unit("XAUUSD", "tick", 2026, 10).qmarker(tmp_path, (2026, 10)).read_text())
     assert "provisional" not in info
+
+
+# ======================================================== Review v8 (Bereich) ---
+NOPROV_RANGE = hd.DEFAULT_RANGE_CONFIG.read_text().replace("window_days: 60", "window_days: 0")
+
+
+def _pstate(root, ym):
+    p = hd.Unit("XAUUSD", "tick", *ym).pmarker(root, ym)
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def test_review_v8_old_code_marker_is_migrated_to_provisional(tmp_path, clock, v8_range, v7_default,
+                                                               tmp_path_factory, monkeypatch):
+    """Item 1: Marker der Vorversion (v7, gleiche Regel, ohne provisional) fuer 2026-10 -> beim
+    naechsten Lauf vorlaeufig (since = since des Markers), Neupruefung nach 30 Tagen."""
+    _use_range(tmp_path_factory, monkeypatch, NOPROV_RANGE)          # so schrieb der alte Code
+    site = _site26(clock)
+    assert run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=NOW8)["exit_code"] == 4
+    q = hd.Unit("XAUUSD", "tick", 2026, 10).qmarker(tmp_path, (2026, 10))
+    old = json.loads(q.read_text())
+    assert "provisional" not in old and old["tz_check_version"] == hd.TZ_CHECK_VERSION
+    monkeypatch.setenv(hd.RANGE_CONFIG_ENV, str(hd.DEFAULT_RANGE_CONFIG))
+    later = NOW8 + timedelta(days=3)
+    rep = run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=later)
+    assert rep["exit_code"] == 0 and rep["status"] == "provisional_pending", rep["quarantined"]
+    st = _pstate(tmp_path, (2026, 10))
+    assert st["since"] == old["since"] and st["rechecks"] == 0 and st["migrated"] is True
+    assert st["recheck_after"].startswith("2026-12-08")
+    assert json.loads(q.read_text())["provisional"]["since"] == old["since"]
+    n = site.requests
+    rep = run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=NOW8 + timedelta(days=31))
+    assert site.requests - n == 2 and rep["provisional_rechecked"][0]["raw_month"] == "2026-10"
+    assert _pstate(tmp_path, (2026, 10))["rechecks"] == 1
+
+
+def test_review_v8_backstop_and_after_history(tmp_path, clock, v8_range, v7_default, monkeypatch):
+    """Item 2: eine dauerhafte Quarantaene nach history.end bleibt sichtbar (Exit 4), auch wenn
+    der Lauf ihren Monat nicht abdeckt; --after-history = history.end+1 .. laufender Monat."""
+    site = _site26(clock)
+    run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=NOW8)
+    pf = hd.Unit("XAUUSD", "tick", 2026, 10).pmarker(tmp_path, (2026, 10))
+    pf.write_text(json.dumps({**json.loads(pf.read_text()), "expired": True}))   # wie nach 3 Fehlschlaegen
+    rep = run(tmp_path, clock, site, start=(2026, 9), end=(2026, 9), now=NOW8 + timedelta(days=5))
+    assert rep["exit_code"] == 4, rep["status"]
+    m = [x for x in rep["quarantined"] if x["month"] == "2026-10"]
+    assert m and m[0]["outside_range"] is True and m[0]["kind"] == "quarantine"
+    assert any(x["raw_month"] == "2026-10" for x in rep["quarantine_markers"])
+    seen = {}
+
+    def fake_run(sym, start, end, *a, **kw):
+        seen.update(start=start, end=end, history=kw.get("history"))
+        return {"exit_code": 0}
+    monkeypatch.setattr(hd, "run", fake_run)
+    monkeypatch.setattr(hd.dk, "utc_now", lambda: datetime(2027, 2, 3, tzinfo=UTC))
+    assert hd.main(["--symbol", "XAUUSD", "--after-history"]) == 0
+    assert seen == {"start": date(2026, 10, 1), "end": date(2027, 2, 1), "history": False}
+    for extra in (["--history"], ["--start", "2026-10"], ["--end", "2027-01"]):
+        with pytest.raises(SystemExit) as e:
+            hd.main(["--symbol", "XAUUSD", "--after-history", *extra])
+        assert e.value.code == 2
+
+
+def test_review_v8_recheck_counter_survives_marker_loss_and_expiry_is_final(tmp_path, clock, v8_range,
+                                                                             v7_default):
+    """Item 3: der Zaehler liegt in <zip>.provisional (ueberlebt neue Downloads und ein
+    geloeschtes Marker-JSON); abgelaufen bleibt abgelaufen."""
+    site = _site26(clock)
+    run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=NOW8)
+    q = hd.Unit("XAUUSD", "tick", 2026, 10).qmarker(tmp_path, (2026, 10))
+    t = NOW8 + timedelta(days=31)
+    run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=t)
+    assert _pstate(tmp_path, (2026, 10))["rechecks"] == 1
+    q.unlink()                                                    # Mensch loescht den Marker
+    t += timedelta(days=1)
+    rep = run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=t)
+    assert rep["exit_code"] == 0 and _pstate(tmp_path, (2026, 10))["rechecks"] == 1      # nicht auf 0
+    for _ in range(2):
+        t += timedelta(days=31)
+        rep = run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=t)
+    st = _pstate(tmp_path, (2026, 10))
+    assert rep["exit_code"] == 4 and st["expired"] is True and st["rechecks"] == 3
+    q.unlink()
+    rep = run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=t + timedelta(days=1))
+    assert rep["exit_code"] == 4 and rep["months_provisional"] == {}            # nie neu scharf
+    assert "provisional" not in json.loads(q.read_text())
+
+
+def test_review_v8_provisional_only_after_history_end(tmp_path, clock, v7_default, tmp_path_factory,
+                                                      monkeypatch):
+    """Item 4: im --history-Bereich ist jede Quarantaene normal (Exit 4), auch frische Monate."""
+    _use_range(tmp_path_factory, monkeypatch,
+               hd.DEFAULT_RANGE_CONFIG.read_text().replace('end: "2026-09"', 'end: "2026-10"'))
+    rep = run(tmp_path, clock, _site26(clock), start=(2026, 9), end=(2026, 10), now=NOW8)
+    assert rep["exit_code"] == 4 and rep["months_provisional"] == {}
+    assert _pstate(tmp_path, (2026, 10)) is None
+
+
+def test_review_v8_superseded_only_when_a_month_is_rechecked(tmp_path, clock, v8_range, v7_default):
+    """Item 5: faellig, aber kein betroffener UTC-Monat bereit (Rohmonat 2026-09 fehlt im Cache):
+    ZIP bleibt liegen; bei Neupruefung ein eigener Name je Mal (nichts ueberschrieben)."""
+    site = _site26(clock)
+    run(tmp_path, clock, site, start=(2026, 9), end=(2026, 10), now=NOW8)
+    zp = hd.Unit("XAUUSD", "tick", 2026, 10).path(tmp_path)
+    hd.Unit("XAUUSD", "tick", 2026, 9).path(tmp_path).unlink()
+    rep = run(tmp_path, clock, Site(clock), start=(2026, 8), end=(2026, 8), now=NOW8 + timedelta(days=31))
+    assert rep["provisional_rechecked"] == [] and zp.exists()
+    assert not list(zp.parent.glob(zp.name + ".superseded*"))
+
+
+def test_review_v8_range_validation_and_wrong_start_is_loud(tmp_path, clock, v8_range, monkeypatch, caplog):
+    good = hd.DEFAULT_RANGE_CONFIG.read_text()
+    for bad, word in ((good.replace('XAGUSD: "2009-06"', 'XAGUSD: "2009-04"'), "gelisteten"),
+                      (good.replace('XAUUSD: "2009-06"', 'XAUUSD: "2099-01"').replace('"2026-09"', '"2099-12"'),
+                       "nach dem laufenden Monat"),
+                      (good.replace('XAUUSD: "2009-06"', 'XAUUSD: "2009-6"'), "history.start.XAUUSD: Wert muss")):
+        p = tmp_path / f"b{len(word)}.yaml"
+        p.write_text(bad)
+        with pytest.raises(ValueError, match=word):
+            hd.load_range_config(p)
+    # plausibler, aber falscher Beginn: verschiebt, aber laut (ERROR, Anzahl, Liste)
+    site = Site(clock, {("T", f"2009{m:02d}"): tick_zip("XAUUSD", 2009, m) for m in (6, 7)})
+    root = tmp_path / "d"
+    assert run(root, clock, site, start=(2009, 6), end=(2009, 7))["exit_code"] == 0
+    wrong = tmp_path / "wrong.yaml"
+    wrong.write_text(good.replace('XAUUSD: "2009-06"', 'XAUUSD: "2019-06"'))
+    monkeypatch.setenv(hd.RANGE_CONFIG_ENV, str(wrong))
+    with caplog.at_level("ERROR", logger="histdata"):
+        rep = run(root, clock, site, start=(2019, 6), end=(2019, 6))
+    assert sorted(rep["retired_before_start"]) == ["2009-06", "2009-07"]
+    assert any(r.levelname == "ERROR" and "2 Monatsdatei(en)" in r.getMessage() for r in caplog.records)
+
+
+def test_review_v8_provisional_previous_raw_month_does_not_hide_real_problem(tmp_path, clock, v8_range,
+                                                                            v7_default):
+    """Item 7: UTC 2026-11 braucht Rohmonat 10 (vorlaeufig) und 11 (echtes Problem): beide
+    gemeldet, und weil 11 dauerhaft ist, Exit 4."""
+    files = {("T", f"2026{m:02d}"): tick_zip("XAUUSD", 2026, m) for m in (8, 9)}
+    files[("T", "202610")] = _zip_from(_oct26(), "XAUUSD", 2026, 10)
+    files[("T", "202611")] = tick_zip("XAUUSD", 2026, 11, stamping="utc")      # 5 h daneben
+    site = Site(clock, files)
+    now = datetime(2026, 12, 8, 12, tzinfo=UTC)
+    pf = hd.Unit("XAUUSD", "tick", 2026, 11).pmarker(tmp_path, (2026, 11))
+    pf.parent.mkdir(parents=True, exist_ok=True)
+    pf.write_text(json.dumps({"raw_month": "2026-11", "expired": True, "rechecks": 3}))
+    hd.Unit("XAUUSD", "tick", 2026, 9).path(tmp_path).write_bytes(files[("T", "202609")])
+    rep = run(tmp_path, clock, site, start=(2026, 11), end=(2026, 11), now=now)
+    assert rep["exit_code"] == 4, rep["status"]
+    e = rep["quarantine"][0]
+    assert e["month"] == "2026-11" and e["raw_month"] == "2026-11"
+    assert {(p["raw_month"], p["provisional"]) for p in e["problems"]} == {("2026-10", True), ("2026-11", False)}

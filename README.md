@@ -522,20 +522,49 @@ Unpublished and missing data:
   quarantine: a double raw hour on 25.10 19:00–19:59 (XAG 8416 ticks)
   without a reversal, all example ticks with `.000` ms - probably a
   provisional file version.
-- **Provisional quarantine** (`provisional` in the same file): a raw month
-  quarantined for any reason (time zone, format, fold) whose raw month ended
-  less than `window_days` (60) ago at its first quarantine gets
-  `provisional: {since, recheck_after, rechecks}` in the marker. Until
+- **Provisional quarantine** (`provisional` in the same file), only for raw
+  months **after `history.end`** (inside the `--history` range every
+  quarantine is a normal exit 4): a raw month quarantined for any reason
+  (time zone, format, fold) whose raw month ended less than `window_days`
+  (60) ago at its first quarantine is provisional. Its state lives in its own
+  file `<zip>.provisional` (`since`, `recheck_after`, `rechecks`, `history`),
+  which a new download does not delete; the marker carries a copy. Until
   `recheck_after` (+`recheck_days`, 30): no exit 4 and no exit 3; the run
   status is `provisional_pending`, the run report lists it under
   `months_provisional` with its recheck date, and every run logs a WARNING.
-  Then any run of the symbol/mode (any range; `--history` not beyond
-  `history.end`) moves the cached ZIP to `<zip>.superseded`, downloads it
-  again (2 requests) and re-checks: pass → the affected UTC months are
-  written (`provisional_rechecked`); fail → `rechecks + 1` and a new date.
-  After `max_rechecks` (3) it becomes a normal quarantine (exit 4). Monthly
-  report and marker carry `ms_zero_share` (share of ticks with `.000` ms),
-  purely informative.
+  Then a run of the symbol/mode moves the cached ZIP to
+  `<zip>.superseded.<timestamp>` (never overwritten; only when at least one
+  affected UTC month can be built now), downloads it again (2 requests) and
+  re-checks: pass → the affected UTC months are written and the state file is
+  removed (`provisional_passed`); fail → `rechecks + 1` and a new date. After
+  `max_rechecks` (3) the state file keeps `expired: true`, so it is never
+  re-armed automatically, and the quarantine is normal (exit 4). To reset by
+  hand, delete `<zip>.provisional` (it re-arms only if the month ended less
+  than `window_days` ago) or edit `rechecks`/`recheck_after` in it.
+  Quarantine markers written by the previous code (current check version,
+  no `provisional`) are migrated: if the raw month ended less than
+  `window_days` before the marker's `since`, they become provisional with
+  `since` from the marker. Monthly report and marker carry `ms_zero_share`
+  (share of ticks with `.000` ms), purely informative.
+- **Backstop:** every run lists all quarantine markers of the symbol/mode
+  (`quarantine_markers`, any month from the configured start on, whatever
+  the range). Current-version, non-provisional ones are manual cases
+  (`quarantined`, `outside_range: true`, exit 4) even when the run's range
+  does not cover them; markers of an older check version are only listed
+  (re-checked when their month is processed).
+- **`--after-history`**: range = month after `history.end` .. current
+  month, not together with `--start`/`--end`/`--history`. The bot's
+  metals-fetch uses it for HistData, so every month after the end is covered
+  on each run (finished months cost no requests). The range comes only from
+  `config/histdata.yaml`: `--start`/`--end` inside `HISTDATA_ARGS` together
+  with `--history` or `--after-history` is an error (exit 2).
+- `history.start` must not be before HistData's listed first month (XAUUSD
+  2009-03, XAGUSD 2009-05) or after the current month. A plausible but wrong
+  start (e.g. 2019-06) would move every earlier store file to
+  `metals/stale/`: it is done, but logged as ERROR with the count, and the
+  files are listed in `retired_before_start`.
+- A UTC month needing several raw months reports every problem (`problems`):
+  a provisional raw M-1 does not hide a real quarantine of raw M (then exit 4).
 - A run whose only unwritten months are before the start, after the range
   end, or provisional-pending exits 0 if everything else is complete.
 - **Extending the range later:** raise `history.end` once the months are

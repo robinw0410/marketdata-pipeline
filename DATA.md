@@ -491,16 +491,40 @@ Verfuegbarkeit / "keine Daten":
   doppelte Rohstunde 25.10. 19:00-19:59 (XAG 8416 Ticks) ohne Ruecksprung,
   Beispielticks alle mit .000 ms, vermutlich eine vorlaeufige Dateiversion.
 - Vorlaeufige Quarantaene (provisional: window_days 60, recheck_days 30,
-  max_rechecks 3): Quarantaene (jeder Grund) eines Rohmonats, der beim ersten
-  Mal vor < window_days endete -> Marker provisional {since, recheck_after,
-  rechecks}. Bis recheck_after kein Exit 4/3: Status provisional_pending,
-  Laufreport months_provisional mit Datum, WARNING je Lauf. Danach legt jeder
-  Lauf des Symbols/Modus (beliebiger Bereich; --history nicht ueber
-  history.end hinaus) das ZIP nach <zip>.superseded, laedt neu (2 Requests),
-  prueft neu: besteht -> betroffene UTC-Monate geschrieben
-  (provisional_rechecked), sonst rechecks + 1 und neues Datum; nach
-  max_rechecks normale Quarantaene (Exit 4). Monatsreport und Marker:
+  max_rechecks 3), NUR fuer Rohmonate nach history.end (im --history-Bereich
+  ist jede Quarantaene normal, Exit 4): Quarantaene (jeder Grund) eines
+  Rohmonats, der beim ersten Mal vor < window_days endete. Stand in eigener
+  Datei <zip>.provisional (since, recheck_after, rechecks, history; ein neuer
+  Download loescht sie NICHT), Kopie im Marker. Bis recheck_after kein Exit
+  4/3: Status provisional_pending, Laufreport months_provisional mit Datum,
+  WARNING je Lauf. Danach (nur wenn mindestens ein betroffener UTC-Monat jetzt
+  gebaut werden kann) ZIP nach <zip>.superseded.<Zeitstempel> (nie
+  ueberschrieben), neu laden (2 Requests), neu pruefen: besteht ->
+  UTC-Monate geschrieben, Stand-Datei weg (provisional_passed); sonst
+  rechecks + 1 und neues Datum; nach max_rechecks bleibt die Datei mit
+  expired: true (nie automatisch neu scharf) -> normale Quarantaene (Exit 4).
+  Von Hand zuruecksetzen: <zip>.provisional loeschen (wird nur neu scharf,
+  wenn der Monat vor < window_days endete) oder rechecks/recheck_after darin
+  aendern. Marker der Vorversion (aktuelle Pruefversion, ohne provisional),
+  deren Rohmonat weniger als window_days vor ihrem since endete, werden als
+  vorlaeufig uebernommen (since aus dem Marker). Monatsreport und Marker:
   ms_zero_share (Anteil Ticks mit .000 ms, nur Diagnose).
+- Uebersicht: jeder Lauf listet ALLE Quarantaene-Marker des Symbols/Modus ab
+  dem konfigurierten Beginn (quarantine_markers), unabhaengig vom Bereich;
+  aktuelle, nicht vorlaeufige -> manueller Fall (quarantined, outside_range,
+  Exit 4); Marker aelterer Pruefversion nur gelistet.
+- --after-history: Bereich = Monat nach history.end .. laufender Monat (nicht
+  mit --start/--end/--history); metals-fetch nutzt es fuer HistData, fertige
+  Monate kosten keine Requests. Der Bereich kommt nur aus
+  config/histdata.yaml: --start/--end in HISTDATA_ARGS zusammen mit
+  --history/--after-history -> Exit 2.
+- history.start nicht vor dem bei HistData gelisteten ersten Monat (XAUUSD
+  2009-03, XAGUSD 2009-05) und nicht nach dem laufenden Monat; ein
+  plausibler, aber falscher Beginn verschiebt fruehere Store-Dateien nach
+  metals/stale/ - mit ERROR, Anzahl und Liste (retired_before_start).
+- Braucht ein UTC-Monat mehrere Rohmonate, wird jedes Problem gemeldet
+  (problems); ein vorlaeufiger Rohmonat M-1 verdeckt kein echtes Problem in
+  M (dann Exit 4).
 - Exit 0, wenn nur Monate vor dem Beginn, nach dem Bereichsende oder
   provisional_pending fehlen und sonst alles vollstaendig ist.
 - Bereich spaeter erweitern: history.end hochsetzen, sobald die Monate sauber

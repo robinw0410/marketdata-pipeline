@@ -297,10 +297,13 @@ def do_run(root, site, start, end, sym="XAUUSD", now=datetime(2026, 11, 8, 12, t
                   jitter=0.0, sleep=clock.sleep, clock=clock, wall=clock, session=site)
 
 
-def cli(argv, root, site, monkeypatch):
-    """fh.main mit gemocktem HTTP (requests.Session.get/post -> Site), ohne Pausen."""
+def cli(argv, root, site, monkeypatch, now=None):
+    """fh.main mit gemocktem HTTP (requests.Session.get/post -> Site), ohne Pausen;
+    now: feste Uhr (dk.utc_now) statt der Systemzeit."""
     import requests
     monkeypatch.setenv("MARKETDATA_DATA_ROOT", str(root))
+    if now is not None:
+        monkeypatch.setattr(dk, "utc_now", lambda: now)
     monkeypatch.setattr(requests.Session, "get", lambda self, url, **kw: site.get(url, **kw))
     monkeypatch.setattr(requests.Session, "post", lambda self, url, **kw: site.post(url, **kw))
     try:
@@ -438,7 +441,7 @@ def test_history_run_skips_swapped_early_months(tmp_path, monkeypatch, caplog, s
 def test_start_2009_03_config_exits_2_and_data_untouched(tmp_path, monkeypatch, sym):
     """Gegenprobe: mit Historienbeginn 2009-03 sind die fruehen Monate wirklich kaputt
     (Validierung, Exit 2); die Rohdaten werden dabei nicht veraendert (kein Tausch)."""
-    short_history(tmp_path, monkeypatch, start=("2009-03", "2009-03"))
+    short_history(tmp_path, monkeypatch, start=("2009-03", "2009-05"))   # gelistete Anfaenge
     root = tmp_path / "data"
     write_raw(root, sym, (2009, 8), early_zip(sym, (2009, 8)))
     site = early_site(sym)
@@ -646,14 +649,14 @@ def test_provisional_bad_three_times_becomes_permanent(tmp_path, sym):
         if k < 3:
             assert rep["exit_code"] == 0, (k, rep)
             assert info["provisional"]["rechecks"] == k
-            assert parse_iso(info["provisional"]["recheck_after"]) == now + timedelta(days=30) \
-                or parse_iso(info["provisional"]["recheck_after"]) > now
+            assert parse_iso(info["provisional"]["recheck_after"]) == now + timedelta(days=30)
             assert prov_entry(rep, "2026-10") is not None
     assert codes[:2] == [0, 0]
     assert rechecks[:2] == [1, 2]
     assert codes[2] == 4, rep
     info = json.loads(q.read_text())
     assert not info.get("provisional"), info                       # normale Quarantaene
+    assert 3 in find_key(info, "rechecks"), info                   # max_rechecks = 3 erreicht
     assert "2026-10" in rep["summary"]["months_quarantine"]
     assert prov_entry(rep, "2026-10") is None
     assert not store_file(root, sym, 2026, 10).exists()
@@ -690,3 +693,303 @@ def test_old_month_quarantine_is_not_provisional(tmp_path):
     assert "2015-03" in rep["summary"]["months_quarantine"]
     assert prov_entry(rep, "2015-03") is None
     assert "ms_zero_share" in info
+
+
+# ============================================================ review v8 ====
+def zip_of_df(symbol, y, m, df) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"DAT_ASCII_{symbol}_T_{y}{m:02d}.csv", tick_csv(df))
+        zf.writestr(f"DAT_ASCII_{symbol}_T_{y}{m:02d}.txt", "HistData.com status report\n")
+    return buf.getvalue()
+
+
+def weekday_reversal_zip(sym, y, m, day):
+    """Rohmonat (neue Regel) mit 60-min-Ruecksprung an einem Werktag um roh 12:00 (nie freigebbar)."""
+    df = gen_month(sym, y, m, NEW)
+    t = rms(y, m, day, 12)
+    assert date(y, m, day).weekday() == 2                       # Mittwoch
+    pos = int(np.searchsorted(df["raw"].to_numpy(), t, side="right"))
+    p = base_price(sym, y)
+    extra = pd.DataFrame({"raw": np.arange(t - HOUR_MS, t - HOUR_MS + 6 * 600_000, 600_000) + 211,
+                          "utc": 0, "bid": p, "ask": p + SPREAD[sym]})
+    return zip_of_df(sym, y, m, pd.concat([df.iloc[:pos], extra, df.iloc[pos:]], ignore_index=True))
+
+
+def superseded(root, sym, ym):
+    p = raw_zip_path(root, sym, *ym)
+    return sorted(x for x in p.parent.glob(p.name + "*.superseded*"))
+
+
+def bad_oct(sym):
+    return provisional_files(sym)[(sym, "202610")]
+
+
+# ---- 1: alter Marker (v7, ohne provisional) wird migriert -------------------
+@pytest.mark.parametrize("sym", SYMS)
+def test_old_v7_marker_is_migrated_to_provisional_and_rechecked(tmp_path, monkeypatch, sym):
+    root = tmp_path / "data"
+    seed_provisional(root, sym)
+    write_raw(root, sym, (2026, 9), zip_bytes(sym, 2026, 9, NEW))
+    write_raw(root, sym, (2026, 10), bad_oct(sym))
+    since = datetime(2026, 11, 6, 9, tzinfo=UTC)
+    # Marker so schreiben lassen, wie der alte Code ihn schrieb: ohne provisional
+    monkeypatch.setenv(RANGE_ENV, str(write_range_cfg(tmp_path / "w0.yaml", window=0)))
+    rep = do_run(root, Site(), (2026, 10), (2026, 10), sym=sym, now=since)
+    assert rep["exit_code"] == 4, rep
+    monkeypatch.delenv(RANGE_ENV)
+    q = qmarker_path(root, sym, 2026, 10)
+    old = json.loads(q.read_text())
+    for k in ("provisional", "provisional_expired", "ms_zero_share"):
+        old.pop(k, None)
+    assert old["tz_check_version"] == 7 and old["tz_rule"] == NEW
+    assert parse_iso(old["since"]) == since
+    q.write_text(json.dumps(old))
+    write_raw(root, sym, (2026, 11), zip_bytes(sym, 2026, 11, NEW))   # Kontext, kein Download
+    now = since + timedelta(days=31)
+    site = Site({(sym, "202610"): bad_oct(sym)})
+    rep = do_run(root, site, (2026, 10), (2026, 11), sym=sym, now=now)
+    assert site.requests == 2, site.calls
+    assert site.periods == [(sym, 2026, 10)]
+    assert rep["exit_code"] == 0, rep.get("quarantined") or rep
+    info = json.loads(q.read_text())
+    prov = info["provisional"]
+    assert parse_iso(prov["since"]) == since
+    assert prov["rechecks"] == 1
+    assert parse_iso(prov["recheck_after"]) == now + timedelta(days=30)
+    assert prov_entry(rep, "2026-10") is not None
+    assert len(superseded(root, sym, (2026, 10))) == 1
+
+
+# ---- 2: --after-history --------------------------------------------------------
+def test_after_history_range_and_exclusivity(tmp_path, monkeypatch, capsys):
+    sym = "XAUUSD"
+    root = tmp_path / "data"
+    for m in (7, 8, 9):
+        write_raw(root, sym, (2026, m), zip_bytes(sym, 2026, m, NEW))
+    good = provisional_files(sym, good_oct=True)[(sym, "202610")]
+    for extra in (["--start", "2026-10"], ["--end", "2026-10"], ["--history"]):
+        site = Site({(sym, "202610"): good})
+        capsys.readouterr()
+        code = cli(["--symbol", sym, "--after-history", *extra], root, site, monkeypatch, now=T0)
+        err = capsys.readouterr().err
+        assert code == 2, extra
+        assert "unrecognized" not in err and "--after-history" in err, err
+        assert site.requests == 0
+    site = Site({(sym, "202610"): good})
+    code = cli(["--symbol", sym, "--after-history"], root, site, monkeypatch, now=T0)
+    assert code == 0, run_report(root, sym)
+    assert sorted({(y, m) for _, y, m in site.periods}) == [(2026, 10)]      # nur nach history.end
+    assert site.requests == 2
+    assert store_months(root, sym) == ["2026-10"]
+    rr = run_report(root, sym)
+    assert rr["range"] == {"start": "2026-10", "end": "2026-11"}
+    # fertige Monate kosten nichts
+    site = Site({(sym, "202610"): good})
+    assert cli(["--symbol", sym, "--after-history"], root, site, monkeypatch, now=T0) == 0
+    assert site.requests == 0
+
+
+# ---- 3: Marker-Scan ------------------------------------------------------------
+def expire(tmp_path, sym):
+    """Raw 2026-10: erste vorlaeufige Quarantaene, dann 3 fehlgeschlagene Neupruefungen."""
+    root, _, _ = first_quarantine(tmp_path, sym)
+    write_raw(root, sym, (2026, 11), zip_bytes(sym, 2026, 11, NEW))
+    q = qmarker_path(root, sym, 2026, 10)
+    now = T0
+    for _ in range(3):
+        now = parse_iso(json.loads(q.read_text())["provisional"]["recheck_after"]) + timedelta(hours=1)
+        rep = do_run(root, Site(provisional_files(sym)), (2026, 9), (2026, 10), sym=sym, now=now)
+    assert rep["exit_code"] == 4 and not json.loads(q.read_text()).get("provisional")
+    return root, now
+
+
+def test_expired_quarantine_after_end_exits_4_on_every_run(tmp_path, monkeypatch):
+    sym = "XAUUSD"
+    root, now = expire(tmp_path, sym)
+    later = now + timedelta(days=5)
+    # UTC 2026-07 braucht Rohmonat 2026-06 (M-1): mit in den Cache, sonst holt der Lauf
+    # ihn (keine Daten -> Exit 3, Vorrang vor 4) und der Test prueft etwas anderes
+    write_raw(root, sym, (2026, 6), zip_bytes(sym, 2026, 6, NEW))
+    for rng in (((2026, 9), (2026, 9)), ((2026, 7), (2026, 8)), ((2026, 11), (2026, 11))):
+        site = Site()
+        rep = do_run(root, site, *rng, sym=sym, now=later)
+        assert rep["exit_code"] == 4, (rng, rep["summary"])
+        assert site.requests == 0
+    # auch --history (Bereich bis history.end, ohne 2026-10)
+    short_history(tmp_path, monkeypatch, start=("2026-08", "2026-08"), end="2026-09")
+    site = Site()
+    code = cli(["--symbol", sym, "--history"], root, site, monkeypatch, now=later)
+    assert code == 4, run_report(root, sym)
+    assert site.requests == 0
+
+
+def test_markers_before_configured_start_are_ignored(tmp_path):
+    sym = "XAUUSD"
+    root = tmp_path / "data"
+    seed_provisional(root, sym)
+    write_raw(root, sym, (2026, 9), zip_bytes(sym, 2026, 9, NEW))
+    q = qmarker_path(root, sym, 2009, 4)
+    q.parent.mkdir(parents=True, exist_ok=True)
+    q.write_text(json.dumps({"reason": "alte Quarantaene", "check": None, "since": "2025-01-01T00:00:00+00:00",
+                             "accepted": False, "tz_rule": NYL, "raw_tz": "America/New_York",
+                             "tz_shift_h": 0, "tz_check_version": 7}))
+    site = Site()
+    rep = do_run(root, site, (2026, 9), (2026, 9), sym=sym, now=T0)
+    assert rep["exit_code"] == 0, rep["summary"]
+    assert site.requests == 0
+    assert rep["summary"]["months_quarantine"] == []
+    assert q.exists()
+
+
+# ---- 4: Zaehler ueberlebt Absturz und geloeschten Marker -----------------------
+@pytest.mark.parametrize("sym", SYMS)
+def test_recheck_counter_survives_crash_between_download_and_check(tmp_path, monkeypatch, sym):
+    root, _, _ = first_quarantine(tmp_path, sym)
+    write_raw(root, sym, (2026, 11), zip_bytes(sym, 2026, 11, NEW))
+    q = qmarker_path(root, sym, 2026, 10)
+    now = parse_iso(json.loads(q.read_text())["provisional"]["recheck_after"]) + timedelta(hours=1)
+
+    def crash(*a, **k):
+        raise RuntimeError("Absturz nach dem Download")
+
+    monkeypatch.setattr(fh, "build_month", crash)
+    site = Site(provisional_files(sym))
+    with pytest.raises(RuntimeError):
+        do_run(root, site, (2026, 9), (2026, 10), sym=sym, now=now)
+    assert site.requests == 2                                   # neu geladen, nicht geprueft
+    monkeypatch.undo()
+    monkeypatch.delenv(TZ_ENV, raising=False)
+    monkeypatch.delenv(RANGE_ENV, raising=False)
+    rep = do_run(root, Site(provisional_files(sym)), (2026, 9), (2026, 10), sym=sym,
+                 now=now + timedelta(hours=1))
+    info = json.loads(q.read_text())
+    assert info["provisional"]["rechecks"] >= 1, info              # nicht auf 0 zurueck
+    assert rep["exit_code"] == 0, rep
+
+
+@pytest.mark.parametrize("sym", SYMS)
+def test_recheck_counter_survives_deleted_marker_and_expiry_is_final(tmp_path, sym):
+    root, _, _ = first_quarantine(tmp_path, sym)
+    write_raw(root, sym, (2026, 11), zip_bytes(sym, 2026, 11, NEW))
+    q = qmarker_path(root, sym, 2026, 10)
+    now = parse_iso(json.loads(q.read_text())["provisional"]["recheck_after"]) + timedelta(hours=1)
+    rep = do_run(root, Site(provisional_files(sym)), (2026, 9), (2026, 10), sym=sym, now=now)
+    assert json.loads(q.read_text())["provisional"]["rechecks"] == 1
+    q.unlink()                                                  # Mensch loescht den Marker
+    site = Site(provisional_files(sym))
+    rep = do_run(root, site, (2026, 9), (2026, 10), sym=sym, now=now + timedelta(days=1))
+    info = json.loads(q.read_text())
+    assert info["provisional"]["rechecks"] == 1, info              # nicht auf 0 zurueck
+    assert site.requests == 0
+    # bis zum Ablauf, dann Marker loeschen: nie wieder automatisch vorlaeufig
+    for _ in range(2):
+        now = parse_iso(json.loads(q.read_text())["provisional"]["recheck_after"]) + timedelta(hours=1)
+        rep = do_run(root, Site(provisional_files(sym)), (2026, 9), (2026, 10), sym=sym, now=now)
+    assert rep["exit_code"] == 4
+    assert not json.loads(q.read_text()).get("provisional")
+    q.unlink()
+    site = Site(provisional_files(sym))
+    rep = do_run(root, site, (2026, 9), (2026, 10), sym=sym, now=now + timedelta(days=1))
+    assert rep["exit_code"] == 4, rep
+    info = json.loads(q.read_text())
+    assert not info.get("provisional"), info
+    assert prov_entry(rep, "2026-10") is None
+
+
+# ---- 5: vorlaeufig nur nach history.end -----------------------------------------
+def test_recent_quarantine_inside_range_is_not_provisional(tmp_path):
+    sym = "XAUUSD"
+    root = tmp_path / "data"
+    seed_provisional(root, sym)
+    write_raw(root, sym, (2026, 9), weekday_reversal_zip(sym, 2026, 9, 16))
+    # rechter Nachbar im Cache (sonst nur "vorlaeufig wegen fehlendem Nachbarn", ohne Marker)
+    write_raw(root, sym, (2026, 10), provisional_files(sym, good_oct=True)[(sym, "202610")])
+    site = Site()
+    rep = do_run(root, site, (2026, 9), (2026, 9), sym=sym, now=T0)
+    assert rep["exit_code"] == 4, rep
+    assert site.requests == 0
+    info = json.loads(qmarker_path(root, sym, 2026, 9).read_text())
+    assert "provisional" not in info
+    assert "2026-09" in rep["summary"]["months_quarantine"]
+    assert prov_entry(rep, "2026-09") is None
+
+
+# ---- 6: .superseded ------------------------------------------------------------
+@pytest.mark.parametrize("sym", SYMS)
+def test_two_rechecks_keep_two_distinct_superseded_files(tmp_path, sym):
+    root, _, _ = first_quarantine(tmp_path, sym)
+    write_raw(root, sym, (2026, 11), zip_bytes(sym, 2026, 11, NEW))
+    q = qmarker_path(root, sym, 2026, 10)
+    original = raw_zip_path(root, sym, 2026, 10).read_bytes()
+    for _ in range(2):
+        now = parse_iso(json.loads(q.read_text())["provisional"]["recheck_after"]) + timedelta(hours=1)
+        do_run(root, Site(provisional_files(sym)), (2026, 9), (2026, 10), sym=sym, now=now)
+    sup = superseded(root, sym, (2026, 10))
+    assert len(sup) == 2 and len({p.name for p in sup}) == 2, sup
+    assert all(p.read_bytes() == original for p in sup)          # nichts verloren
+    assert raw_zip_path(root, sym, 2026, 10).exists()
+
+
+def test_no_zip_moved_aside_when_no_utc_month_is_built(tmp_path):
+    """Faellig, aber kein betroffener UTC-Monat baubar (Rohmonat 2026-09 fehlt, 2026-11
+    nicht im Cache): ZIP bleibt, kein Request fuer 2026-10, Zaehler unveraendert."""
+    sym = "XAUUSD"
+    root, _, _ = first_quarantine(tmp_path, sym)
+    q = qmarker_path(root, sym, 2026, 10)
+    before = json.loads(q.read_text())["provisional"]
+    raw_zip_path(root, sym, 2026, 9).unlink()
+    original = raw_zip_path(root, sym, 2026, 10).read_bytes()
+    now = parse_iso(before["recheck_after"]) + timedelta(hours=1)
+    site = Site()
+    do_run(root, site, (2026, 8), (2026, 8), sym=sym, now=now)
+    assert (sym, 2026, 10) not in site.periods
+    assert superseded(root, sym, (2026, 10)) == []
+    assert raw_zip_path(root, sym, 2026, 10).read_bytes() == original
+    assert json.loads(q.read_text())["provisional"]["rechecks"] == before["rechecks"]
+
+
+# ---- 7: Konfiguration ----------------------------------------------------------
+@pytest.mark.parametrize("start,end", [
+    (("2009-02", "2009-06"), "2026-09"),       # XAUUSD vor dem gelisteten Beginn 2009-03
+    (("2009-06", "2009-04"), "2026-09"),       # XAGUSD vor dem gelisteten Beginn 2009-05
+    (("2099-01", "2009-06"), "2099-06"),       # Beginn nach dem laufenden Monat
+    (("2009-06", "2026-10"), "2026-09"),       # Beginn > Ende
+])
+def test_range_config_start_errors_mention_history_start(tmp_path, start, end):
+    p = write_range_cfg(tmp_path / "bad.yaml", start=start, end=end)
+    with pytest.raises(ValueError) as e:
+        fh.load_range_config(p)
+    msg = str(e.value)
+    assert "history" in msg and "start" in msg, msg
+    assert "'from'" not in msg and " from " not in msg, msg
+
+
+@pytest.mark.parametrize("bad", ["2009-13", "2009-6", "juni"])
+def test_range_config_bad_month_text_mentions_history(tmp_path, bad):
+    p = write_range_cfg(tmp_path / "bad.yaml", start=(bad, "2009-06"))
+    with pytest.raises(ValueError) as e:
+        fh.load_range_config(p)
+    msg = str(e.value)
+    assert "history.start" in msg and "'from'" not in msg, msg
+
+
+# ---- 8: Probleme im Rohmonat M nicht verdeckt ----------------------------------
+def test_provisional_october_does_not_hide_broken_november(tmp_path):
+    sym = "XAUUSD"
+    root = tmp_path / "data"
+    seed_provisional(root, sym)
+    write_raw(root, sym, (2026, 9), zip_bytes(sym, 2026, 9, NEW))
+    write_raw(root, sym, (2026, 10), bad_oct(sym))
+    write_raw(root, sym, (2026, 11), weekday_reversal_zip(sym, 2026, 11, 18))
+    now = datetime(2026, 12, 9, 12, tzinfo=UTC)
+    site = Site()
+    rep = do_run(root, site, (2026, 10), (2026, 11), sym=sym, now=now)
+    assert site.requests == 0
+    assert qmarker_path(root, sym, 2026, 10).exists()
+    q11 = qmarker_path(root, sym, 2026, 11)
+    assert q11.exists(), rep["summary"]                         # 2026-11 wurde geprueft
+    assert "Ruecksprung" in json.loads(q11.read_text())["reason"]
+    assert "2026-11" in find_key(rep, "raw_month"), rep["summary"]
+    assert not store_file(root, sym, 2026, 10).exists()
+    assert not store_file(root, sym, 2026, 11).exists()

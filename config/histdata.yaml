@@ -25,17 +25,30 @@
 #   laufenden Monat (metals-fetch, monatlich), dort greift die vorlaeufige
 #   Quarantaene (unten).
 #
-# provisional - vorlaeufige Quarantaene:
+# provisional - vorlaeufige Quarantaene, NUR fuer Rohmonate NACH history.end
+#   (im --history-Bereich ist jede Quarantaene normal, Exit 4):
 #   Wird ein Rohmonat (Zeitzone, Format, doppelte Stunde, ...) in Quarantaene
 #   gesetzt und endete er beim ersten Mal vor weniger als window_days Tagen,
-#   bekommt der Marker provisional: {since, recheck_after = since +
-#   recheck_days, rechecks: 0}. Bis recheck_after: kein Exit 4 (und kein Exit
-#   3), Laufreport months_provisional mit Datum, WARNING je Lauf. Danach legt
-#   jeder Lauf des Symbols/Modus (beliebiger Bereich; --history nur bis
-#   history.end) das ZIP beiseite (<zip>.superseded), laedt neu (2 Requests)
-#   und prueft neu: besteht -> die betroffenen UTC-Monate werden geschrieben;
-#   faellt durch -> rechecks + 1, neues recheck_after. Nach max_rechecks wird
-#   daraus eine normale Quarantaene (Exit 4). window_days: 0 = aus.
+#   ist er vorlaeufig: Stand in <zip>.provisional {since, recheck_after = since
+#   + recheck_days, rechecks: 0} (ein neuer Download loescht diese Datei NICHT;
+#   Kopie im Marker). Bis recheck_after: kein Exit 4 (und kein Exit 3),
+#   Laufreport months_provisional mit Datum, WARNING je Lauf. Danach legt ein
+#   Lauf des Symbols/Modus das ZIP nach <zip>.superseded.<Zeitstempel> (nur
+#   wenn ein betroffener UTC-Monat jetzt gebaut werden kann; nie
+#   ueberschrieben), laedt neu (2 Requests) und prueft neu: besteht -> die
+#   UTC-Monate werden geschrieben, die Stand-Datei entfernt; faellt durch ->
+#   rechecks + 1, neues recheck_after. Nach max_rechecks: expired: true in der
+#   Stand-Datei (nie automatisch neu scharf), normale Quarantaene (Exit 4).
+#   Von Hand zuruecksetzen: <zip>.provisional loeschen. window_days: 0 = aus.
+#   Marker der Vorversion ohne provisional werden uebernommen, wenn der
+#   Rohmonat weniger als window_days vor ihrem since endete.
+#   Jeder Lauf listet alle Quarantaene-Marker; dauerhafte -> Exit 4, auch wenn
+#   der Bereich ihren Monat nicht abdeckt. metals-fetch: --after-history
+#   (history.end+1 .. laufender Monat); --start/--end zusammen mit --history
+#   oder --after-history -> Exit 2 (der Bereich kommt nur aus dieser Datei).
+#   history.start: nicht vor dem HistData-Listenbeginn (XAUUSD 2009-03,
+#   XAGUSD 2009-05), nicht nach dem laufenden Monat; ein falscher, aber
+#   plausibler Beginn verschiebt fruehere Store-Dateien (ERROR + Liste).
 #
 # Bereich spaeter erweitern: history.end hochsetzen (z.B. "2026-12"), sobald
 # die Monate sauber sind (Laufreport/Quarantaene pruefen); history.start nur
