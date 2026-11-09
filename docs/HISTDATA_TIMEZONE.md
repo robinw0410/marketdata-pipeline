@@ -138,9 +138,12 @@ schedule:
 ```
 
 Ein Wechsel gilt nur an **Rohmonatsgrenzen**, also an Monaten der HistData-Datei,
-nicht an UTC-Monaten. Ein UTC-Monat M setzt sich aus den letzten 4 h (EU-Sommer)
-bzw. 5 h (EU-Winter) des Rohmonats M−1 und dem Rohmonat M ohne diese Stunden an
-seinem Ende zusammen. Er wird nur geschrieben, wenn beide Rohmonate erledigt sind
+nicht an UTC-Monaten. Ein UTC-Monat M setzt sich aus den letzten 4 bzw. 5 h des
+Rohmonats M−1 und dem Rohmonat M ohne die entsprechenden Stunden an seinem Ende
+zusammen. Wie viele Stunden es sind, bestimmt der Offset der jeweils geltenden
+Regel an der Monatsgrenze (−4 h → 4 h, −5 h → 5 h). Unter `ny_local` sind es an
+der Oktober/November-Grenze 4 h, weil am 1. November 00:00 UTC in New York noch
+Sommerzeit gilt. Er wird nur geschrieben, wenn beide Rohmonate erledigt sind
 (`DATA.md`, Abschnitt „Zeitzone und Monatsgrenze“).
 
 ### 3.2 Die Regel `berlin_minus_6_utc_midnight`

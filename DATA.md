@@ -413,9 +413,10 @@ Zeitzone und Monatsgrenze:
   UTC. Rohzeit in einer Umstellungsluecke oder doppelten Stunde wird NIE
   geraten (Ausnahme: die Herbststunde von dst_daily_utc mit Ruecksprung, s.
   o.): TimezoneError -> Quarantaene (Exit 4).
-- UTC-Monat M = letzte 4 h (EU-Sommer) bzw. 5 h (EU-Winter/M1) des
-  Rohmonats M-1 + Rohmonat M ohne diese Stunden an seinem Ende (aus dem
-  Fahrplan berechnet). Geschrieben wird M nur, wenn beide Rohmonate erledigt
+- UTC-Monat M = letzte 4 bzw. 5 h des Rohmonats M-1 (je nach Offset der
+  geltenden Regel an der Monatsgrenze; unter ny_local an der Oktober/
+  November-Grenze 4 h, M1 fixed_est immer 5 h) + Rohmonat M ohne diese
+  Stunden an seinem Ende (aus dem Fahrplan berechnet). Geschrieben wird M nur, wenn beide Rohmonate erledigt
   sind (Daten, bestaetigt leer oder vor Historienbeginn).
 - Pruefung je Rohmonat (check_timezone, Pruefversion 7): je Marktluecke ein
   Schluss- und ein Oeffnungsanker: Wochenende (>= 24 h, Schluss Do/Fr,
