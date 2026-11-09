@@ -1,0 +1,19 @@
+# /etc/systemd/system/marketdata-calendar.service
+[Unit]
+Description=Economic calendar (FRED, FOMC, ECB) for the news blackout
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mkt
+Group=mkt
+# FRED_API_KEY; '-': Unit startet auch ohne Datei (fred schlaegt dann mit Exit 4 fehl)
+EnvironmentFile=-/etc/marketdata.env
+ExecStart=/opt/marketdata/.venv/bin/python \
+    /opt/marketdata/scripts/fetch_calendar.py --start-year 2003
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/marketdata/data

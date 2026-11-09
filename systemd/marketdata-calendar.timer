@@ -1,0 +1,10 @@
+# /etc/systemd/system/marketdata-calendar.timer
+[Unit]
+Description=Daily economic calendar update
+
+[Timer]
+OnCalendar=*-*-* 05:10:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

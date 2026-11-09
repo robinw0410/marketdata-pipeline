@@ -2,5 +2,6 @@ duckdb
 numpy
 pandas>=2.0
 pyarrow
+pyyaml
 requests
 websockets

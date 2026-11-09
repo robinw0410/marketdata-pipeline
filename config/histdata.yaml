@@ -1,0 +1,66 @@
+# Bereich und vorlaeufige Quarantaene fuer scripts/fetch_histdata.py
+# (load_range_config; andere Datei per Umgebungsvariable HISTDATA_CONFIG).
+# Fehlende oder ungueltige Datei -> Abbruch beim Laden, nie still ein Default.
+#
+# history.start - erster ROHmonat je Symbol, der geladen und geschrieben wird.
+#   Rohmonate davor werden NIE angefragt, nie geschrieben und im Laufreport als
+#   "vor konfiguriertem Historienbeginn" (months_unavailable) gefuehrt - kein
+#   Exit 2/3/4. Der erste UTC-Monat (hier 2009-06) wird nur aus Rohmonaten
+#   >= Beginn gebaut: seine ersten Stunden (aus Rohmonat 2009-05) fehlen, im
+#   Monatsreport partial_start: true (kein Fehler). Vorhandene Monatsdateien vor
+#   dem Beginn verschiebt jeder Lauf nach metals/stale/.
+#   Warum 2009-06: der volle Historienlauf im Homelab endete mit Exit 2, weil
+#   NUR die ersten Monate die Validierung nicht bestanden: XAUUSD 2009-03,
+#   2009-04, 2009-05 und XAGUSD 2009-05 haben in 76-99 % der Bars ask_close <
+#   bid_close - sehr wahrscheinlich vertauschte Bid/Ask-Spalten in den fruehen
+#   HistData-Dateien (Mai 2009 teilweise). Wir tauschen NICHT und raten NICHT;
+#   diese Monate werden nicht verwendet. HistData listet XAUUSD ab 2009-03 und
+#   XAGUSD ab 2009-05 (frueher geht nicht).
+#
+# history.end - Ende des Bereichs fuer --history (Volllauf der Historie unit).
+#   Warum 2026-09: 2026-10 (XAUUSD und XAGUSD) steht in Quarantaene - doppelte
+#   Rohstunde am 25.10. 19:00-19:59 (XAGUSD 8416 Ticks) OHNE Ruecksprung, alle
+#   Beispielticks mit .000 ms: vermutlich eine vorlaeufige Dateiversion. Der
+#   Volllauf fasst 2026-10 nicht an; ohne --history laeuft --end bis zum
+#   laufenden Monat (metals-fetch, monatlich), dort greift die vorlaeufige
+#   Quarantaene (unten).
+#
+# provisional - vorlaeufige Quarantaene, NUR fuer Rohmonate NACH history.end
+#   (im --history-Bereich ist jede Quarantaene normal, Exit 4):
+#   Wird ein Rohmonat (Zeitzone, Format, doppelte Stunde, ...) in Quarantaene
+#   gesetzt und endete er beim ersten Mal vor weniger als window_days Tagen,
+#   ist er vorlaeufig: Stand in <zip>.provisional {since, recheck_after = since
+#   + recheck_days, rechecks: 0} (ein neuer Download loescht diese Datei NICHT;
+#   Kopie im Marker). Bis recheck_after: kein Exit 4 (und kein Exit 3),
+#   Laufreport months_provisional mit Datum, WARNING je Lauf. Danach legt ein
+#   Lauf des Symbols/Modus das ZIP nach <zip>.superseded.<Zeitstempel> (nur
+#   wenn ein betroffener UTC-Monat jetzt gebaut werden kann; nie
+#   ueberschrieben), laedt neu (2 Requests) und prueft neu: besteht -> die
+#   UTC-Monate werden geschrieben, die Stand-Datei entfernt; faellt durch ->
+#   rechecks + 1, neues recheck_after. Nach max_rechecks: expired: true in der
+#   Stand-Datei (nie automatisch neu scharf), normale Quarantaene (Exit 4).
+#   Von Hand zuruecksetzen: <zip>.provisional loeschen. window_days: 0 = aus.
+#   Marker der Vorversion ohne provisional werden uebernommen, wenn der
+#   Rohmonat weniger als window_days vor ihrem since endete.
+#   Jeder Lauf listet alle Quarantaene-Marker; dauerhafte -> Exit 4, auch wenn
+#   der Bereich ihren Monat nicht abdeckt. metals-fetch: --after-history
+#   (history.end+1 .. laufender Monat); --start/--end zusammen mit --history
+#   oder --after-history -> Exit 2 (der Bereich kommt nur aus dieser Datei).
+#   history.start: nicht vor dem HistData-Listenbeginn (XAUUSD 2009-03,
+#   XAGUSD 2009-05), nicht nach dem laufenden Monat; ein falscher, aber
+#   plausibler Beginn verschiebt fruehere Store-Dateien (ERROR + Liste).
+#
+# Bereich spaeter erweitern: history.end hochsetzen (z.B. "2026-12"), sobald
+# die Monate sauber sind (Laufreport/Quarantaene pruefen); history.start nur
+# frueher setzen, wenn gezeigt ist, dass die fruehen Dateien richtig sind (dann
+# bestehen sie die Validierung - getauscht wird nie). Danach normal laufen
+# lassen (fetch_histdata.py --symbol SYM --history).
+
+history:
+  start: {XAUUSD: "2009-06", XAGUSD: "2009-06"}   # Rohmonate davor: nie geladen/geschrieben
+  end: "2026-09"                                   # Ende des --history-Bereichs
+
+provisional:
+  window_days: 60     # Quarantaene eines Rohmonats, der vor < window_days endete: vorlaeufig
+  recheck_days: 30    # dann ZIP neu laden und neu pruefen nach so vielen Tagen
+  max_rechecks: 3     # danach normale (dauerhafte) Quarantaene
